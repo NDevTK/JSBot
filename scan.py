@@ -13,6 +13,7 @@ def sha(data):
 def crawl(url):
     result = requests.get(url)
     parser = BeautifulSoup(result.text, features='lxml')
+    hashedURL = sha(url)
     for script in parser.findAll('script'):
         scriptType = script.get('type') or 'application/javascript'
         if scriptType != 'application/javascript' and scriptType != 'application/ecmascript':
@@ -22,7 +23,6 @@ def crawl(url):
         if hashed in seenScripts:
             continue
         seenScripts.add(hashed)
-        hashedURL = sha(url)
         if hashedURL not in seenURLs:
             seenURLs.add(hashedURL)
             print(url)
