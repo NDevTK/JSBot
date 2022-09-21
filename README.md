@@ -1,2 +1,2 @@
 # JSBot
-A great bot that unique finds JS!
+A great bot that finds unique finds JS!
