@@ -10,6 +10,7 @@ seenURLs = set()
 
 unsafeOnly = True
 allowExternal = True
+skipError = True
 
 # https://github.com/hahwul/RegexPassive
 unsafe1 = r"""((src|href|data|location|code|value|action)\s*["'\]]*\s*\+?\s*=)|((replace|assign|navigate|getResponseHeader|open(Dialog)?|showModalDialog|eval|evaluate|execCommand|execScript|setTimeout|setInterval)\s*["'\]]*\s*\()"""
@@ -56,6 +57,10 @@ if (len(argv) > 1):
         urls = list(set(urls))
         shuffle(urls)
         for url in urls:
-            crawl(url.strip())
+            try:
+                crawl(url.strip())
+            except:
+                if skipError:
+                    continue
 else:
     print('No file provided')
