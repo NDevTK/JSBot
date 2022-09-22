@@ -1,4 +1,4 @@
-import requests
+from requests import get
 from re import match
 from hashlib import sha256
 from bs4 import BeautifulSoup
@@ -25,7 +25,7 @@ def isSafe(script):
     return True
     
 def crawl(url):
-    result = requests.get(url)
+    result = get(url)
     parser = BeautifulSoup(result.text, features='lxml')
     hashedURL = sha(url)
     for script in parser.findAll('script'):
