@@ -68,6 +68,6 @@ if (len(argv) > 1):
                 if skipError:
                     continue
                 else:
-                    break
+                    exit()
 else:
     print('No file provided')
