@@ -33,13 +33,13 @@ def crawl(url):
         scriptType = script.get('type') or 'application/javascript'
         if scriptType != 'application/javascript' and scriptType != 'application/ecmascript':
             continue
-        del script['nonce']
         if script.get('src') and not allowExternal:
             continue
         if not script.get('src') and unsafeOnly and isSafe(script):
             continue
         if script.get('src') in whitelistURLs:
             continue
+        del script['nonce']
         hashed = sha(script)
         if hashed in seenScripts:
             continue
