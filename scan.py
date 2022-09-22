@@ -7,6 +7,7 @@ from random import shuffle
 
 seenScripts = set()
 seenURLs = set()
+
 unsafeOnly = True
 allowExternal = True
 
