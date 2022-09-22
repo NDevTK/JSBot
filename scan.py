@@ -18,10 +18,10 @@ unsafe2 = r"""(location\s*[\[.])|([.\[]\s*["']?\s*(arguments|dialogArguments|inn
 def sha(data):
     return sha256(data.encode()).hexdigest()
 
-def isUnsafe(script):
+def isSafe(script):
     if match(unsafe1, str(script)) or match(unsafe2, str(script)):
-        return True
-    return False
+        return False
+    return True
     
 def crawl(url):
     result = requests.get(url)
@@ -34,7 +34,7 @@ def crawl(url):
         del script['nonce']
         if script.get('src') and not allowExternal:
             continue
-        if not script.get('src') and unsafeOnly and not isUnsafe(script):
+        if not script.get('src') and unsafeOnly and isSafe(script):
             continue
         hashed = sha(script)
         if hashed in seenScripts:
