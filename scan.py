@@ -8,6 +8,7 @@ from random import shuffle
 seenScripts = set()
 seenURLs = set()
 
+whitelistURLs = set([''])
 unsafeOnly = True
 allowExternal = True
 skipError = True
@@ -37,6 +38,8 @@ def crawl(url):
             continue
         if not script.get('src') and unsafeOnly and isSafe(script):
             continue
+        if script.get('src') in whitelistURLs:
+            continue
         hashed = sha(script)
         if hashed in seenScripts:
             continue
@@ -59,6 +62,8 @@ if (len(argv) > 1):
         for url in urls:
             try:
                 crawl(url.strip())
+            except KeyboardInterrupt:
+                exit()
             except:
                 if skipError:
                     continue
