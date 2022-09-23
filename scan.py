@@ -13,6 +13,7 @@ whitelistURLs = set(['https://www.gstatic.com/external_hosted/modernizr/csstrans
 unsafeOnly = True
 allowExternal = True
 showErrors = False
+allowRedirects = True
 
 limits = httpx.Limits(max_keepalive_connections=10, max_connections=10)
 workers = asyncio.Semaphore(10)
@@ -75,7 +76,7 @@ async def main():
             urls = list(set(urls))
             shuffle(urls)
             tasks = []
-            async with httpx.AsyncClient(http2=True, limits=limits) as client:
+            async with httpx.AsyncClient(http2=True, limits=limits, follow_redirects=allowRedirects) as client:
                 for url in urls:
                     tasks.append(crawl(url.strip(), client))
                 await asyncio.gather(*tasks)
