@@ -1,4 +1,5 @@
-from requests import get
+import asyncio
+import httpx
 from re import match
 from hashlib import sha256
 from bs4 import BeautifulSoup
@@ -11,7 +12,10 @@ seenURLs = set()
 whitelistURLs = set(['https://www.gstatic.com/external_hosted/modernizr/csstransforms3d_csstransitions_search_webp_addtest_shiv_dontmin/modernizr-custom.js', 'https://www.gstatic.com/external_hosted/lottie/lottie.js', 'https://cdn.jsdelivr.net/npm/bootstrap@5.2.1/dist/js/bootstrap.bundle.min.js', 'https://www.google-analytics.com/analytics.js', 'https://ajax.googleapis.com/ajax/libs/jqueryui/1.13.2/jquery-ui.min.js', 'https://ajax.googleapis.com/ajax/libs/jquery/3.6.1/jquery.min.js', 'https://www.gstatic.com/external_hosted/modernizr/modernizr.js', 'https://www.gstatic.com/external_hosted/scrollmagic/ScrollMagic.min.js', 'https://www.gstatic.com/external_hosted/scrollmagic/animation.gsap.min.js', 'https://www.gstatic.com/external_hosted/picturefill/picturefill.min.js', 'https://www.gstatic.com/external_hosted/hammerjs/v2_0_2/hammer.min.js', 'https://www.gstatic.com/external_hosted/gsap/v1_18_0/TweenMax.min.js', 'https://ssl.google-analytics.com/ga.js'])
 unsafeOnly = True
 allowExternal = True
-skipError = True
+showErrors = False
+
+limits = httpx.Limits(max_keepalive_connections=10, max_connections=10)
+workers = asyncio.Semaphore(10)
 
 # https://github.com/hahwul/RegexPassive
 unsafe1 = r"""((src|href|data|location|code|value|action)\s*["'\]]*\s*\+?\s*=)|((replace|assign|navigate|getResponseHeader|open(Dialog)?|showModalDialog|eval|evaluate|execCommand|execScript|setTimeout|setInterval)\s*["'\]]*\s*\()"""
@@ -25,9 +29,8 @@ def isSafe(script):
         return False
     return True
     
-def crawl(url):
-    result = get(url)
-    parser = BeautifulSoup(result.text, features='lxml')
+def parse(url, content):
+    parser = BeautifulSoup(content, features='lxml')
     hashedURL = sha(url)
     for script in parser.findAll('script'):
         scriptType = script.get('type') or 'application/javascript'
@@ -48,26 +51,35 @@ def crawl(url):
             seenURLs.add(hashedURL)
             print(url)
 
-if (len(argv) > 1):
-    try:
-        file = open(argv[1], 'r')
-        urls = file.readlines()
-        file.close()
-    except IOError:
-        print('Unable to read file')
+async def crawl(url, client):
+    async with workers:
+        try:
+            result = await client.get(url)
+            parse(str(result.url), result.text)
+        except:
+            if showErrors:
+                print('[Error]', url)
+
+async def main():
+    if (len(argv) > 1):
+        try:
+            file = open(argv[1], 'r')
+            urls = file.readlines()
+            file.close()
+        except IOError:
+            print('Unable to read file')
+        else:
+            # Make urls unique and shuffled
+            urls = list(set(urls))
+            shuffle(urls)
+            tasks = []
+            async with httpx.AsyncClient(http2=True, limits=limits) as client:
+                for url in urls:
+                    tasks.append(crawl(url.strip(), client))
+                await asyncio.gather(*tasks)
     else:
-        # Make urls unique and shuffled
-        urls = list(set(urls))
-        shuffle(urls)
-        for url in urls:
-            try:
-                crawl(url.strip())
-            except KeyboardInterrupt:
-                exit()
-            except:
-                if skipError:
-                    continue
-                else:
-                    exit()
-else:
-    print('No file provided')
+        print('No file provided')
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
