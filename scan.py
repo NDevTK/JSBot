@@ -56,6 +56,8 @@ async def crawl(url, client):
         try:
             result = await client.get(url)
             parse(str(result.url), result.text)
+        except KeyboardInterrupt:
+            exit()
         except:
             if showErrors:
                 print('[Error]', url)
@@ -81,5 +83,8 @@ async def main():
         print('No file provided')
 
 if __name__ == '__main__':
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        exit()
