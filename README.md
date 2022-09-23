@@ -9,3 +9,6 @@ One usage of this is to help find XSS :)
 - Extract from sitemap (https://www.google.com/sitemap.xml)
 - Waybackurls (https://github.com/tomnomnom/waybackurls)
 - Spider (https://github.com/jaeles-project/gospider)
+
+# Why no concurrency?
+Because KeyboardInterrupt not working for me :(
