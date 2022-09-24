@@ -66,7 +66,7 @@ async def crawl(url, client):
 async def main():
     if (len(argv) > 1):
         try:
-            file = open(argv[1], 'r')
+            file = open(argv[1], 'r', encoding='utf8')
             urls = file.readlines()
             file.close()
         except IOError:
