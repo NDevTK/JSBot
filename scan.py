@@ -10,6 +10,9 @@ from random import shuffle
 seenScripts = set()
 seenURLs = set()
 
+checkedURLs = set()
+checkedJSURLs = set()
+
 whitelistURLs = set(['https://www.gstatic.com/external_hosted/modernizr/csstransforms3d_csstransitions_search_webp_addtest_shiv_dontmin/modernizr-custom.js', 'https://www.gstatic.com/external_hosted/lottie/lottie.js', 'https://cdn.jsdelivr.net/npm/bootstrap@5.2.1/dist/js/bootstrap.bundle.min.js', 'https://www.google-analytics.com/analytics.js', 'https://ajax.googleapis.com/ajax/libs/jqueryui/1.13.2/jquery-ui.min.js', 'https://ajax.googleapis.com/ajax/libs/jquery/3.6.1/jquery.min.js', 'https://www.gstatic.com/external_hosted/modernizr/modernizr.js', 'https://www.gstatic.com/external_hosted/scrollmagic/ScrollMagic.min.js', 'https://www.gstatic.com/external_hosted/scrollmagic/animation.gsap.min.js', 'https://www.gstatic.com/external_hosted/picturefill/picturefill.min.js', 'https://www.gstatic.com/external_hosted/hammerjs/v2_0_2/hammer.min.js', 'https://www.gstatic.com/external_hosted/gsap/v1_18_0/TweenMax.min.js', 'https://ssl.google-analytics.com/ga.js'])
 unsafeOnly = True
 allowExternal = True
@@ -34,10 +37,14 @@ def isSafe(script):
 async def crawl(url, client):
     async with workers:
         try:
+            seen = False
             result = await client.get(url)
             url = str(result.url)
-            parser = BeautifulSoup(result.text, features='lxml')
             hashedURL = sha(url)
+            if hashedURL in checkedURLs:
+                return
+            checkedURLs.add(hashedURL)
+            parser = BeautifulSoup(result.text, features='lxml')
             for script in parser.findAll('script'):
                 scriptType = script.get('type') or 'application/javascript'
                 if scriptType != 'application/javascript' and scriptType != 'application/ecmascript':
@@ -49,9 +56,9 @@ async def crawl(url, client):
                 if script.get('src'):
                     scriptURL = urljoin(url, script.get('src'))
                     hashedScriptURL = sha(scriptURL)
-                    if hashedScriptURL in seenURLs:
+                    if hashedScriptURL in checkedJSURLs:
                         continue
-                    seenURLs.add(hashedScriptURL)
+                    checkedJSURLs.add(hashedScriptURL)
                     if scriptURL in whitelistURLs:
                         continue
                     scriptSRC = await client.get(scriptURL)
@@ -67,8 +74,8 @@ async def crawl(url, client):
                     if hashed in seenScripts:
                         continue
                     seenScripts.add(hashed)
-                if hashedURL not in seenURLs:
-                    seenURLs.add(hashedURL)
+                if not seen:
+                    seen = True
                     print(url)
         except KeyboardInterrupt:
             exit()
