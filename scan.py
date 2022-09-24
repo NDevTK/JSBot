@@ -1,6 +1,7 @@
+from urllib.parse import urljoin
 import asyncio
 import httpx
-from re import match
+from re import search
 from hashlib import sha256
 from bs4 import BeautifulSoup
 from sys import argv
@@ -26,37 +27,49 @@ def sha(data):
     return sha256(data.encode()).hexdigest()
 
 def isSafe(script):
-    if match(unsafe1, str(script)) or match(unsafe2, str(script)):
+    if search(unsafe1, str(script)) or search(unsafe2, str(script)):
         return False
     return True
-    
-def parse(url, content):
-    parser = BeautifulSoup(content, features='lxml')
-    hashedURL = sha(url)
-    for script in parser.findAll('script'):
-        scriptType = script.get('type') or 'application/javascript'
-        if scriptType != 'application/javascript' and scriptType != 'application/ecmascript':
-            continue
-        if script.get('src') and not allowExternal:
-            continue
-        if not script.get('src') and unsafeOnly and isSafe(script):
-            continue
-        if script.get('src') in whitelistURLs:
-            continue
-        del script['nonce']
-        hashed = sha(script)
-        if hashed in seenScripts:
-            continue
-        seenScripts.add(hashed)
-        if hashedURL not in seenURLs:
-            seenURLs.add(hashedURL)
-            print(url)
 
 async def crawl(url, client):
     async with workers:
         try:
             result = await client.get(url)
-            parse(str(result.url), result.text)
+            url = str(result.url)
+            parser = BeautifulSoup(result.text, features='lxml')
+            hashedURL = sha(url)
+            for script in parser.findAll('script'):
+                scriptType = script.get('type') or 'application/javascript'
+                if scriptType != 'application/javascript' and scriptType != 'application/ecmascript':
+                    continue
+                if script.get('src') and not allowExternal:
+                    continue
+                if not script.get('src') and unsafeOnly and isSafe(script):
+                    continue
+                if script.get('src'):
+                    scriptURL = urljoin(url, script.get('src'))
+                    hashedScriptURL = sha(scriptURL)
+                    if hashedScriptURL in seenURLs:
+                        continue
+                    seenURLs.add(hashedScriptURL)
+                    if scriptURL in whitelistURLs:
+                        continue
+                    scriptSRC = await client.get(scriptURL)
+                    if isSafe(scriptSRC.text) and unsafeOnly:
+                        continue
+                    hashedSRC = sha(scriptSRC.text)
+                    if hashedSRC in seenScripts:
+                        continue
+                    seenScripts.add(hashedSRC)
+                else:
+                    del script['nonce']
+                    hashed = sha(script)
+                    if hashed in seenScripts:
+                        continue
+                    seenScripts.add(hashed)
+                if hashedURL not in seenURLs:
+                    seenURLs.add(hashedURL)
+                    print(url)
         except KeyboardInterrupt:
             exit()
         except:
