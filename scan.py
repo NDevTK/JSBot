@@ -8,8 +8,6 @@ from sys import argv
 from random import shuffle
 
 seenScripts = set()
-seenURLs = set()
-
 checkedURLs = set()
 checkedJSURLs = set()
 
