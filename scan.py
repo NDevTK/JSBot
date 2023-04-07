@@ -32,7 +32,7 @@ def sha(data):
 
 def isSafe(script):
     if not search(sink, str(script)):
-        return False
+        return True
     if search(unsafe1, str(script)) or search(unsafe2, str(script)):
         return False
     return True
