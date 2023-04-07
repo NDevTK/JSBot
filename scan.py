@@ -16,6 +16,7 @@ unsafeOnly = True
 allowExternal = True
 showErrors = False
 allowRedirects = True
+shouldSave = False
 
 limits = httpx.Limits(max_keepalive_connections=100, max_connections=100)
 workers = asyncio.Semaphore(100)
@@ -51,6 +52,10 @@ async def crawl(url, client):
                 if unsafeOnly and isSafe(result.text):
                     return
                 print(url)
+                if shouldSave:
+                    with open(hashedURL, 'w') as f:
+                        f.write(result.text)
+                        f.close()
                 return
 
             if 'image' in result.headers['content-type']:
@@ -98,6 +103,10 @@ async def crawl(url, client):
                 if not seen:
                     seen = True
                     print(url)
+                    if shouldSave:
+                        with open(hashedScriptURL, 'w') as f:
+                            f.write(script)
+                            f.close()
         except KeyboardInterrupt:
             exit()
         except:
