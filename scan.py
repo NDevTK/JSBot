@@ -42,6 +42,27 @@ async def crawl(url, client):
             if hashedURL in checkedURLs:
                 return
             checkedURLs.add(hashedURL)
+
+            if 'javascript' in result.headers['content-type']:
+                hashedResult = sha(result.text)
+                if hashedResult in seenScripts:
+                    return
+                seenScripts.add(hashedResult)
+                print(url)
+                return
+
+            if 'image' in result.headers['content-type']:
+                return
+
+            if 'audio' in result.headers['content-type']:
+                return
+
+            if 'video' in result.headers['content-type']:
+                return
+            
+            if 'font' in result.headers['content-type']:
+                return
+            
             parser = BeautifulSoup(result.text, features='lxml')
             for script in parser.findAll('script'):
                 scriptType = script.get('type') or 'application/javascript'
