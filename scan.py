@@ -25,10 +25,14 @@ workers = asyncio.Semaphore(100)
 unsafe1 = r"""((src|href|data|location|code|value|action)\s*["'\]]*\s*\+?\s*=)|((replace|assign|navigate|getResponseHeader|open(Dialog)?|showModalDialog|eval|evaluate|execCommand|execScript|setTimeout|setInterval)\s*["'\]]*\s*\()"""
 unsafe2 = r"""(location\s*[\[.])|([.\[]\s*["']?\s*(arguments|dialogArguments|innerHTML|write(ln)?|open(Dialog)?|showModalDialog|cookie|URL|documentURI|baseURI|referrer|name|opener|parent|top|content|self|frames)\W)|(localStorage|sessionStorage|Database)"""
 
+sink = r"""(location\.search|location.href|location.hash|window.name)"""
+
 def sha(data):
     return sha256(data.encode()).hexdigest()
 
 def isSafe(script):
+    if not search(sink, str(script)):
+        return False
     if search(unsafe1, str(script)) or search(unsafe2, str(script)):
         return False
     return True
