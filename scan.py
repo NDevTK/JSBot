@@ -17,8 +17,8 @@ allowExternal = True
 showErrors = False
 allowRedirects = True
 
-limits = httpx.Limits(max_keepalive_connections=10, max_connections=10)
-workers = asyncio.Semaphore(10)
+limits = httpx.Limits(max_keepalive_connections=100, max_connections=100)
+workers = asyncio.Semaphore(100)
 
 # https://github.com/hahwul/RegexPassive
 unsafe1 = r"""((src|href|data|location|code|value|action)\s*["'\]]*\s*\+?\s*=)|((replace|assign|navigate|getResponseHeader|open(Dialog)?|showModalDialog|eval|evaluate|execCommand|execScript|setTimeout|setInterval)\s*["'\]]*\s*\()"""
@@ -48,6 +48,8 @@ async def crawl(url, client):
                 if hashedResult in seenScripts:
                     return
                 seenScripts.add(hashedResult)
+                if unsafeOnly and isSafe(result.text):
+                    return
                 print(url)
                 return
 
