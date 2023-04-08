@@ -7,6 +7,7 @@ from hashlib import sha256
 from bs4 import BeautifulSoup
 from sys import argv
 from random import shuffle
+import jsbeautifier
 
 seenScripts = set()
 checkedURLs = set()
@@ -38,7 +39,7 @@ def sha(data):
 
 def isSafe(script):
     if sinkCheck:
-        for sink in re.findall(sinks, script):
+        for sink in re.findall(sinks, str(script)):
             if search(unsafe1, str(script)) or search(unsafe2, str(script)):
                 return False
         return True
@@ -59,6 +60,7 @@ async def crawl(url, client):
 
             if 'javascript' in result.headers['content-type']:
                 hashedResult = sha(result.text)
+                result.text = jsbeautifier.beautify(result.text)
                 if hashedResult in seenScripts:
                     return
                 seenScripts.add(hashedResult)
@@ -99,6 +101,7 @@ async def crawl(url, client):
                     continue
                 if script.get('src') and not allowExternal:
                     continue
+                script = jsbeautifier.beautify(str(script))
                 if not script.get('src') and unsafeOnly and isSafe(script):
                     continue
                 if script.get('src'):
@@ -110,6 +113,7 @@ async def crawl(url, client):
                     if scriptURL in whitelistURLs:
                         continue
                     scriptSRC = await client.get(scriptURL)
+                    result.text = jsbeautifier.beautify(scriptSRC.text)
                     if isSafe(scriptSRC.text) and unsafeOnly:
                         continue
                     hashedSRC = sha(scriptSRC.text)
