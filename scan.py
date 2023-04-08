@@ -2,6 +2,7 @@ from urllib.parse import urljoin
 import asyncio
 import httpx
 from re import search
+import re
 from hashlib import sha256
 from bs4 import BeautifulSoup
 from sys import argv
@@ -10,6 +11,7 @@ from random import shuffle
 seenScripts = set()
 checkedURLs = set()
 checkedJSURLs = set()
+seenLinks = set()
 
 whitelistURLs = set(['https://www.gstatic.com/external_hosted/modernizr/csstransforms3d_csstransitions_search_webp_addtest_shiv_dontmin/modernizr-custom.js', 'https://www.gstatic.com/external_hosted/lottie/lottie.js', 'https://cdn.jsdelivr.net/npm/bootstrap@5.2.1/dist/js/bootstrap.bundle.min.js', 'https://www.google-analytics.com/analytics.js', 'https://ajax.googleapis.com/ajax/libs/jqueryui/1.13.2/jquery-ui.min.js', 'https://ajax.googleapis.com/ajax/libs/jquery/3.6.1/jquery.min.js', 'https://www.gstatic.com/external_hosted/modernizr/modernizr.js', 'https://www.gstatic.com/external_hosted/scrollmagic/ScrollMagic.min.js', 'https://www.gstatic.com/external_hosted/scrollmagic/animation.gsap.min.js', 'https://www.gstatic.com/external_hosted/picturefill/picturefill.min.js', 'https://www.gstatic.com/external_hosted/hammerjs/v2_0_2/hammer.min.js', 'https://www.gstatic.com/external_hosted/gsap/v1_18_0/TweenMax.min.js', 'https://ssl.google-analytics.com/ga.js'])
 unsafeOnly = True
@@ -17,6 +19,8 @@ allowExternal = True
 showErrors = False
 allowRedirects = True
 shouldSave = False
+
+linkMode = False
 
 limits = httpx.Limits(max_keepalive_connections=100, max_connections=100)
 workers = asyncio.Semaphore(100)
@@ -26,7 +30,8 @@ unsafe1 = r"""((src|href|data|location|code|value|action)\s*["'\]]*\s*\+?\s*=)|(
 unsafe2 = r"""(location\s*[\[.])|([.\[]\s*["']?\s*(arguments|dialogArguments|innerHTML|write(ln)?|open(Dialog)?|showModalDialog|cookie|URL|documentURI|baseURI|referrer|name|opener|parent|top|content|self|frames)\W)|(localStorage|sessionStorage|Database)"""
 
 sink = r"""(location\.search|location.href|location.hash|window.name)"""
-
+link_regex = re.compile("((https?):((//)|(\\\\))+([\w\d:#@%/;$()~_?\+-=\\\.&](#!)?)*)", re.DOTALL)
+    
 def sha(data):
     return sha256(data.encode()).hexdigest()
 
@@ -55,7 +60,15 @@ async def crawl(url, client):
                 seenScripts.add(hashedResult)
                 if unsafeOnly and isSafe(result.text):
                     return
-                print(url)
+                
+                if linkMode:
+                    for url in re.findall(link_regex, result.text):
+                        hashed = sha(url)
+                        if hashed in seenLinks:
+                            continue
+                        print(url)
+                else:
+                    print(url)
                 if shouldSave:
                     with open(hashedURL, 'w') as f:
                         f.write(result.text)
