@@ -62,11 +62,12 @@ async def crawl(url, client):
                     return
                 
                 if linkMode:
-                    for url in re.findall(link_regex, result.text):
-                        hashed = sha(url)
-                        if hashed in seenLinks:
+                    for url2 in re.findall(link_regex, result.text):
+                        hashedLink = sha(url2)
+                        if hashedLink in seenLinks:
                             continue
-                        print(url)
+                        print(url2)
+                        seenLinks.add(hashedLink)
                 else:
                     print(url)
                 if shouldSave:
