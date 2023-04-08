@@ -60,15 +60,15 @@ async def crawl(url, client):
 
             if 'javascript' in result.headers['content-type']:
                 hashedResult = sha(result.text)
-                result.text = jsbeautifier.beautify(result.text)
+                js = jsbeautifier.beautify(result.text)
                 if hashedResult in seenScripts:
                     return
                 seenScripts.add(hashedResult)
-                if unsafeOnly and isSafe(result.text):
+                if unsafeOnly and isSafe(js):
                     return
                 
                 if linkMode:
-                    for url2 in re.findall(link_regex, result.text):
+                    for url2 in re.findall(link_regex, js):
                         hashedLink = sha(url2)
                         if hashedLink in seenLinks:
                             continue
@@ -78,7 +78,7 @@ async def crawl(url, client):
                     print(url)
                 if shouldSave:
                     with open(hashedURL, 'w') as f:
-                        f.write(result.text)
+                        f.write(js)
                         f.close()
                 return
 
@@ -113,16 +113,16 @@ async def crawl(url, client):
                     if scriptURL in whitelistURLs:
                         continue
                     scriptSRC = await client.get(scriptURL)
-                    result.text = jsbeautifier.beautify(scriptSRC.text)
-                    if isSafe(scriptSRC.text) and unsafeOnly:
+                    js2 = jsbeautifier.beautify(scriptSRC.text)
+                    if isSafe(js2) and unsafeOnly:
                         continue
-                    hashedSRC = sha(scriptSRC.text)
+                    hashedSRC = sha(js2)
                     if hashedSRC in seenScripts:
                         continue
                     seenScripts.add(hashedSRC)
                 else:
                     del script['nonce']
-                    hashed = sha(script)
+                    hashed = sha(js2)
                     if hashed in seenScripts:
                         continue
                     seenScripts.add(hashed)
@@ -131,7 +131,7 @@ async def crawl(url, client):
                     print(url)
                     if shouldSave:
                         with open(hashedScriptURL, 'w') as f:
-                            f.write(script)
+                            f.write(js2)
                             f.close()
         except KeyboardInterrupt:
             exit()
