@@ -31,7 +31,7 @@ workers = asyncio.Semaphore(100)
 unsafe1 = r"""((src|href|data|location|code|value|action)\s*["'\]]*\s*\+?\s*=)|((replace|assign|navigate|getResponseHeader|open(Dialog)?|showModalDialog|eval|evaluate|execCommand|execScript|setTimeout|setInterval)\s*["'\]]*\s*\()"""
 unsafe2 = r"""(location\s*[\[.])|([.\[]\s*["']?\s*(arguments|dialogArguments|innerHTML|write(ln)?|open(Dialog)?|showModalDialog|cookie|URL|documentURI|baseURI|referrer|name|opener|parent|top|content|self|frames)\W)|(localStorage|sessionStorage|Database)"""
 
-sinks = r"""(location\.search|location\.href|location\.hash|window\.name)"""
+sinks = r"""(.*location\.search.*|.*location\.href.*|.*location\.hash.*|.*window\.name.*)"""
 link_regex = r"""https?:\/\/[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_\+.~#?&//=]*"""
 
 def sha(data):
@@ -40,7 +40,7 @@ def sha(data):
 def isSafe(script):
     if sinkCheck:
         for sink in re.findall(sinks, str(script)):
-            if search(unsafe1, str(script)) or search(unsafe2, str(script)):
+            if search(unsafe1, str(sink)) or search(unsafe2, str(sink)):
                 return False
         return True
     if search(unsafe1, str(script)) or search(unsafe2, str(script)):
