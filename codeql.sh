@@ -1,6 +1,6 @@
 #!/bin/bash
+find JS/ -type f -not -name "*.*" -print0 | xargs -0 rename 's/(.)$/$1.js/'
 for filename in JS/*; do
- find JS/ -type f -not -name "*.*" -print0 | xargs -0 rename 's/(.)$/$1.js/'
  rm -rf DB/
  rm -rf JS2/
  mkdir JS2/
