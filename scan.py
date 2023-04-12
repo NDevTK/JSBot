@@ -78,7 +78,7 @@ async def crawl(url, client):
                     print(url)
                 if shouldSave:
                     with open(hashedURL, 'w') as f:
-                        f.write(js)
+                        f.write(js+'.js')
                         f.close()
                 return
 
@@ -131,7 +131,7 @@ async def crawl(url, client):
                     print(url)
                     if shouldSave:
                         with open(hashedScriptURL, 'w') as f:
-                            f.write(js2)
+                            f.write(js2+'.js')
                             f.close()
         except KeyboardInterrupt:
             exit()
