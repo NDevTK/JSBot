@@ -101,7 +101,7 @@ async def crawl(url, client):
                     continue
                 if script.get('src') and not allowExternal:
                     continue
-                script = jsbeautifier.beautify(str(script))
+                js1 = jsbeautifier.beautify(str(script))
                 if not script.get('src') and unsafeOnly and isSafe(script):
                     continue
                 if script.get('src'):
@@ -122,7 +122,7 @@ async def crawl(url, client):
                     seenScripts.add(hashedSRC)
                 else:
                     del script['nonce']
-                    hashed = sha(js2)
+                    hashed = sha(js1)
                     if hashed in seenScripts:
                         continue
                     seenScripts.add(hashed)
