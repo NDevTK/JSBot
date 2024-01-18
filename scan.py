@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 from sys import argv
 from random import shuffle
 import jsbeautifier
+import sys
 
 seenScripts = set()
 checkedURLs = set()
@@ -161,6 +162,14 @@ async def main():
 
 if __name__ == '__main__':
     try:
-        asyncio.get_event_loop().run_until_complete(main())
+        if sys.version_info < (3, 10):
+            loop = asyncio.get_event_loop()
+        else:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+        loop.run_until_complete(main())
     except KeyboardInterrupt:
         exit()
