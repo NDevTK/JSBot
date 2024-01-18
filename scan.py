@@ -186,7 +186,7 @@ def waybackBot(urls):
 def known_urls(url):
     while(True):
         try:
-            cdx = WaybackMachineCDXServerAPI(url=url, user_agent='JSBot', collapses=["urlkey"], limit=waybackLimit, filters=waybackFilters, max_tries=100)
+            cdx = WaybackMachineCDXServerAPI(url=url, user_agent='JSBot', collapses=["urlkey"], limit=waybackLimit, filters=waybackFilters)
             break
         except:
             time.sleep(10)
