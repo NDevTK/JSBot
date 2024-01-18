@@ -21,11 +21,16 @@ showErrors = False
 allowRedirects = True
 shouldSave = False
 formatJS = False
+wayback = False
 linkMode = False
 sinkCheck = True
 
 if formatJS:
+    # pip install jsbeautifier
     import jsbeautifier
+if wayback:
+    # pip install waybackpy
+    import waybackpy
 
 limits = httpx.Limits(max_keepalive_connections=100, max_connections=100)
 workers = asyncio.Semaphore(100)
@@ -148,6 +153,14 @@ async def crawl(url, client):
             if showErrors:
                 print('[Error]', url)
 
+def waybackBot(urls):
+    result = []
+    for url in urls:
+        wayback = waybackpy.Url(url=url, user_agent='JSBot')
+        result += wayback.known_urls(subdomain=True)
+    result = list(set(result))
+    return result
+
 async def main():
     if (len(argv) > 1):
         try:
@@ -159,6 +172,8 @@ async def main():
         else:
             # Make urls unique and shuffled
             urls = list(set(urls))
+            if (wayback):
+                urls = waybackBot(urls)
             shuffle(urls)
             tasks = []
             async with httpx.AsyncClient(http2=True, limits=limits, follow_redirects=allowRedirects) as client:
