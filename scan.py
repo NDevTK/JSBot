@@ -7,7 +7,6 @@ from hashlib import sha256
 from bs4 import BeautifulSoup
 from sys import argv
 from random import shuffle
-import jsbeautifier
 import sys
 
 seenScripts = set()
@@ -21,9 +20,12 @@ allowExternal = True
 showErrors = False
 allowRedirects = True
 shouldSave = False
-
+formatJS = False
 linkMode = False
 sinkCheck = True
+
+if formatJS:
+    import jsbeautifier
 
 limits = httpx.Limits(max_keepalive_connections=100, max_connections=100)
 workers = asyncio.Semaphore(100)
@@ -37,6 +39,12 @@ link_regex = r"""https?:\/\/[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[
 
 def sha(data):
     return sha256(data.encode()).hexdigest()
+
+def parseJS(js):
+    if formatJS:
+        return jsbeautifier.beautify(str(js))
+    else:
+        return str(js)
 
 def isSafe(script):
     if sinkCheck:
@@ -61,7 +69,7 @@ async def crawl(url, client):
 
             if 'javascript' in result.headers['content-type']:
                 hashedResult = sha(result.text)
-                js = jsbeautifier.beautify(result.text)
+                js = parseJS(result.text)
                 if hashedResult in seenScripts:
                     return
                 seenScripts.add(hashedResult)
@@ -114,7 +122,7 @@ async def crawl(url, client):
                     if scriptURL in whitelistURLs:
                         continue
                     scriptSRC = await client.get(scriptURL)
-                    js2 = jsbeautifier.beautify(scriptSRC.text)
+                    js2 = parseJS(scriptSRC.text)
                     if isSafe(js2) and unsafeOnly:
                         continue
                     hashedSRC = sha(js2)
