@@ -22,6 +22,7 @@ showInfo = False
 allowRedirects = True
 shouldSave = False
 formatJS = False
+cleanURL = True
 wayback = False
 waybackMax = 1337
 waybackFilters = ["statuscode:200", "mimetype:text/html"]
@@ -177,6 +178,13 @@ def known_urls(url):
         result.append(snapshot.original)
     return result
 
+def cleanUrls(urls):
+    result = []
+    for url in urls:
+        result.append(url.split('?')[0].split('#')[0])
+    result = list(set(result))
+    return result
+ 
 async def main():
     if (len(argv) > 1):
         try:
@@ -190,6 +198,8 @@ async def main():
             urls = list(set(urls))
             if (wayback):
                 urls = waybackBot(urls)
+            if (cleanURL):
+                urls = cleanUrls(urls)
             shuffle(urls)
             tasks = []
             info('Starting scan')
