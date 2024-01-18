@@ -18,6 +18,7 @@ whitelistURLs = set(['https://www.gstatic.com/external_hosted/modernizr/csstrans
 unsafeOnly = True
 allowExternal = True
 showErrors = False
+showInfo = False
 allowRedirects = True
 shouldSave = False
 formatJS = False
@@ -150,14 +151,21 @@ async def crawl(url, client):
         except KeyboardInterrupt:
             exit()
         except:
-            if showErrors:
-                print('[Error]', url)
+            error(url)
+def info(msg):
+    if (showInfo):
+        print('[Info]', msg)
+
+def error(msg):
+    if (showErrors):
+        print('[Error]', msg)
 
 def waybackBot(urls):
     result = []
     for url in urls:
         wayback = waybackpy.Url(url=url, user_agent='JSBot')
         result += wayback.known_urls(subdomain=True)
+        info('WAYBACK added ' + url)
     result = list(set(result))
     return result
 
@@ -176,12 +184,13 @@ async def main():
                 urls = waybackBot(urls)
             shuffle(urls)
             tasks = []
+            info('Starting scan')
             async with httpx.AsyncClient(http2=True, limits=limits, follow_redirects=allowRedirects) as client:
                 for url in urls:
                     tasks.append(crawl(url.strip(), client))
                 await asyncio.gather(*tasks)
     else:
-        print('No file provided')
+        error('No file provided')
 
 if __name__ == '__main__':
     try:
