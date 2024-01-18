@@ -119,7 +119,7 @@ async def crawl(url, client):
                     continue
                 if script.get('src') and not allowExternal:
                     continue
-                js1 = jsbeautifier.beautify(str(script))
+                js1 = parseJS(str(script))
                 if not script.get('src') and unsafeOnly and isSafe(script):
                     continue
                 if script.get('src'):
