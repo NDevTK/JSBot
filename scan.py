@@ -67,7 +67,7 @@ def isSafe(script):
 
 def findLinks(js):
     if linkMode:
-        for url in re.findall(link_regex, js):
+        for url in re.findall(link_regex, str(js)):
             hashedLink = sha(url)
             if hashedLink in seenLinks:
                 continue
@@ -93,9 +93,6 @@ async def crawl(url, client):
                 seenScripts.add(hashedResult)
                 if unsafeOnly and isSafe(js):
                     return
-
-                findLinks(js)
-
                 else:
                     print(url)
                 if shouldSave:
@@ -115,7 +112,9 @@ async def crawl(url, client):
             
             if 'font' in result.headers['content-type']:
                 return
-            
+
+            findLinks(result.text)
+
             parser = BeautifulSoup(result.text, features='lxml')
             for script in parser.findAll('script'):
                 scriptType = script.get('type') or 'application/javascript'
@@ -148,7 +147,6 @@ async def crawl(url, client):
                     hashed = sha(js1)
                     if hashed in seenScripts:
                         continue
-                    findLinks(js1)
                     seenScripts.add(hashed)
                 if not seen:
                     seen = True
