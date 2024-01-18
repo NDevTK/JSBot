@@ -23,6 +23,8 @@ allowRedirects = True
 shouldSave = False
 formatJS = False
 wayback = False
+waybackMax = 1337
+waybackFilters = ["statuscode:200", "mimetype:text/html"]
 linkMode = False
 sinkCheck = True
 
@@ -31,7 +33,7 @@ if formatJS:
     import jsbeautifier
 if wayback:
     # pip install waybackpy
-    import waybackpy
+    from waybackpy import Cdx
 
 limits = httpx.Limits(max_keepalive_connections=100, max_connections=100)
 workers = asyncio.Semaphore(100)
@@ -163,10 +165,16 @@ def error(msg):
 def waybackBot(urls):
     result = []
     for url in urls:
-        wayback = waybackpy.Url(url=url, user_agent='JSBot')
-        result += wayback.known_urls(subdomain=True)
+        result += known_urls(url)
         info('WAYBACK added ' + url)
     result = list(set(result))
+    return result[slice(waybackMax)]
+
+def known_urls(url):
+    cdx = Cdx(url=url, user_agent='JSBot', collapses=["urlkey"], match_type="prefix", filters=waybackFilters)
+    result = []
+    for snapshot in cdx.snapshots():
+        result.append(snapshot.original)
     return result
 
 async def main():
