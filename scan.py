@@ -178,8 +178,16 @@ def waybackBot(urls):
     result = []
     for url in urls:
         url = padUrl(url)
-        result += known_urls(url)
-        info('WAYBACK added ' + url)       
+
+        # Try to get from cache otherwise use the wayback API
+        try:
+            file = open(sha(url), 'r', encoding='utf8')
+            result += file.readlines()
+            file.close()
+        except IOError:
+            result += known_urls(url)
+        info('WAYBACK added ' + url)
+
     result = list(set(result))
     return result
 
