@@ -18,7 +18,7 @@ whitelistURLs = set(['https://www.gstatic.com/external_hosted/modernizr/csstrans
 unsafeOnly = True
 allowExternal = True
 showErrors = False
-showInfo = False
+showInfo = True
 allowRedirects = True
 shouldSave = False
 formatJS = False
@@ -183,7 +183,7 @@ def waybackBot(urls):
     return result
 
 def known_urls(url):
-    cdx = WaybackMachineCDXServerAPI(url=url, user_agent='JSBot', collapses=["urlkey"], limit=waybackLimit, filters=waybackFilters, use_pagination=True)
+    cdx = WaybackMachineCDXServerAPI(url=url, user_agent='JSBot', collapses=["urlkey"], limit=waybackLimit, filters=waybackFilters, max_tries=100)
     result = []
     for snapshot in cdx.snapshots():
         result.append(snapshot.original)
