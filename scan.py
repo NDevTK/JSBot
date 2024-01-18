@@ -183,7 +183,7 @@ def waybackBot(urls):
     return result
 
 def known_urls(url):
-    cdx = WaybackMachineCDXServerAPI(url=url, user_agent='JSBot', collapses=["urlkey"], limit=waybackLimit, filters=waybackFilters, use_pagination=true)
+    cdx = WaybackMachineCDXServerAPI(url=url, user_agent='JSBot', collapses=["urlkey"], limit=waybackLimit, filters=waybackFilters, use_pagination=True)
     result = []
     for snapshot in cdx.snapshots():
         result.append(snapshot.original)
