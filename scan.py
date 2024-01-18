@@ -24,7 +24,7 @@ shouldSave = False
 formatJS = False
 cleanURL = True
 wayback = False
-waybackMax = 1337
+waybackLimit = 1337
 waybackFilters = ["statuscode:200", "mimetype:text/html"]
 linkMode = False
 sinkCheck = True
@@ -169,10 +169,10 @@ def waybackBot(urls):
         result += known_urls(url)
         info('WAYBACK added ' + url)
     result = list(set(result))
-    return result[slice(waybackMax)]
+    return result
 
 def known_urls(url):
-    cdx = Cdx(url=url, user_agent='JSBot', collapses=["urlkey"], match_type="prefix", filters=waybackFilters)
+    cdx = Cdx(url=url, user_agent='JSBot', collapses=["urlkey"], match_type="prefix", limit=waybackLimit, filters=waybackFilters)
     result = []
     for snapshot in cdx.snapshots():
         result.append(snapshot.original)
