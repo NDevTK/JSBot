@@ -180,7 +180,7 @@ def waybackBot(urls):
         url = padUrl(url)
         result += known_urls(url)
         info('WAYBACK added ' + url)
-        time.sleep(4)
+        time.sleep(30)
     result = list(set(result))
     return result
 
