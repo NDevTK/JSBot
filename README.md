@@ -11,4 +11,4 @@ One usage of this is to help find XSS :)
 - Spider (https://github.com/jaeles-project/gospider)
 
 # Requirements
-pip install httpx[http2] beautifulsoup4
+pip install httpx[http2] beautifulsoup4 lxml
