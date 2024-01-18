@@ -25,7 +25,7 @@ shouldSave = False
 formatJS = False
 cleanURL = True
 wayback = False
-waybackLimit = 1337
+waybackLimit = 31337
 waybackFilters = ["statuscode:200", "mimetype:text/html"]
 linkMode = False
 sinkCheck = True
@@ -179,13 +179,17 @@ def waybackBot(urls):
     for url in urls:
         url = padUrl(url)
         result += known_urls(url)
-        info('WAYBACK added ' + url)
-        time.sleep(30)
+        info('WAYBACK added ' + url)       
     result = list(set(result))
     return result
 
 def known_urls(url):
-    cdx = WaybackMachineCDXServerAPI(url=url, user_agent='JSBot', collapses=["urlkey"], limit=waybackLimit, filters=waybackFilters, max_tries=100)
+    while(True):
+        try:
+            cdx = WaybackMachineCDXServerAPI(url=url, user_agent='JSBot', collapses=["urlkey"], limit=waybackLimit, filters=waybackFilters, max_tries=100)
+            break
+        except:
+            time.sleep(10)
     result = []
     for snapshot in cdx.snapshots():
         result.append(snapshot.original)
