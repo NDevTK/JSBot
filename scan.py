@@ -65,6 +65,15 @@ def isSafe(script):
         return False
     return True
 
+def findLinks(js):
+    if linkMode:
+        for url in re.findall(link_regex, js):
+            hashedLink = sha(url)
+            if hashedLink in seenLinks:
+                continue
+            print(url)
+            seenLinks.add(hashedLink)
+
 async def crawl(url, client):
     async with workers:
         try:
@@ -84,14 +93,9 @@ async def crawl(url, client):
                 seenScripts.add(hashedResult)
                 if unsafeOnly and isSafe(js):
                     return
-                
-                if linkMode:
-                    for url2 in re.findall(link_regex, js):
-                        hashedLink = sha(url2)
-                        if hashedLink in seenLinks:
-                            continue
-                        print(url2)
-                        seenLinks.add(hashedLink)
+
+                findLinks(js)
+
                 else:
                     print(url)
                 if shouldSave:
@@ -137,12 +141,14 @@ async def crawl(url, client):
                     hashedSRC = sha(js2)
                     if hashedSRC in seenScripts:
                         continue
+                    findLinks(js2)
                     seenScripts.add(hashedSRC)
                 else:
                     del script['nonce']
                     hashed = sha(js1)
                     if hashed in seenScripts:
                         continue
+                    findLinks(js1)
                     seenScripts.add(hashed)
                 if not seen:
                     seen = True
