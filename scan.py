@@ -26,7 +26,7 @@ formatJS = False
 cleanURL = True
 wayback = False
 waybackLimit = -25000
-waybackFilters = ["statuscode:200", "mimetype:text/html"]
+waybackFilters = ["statuscode:200"]
 linkMode = False
 sinkCheck = True
 
