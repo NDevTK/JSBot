@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 from sys import argv
 from random import shuffle
 import sys
+import time
 
 seenScripts = set()
 checkedURLs = set()
@@ -179,6 +180,7 @@ def waybackBot(urls):
         url = padUrl(url)
         result += known_urls(url)
         info('WAYBACK added ' + url)
+        time.sleep(4)
     result = list(set(result))
     return result
 
