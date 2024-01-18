@@ -34,7 +34,7 @@ if formatJS:
     import jsbeautifier
 if wayback:
     # pip install waybackpy
-    from waybackpy import Cdx
+    from waybackpy import WaybackMachineCDXServerAPI
 
 limits = httpx.Limits(max_keepalive_connections=100, max_connections=100)
 workers = asyncio.Semaphore(100)
@@ -176,7 +176,7 @@ def waybackBot(urls):
     return result
 
 def known_urls(url):
-    cdx = Cdx(url=url, user_agent='JSBot', collapses=["urlkey"], match_type="prefix", limit=waybackLimit, filters=waybackFilters)
+    cdx = WaybackMachineCDXServerAPI(url=url, user_agent='JSBot', collapses=["urlkey"], match_type="prefix", limit=waybackLimit, filters=waybackFilters)
     result = []
     for snapshot in cdx.snapshots():
         result.append(snapshot.original)
