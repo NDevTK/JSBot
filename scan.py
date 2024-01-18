@@ -167,16 +167,23 @@ def error(msg):
     if (showErrors):
         print('[Error]', msg)
 
+def padUrl(url):
+    if url.startswith('http:') or url.startswith('https:'):
+        return url
+    url = 'https://' + url + '/*'
+    return url
+
 def waybackBot(urls):
     result = []
     for url in urls:
+        url = padUrl(url)
         result += known_urls(url)
         info('WAYBACK added ' + url)
     result = list(set(result))
     return result
 
 def known_urls(url):
-    cdx = WaybackMachineCDXServerAPI(url=url, user_agent='JSBot', collapses=["urlkey"], match_type="prefix", limit=waybackLimit, filters=waybackFilters)
+    cdx = WaybackMachineCDXServerAPI(url=url, user_agent='JSBot', collapses=["urlkey"], limit=waybackLimit, filters=waybackFilters)
     result = []
     for snapshot in cdx.snapshots():
         result.append(snapshot.original)
