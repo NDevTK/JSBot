@@ -25,7 +25,6 @@ shouldSave = False
 formatJS = False
 cleanURL = True
 wayback = False
-waybackLimit = -25000
 waybackFilters = ["statuscode:200"]
 linkMode = False
 sinkCheck = True
@@ -192,7 +191,7 @@ def waybackBot(urls):
     return result
 
 def known_urls(url):
-    cdx = WaybackMachineCDXServerAPI(url=url, user_agent='JSBot', collapses=["urlkey"], limit=waybackLimit, filters=waybackFilters)
+    cdx = WaybackMachineCDXServerAPI(url=url, user_agent='JSBot', collapses=["urlkey"], limit=-25000, filters=waybackFilters)
     result = []
     while(True):
         try:
