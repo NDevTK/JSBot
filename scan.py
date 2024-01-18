@@ -177,14 +177,23 @@ def waybackBot(urls):
     result = []
     for url in urls:
         url = padUrl(url)
-
+        
         # Try to get from cache otherwise use the wayback API
+        hashed = sha(url)
         try:
-            file = open(sha(url), 'r', encoding='utf8')
+            file = open(hashed, 'r', encoding='utf8')
             result += file.readlines()
             file.close()
         except IOError:
-            result += known_urls(url)
+            newData = known_urls(url)
+            result += newData
+            try:
+                file = open(hashed, "w")
+                file.write("\n".join(newData))
+                file.close()
+            except IOError:
+                error('Unable to cache ' + url)
+        
         info('WAYBACK added ' + url)
 
     result = list(set(result))
