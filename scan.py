@@ -96,7 +96,7 @@ async def crawl(url, client):
                 else:
                     print(url)
                 if shouldSave:
-                    with open(hashedURL, 'w') as f:
+                    with open(hashedResult, 'w') as f:
                         f.write(js + '// ' + url)
                         f.close()
                 return
@@ -142,19 +142,24 @@ async def crawl(url, client):
                         continue
                     findLinks(js2)
                     seenScripts.add(hashedSRC)
+                    if shouldSave:
+                        with open(hashedSRC, 'w') as f:
+                            f.write(js2 + '// ' + url + ' ' + scriptURL)
+                            f.close()
                 else:
                     del script['nonce']
                     hashed = sha(js1)
                     if hashed in seenScripts:
                         continue
                     seenScripts.add(hashed)
+                    if shouldSave:
+                        with open(hashed, 'w') as f:
+                            f.write(js1 + '// ' + url)
+                            f.close()
                 if not seen:
                     seen = True
                     print(url)
-                    if shouldSave:
-                        with open(hashedScriptURL, 'w') as f:
-                            f.write(js2 + '// ' + url)
-                            f.close()
+
         except KeyboardInterrupt:
             exit()
         except:
