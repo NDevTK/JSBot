@@ -43,7 +43,7 @@ workers = asyncio.Semaphore(100)
 unsafe1 = r"""((src|href|data|location|code|value|action)\s*["'\]]*\s*\+?\s*=)|((replace|assign|navigate|getResponseHeader|open(Dialog)?|showModalDialog|eval|evaluate|execCommand|execScript|setTimeout|setInterval)\s*["'\]]*\s*\()"""
 unsafe2 = r"""(location\s*[\[.])|([.\[]\s*["']?\s*(arguments|dialogArguments|innerHTML|write(ln)?|open(Dialog)?|showModalDialog|cookie|URL|documentURI|baseURI|referrer|name|opener|parent|top|content|self|frames)\W)|(localStorage|sessionStorage|Database)"""
 
-sinks = r"""(.*location\.search.*|.*location\.href.*|.*location\.hash.*|.*window\.name.*)"""
+sinks = r"""(.*postMessage.*|.*location\.search.*|.*location\.href.*|.*location\.hash.*|.*window\.name.*)"""
 link_regex = r"""https?:\/\/[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_\+.~#?&//=]*"""
 
 def cleanUrls(urls):
