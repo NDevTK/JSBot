@@ -46,6 +46,13 @@ unsafe2 = r"""(location\s*[\[.])|([.\[]\s*["']?\s*(arguments|dialogArguments|inn
 sinks = r"""(.*location\.search.*|.*location\.href.*|.*location\.hash.*|.*window\.name.*)"""
 link_regex = r"""https?:\/\/[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_\+.~#?&//=]*"""
 
+def cleanUrls(urls):
+    result = []
+    for url in urls:
+        result.append(url.split('?')[0].split('#')[0])
+    result = list(set(result))
+    return result
+
 def sha(data):
     return sha256(data.encode()).hexdigest()
 
@@ -214,13 +221,6 @@ def known_urls(url):
             break
         except:
             time.sleep(10)
-    return result
-
-def cleanUrls(urls):
-    result = []
-    for url in urls:
-        result.append(url.split('?')[0].split('#')[0])
-    result = list(set(result))
     return result
  
 async def main():
