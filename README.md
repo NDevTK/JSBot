@@ -7,7 +7,7 @@ One usage of this is to help find XSS :)
 
 # How to get urls.txt
 - Extract from sitemap (https://www.google.com/sitemap.xml)
-- Waybackurls (https://github.com/tomnomnom/waybackurls)
+- Waybackurls (https://github.com/tomnomnom/waybackurls) OR enable 'wayback' in python script.
 - Spider (https://github.com/jaeles-project/gospider)
 
 # Requirements
