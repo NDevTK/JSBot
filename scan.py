@@ -197,7 +197,6 @@ def waybackBot(urls):
             result += file.readlines()
             file.close()
         except IOError:
-            info('Starting scan')
             newData = known_urls(url)
             result += newData
             try:
