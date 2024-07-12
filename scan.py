@@ -189,7 +189,7 @@ def waybackBot(urls):
     result = []
     for url in urls:
         url = padUrl(url)
-        
+        info('WAYBACK adding ' + url)
         # Try to get from cache otherwise use the wayback API
         hashed = sha(url)
         try:
@@ -197,6 +197,7 @@ def waybackBot(urls):
             result += file.readlines()
             file.close()
         except IOError:
+            info('Starting scan')
             newData = known_urls(url)
             result += newData
             try:
