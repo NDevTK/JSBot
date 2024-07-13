@@ -93,6 +93,7 @@ async def crawl(url, client):
             checkedURLs.add(hashedURL)
 
             if 'javascript' in result.headers['content-type']:
+                findLinks(result.text)
                 hashedResult = sha(result.text)
                 js = parseJS(result.text)
                 if hashedResult in seenScripts:
