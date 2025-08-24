@@ -1,80 +1,100 @@
-# AGENTS.MD: A Framework for Autonomous JS Security Research
+# AGENTS.MD: An Autonomous Framework for JavaScript Security Analysis
 
-This document outlines a conceptual framework for an autonomous agent system designed to continuously discover, analyze, and prioritize JavaScript code for security research. The goal is to create a self-perpetuating loop that feeds new targets into the system, using `JSBot` as the core analysis engine.
+This document outlines a framework for an autonomous agent system designed to continuously discover, analyze, and prioritize JavaScript code for security research. The system is built around `JSBot` as its core analysis engine and is designed to operate in a self-perpetuating loop.
 
-## Core Philosophy
+## Core Components & Data Stores
 
-The agent operates on a continuous, cyclical model comprised of five phases: **Discovery -> Reconnaissance -> Analysis -> Prioritization -> Feedback**. This loop ensures that the agent not only finds new targets but also learns from its findings to become more effective over time. By automating the large-scale, low-yield parts of reconnaissance, it allows human researchers to focus their attention on the most promising leads.
+The agent's operation relies on several key data stores to manage state and track findings across its continuous lifecycle.
 
-
+1.  **URLQueue**: A persistent queue (e.g., Redis list, RabbitMQ, or a database table) of URLs that are pending reconnaissance and analysis.
+2.  **ScriptDB**: A key-value store or file directory where the key is the SHA256 hash of a JavaScript file's content and the value is the beautified code. The `--save` flag in `JSBot` handles this automatically.
+3.  **FindingsDB**: A structured database (e.g., Elasticsearch, PostgreSQL) that stores the JSON output from `JSBot`, linking findings to script hashes and source URLs.
+4.  **KnownHashesDB**: A simple text file or database set containing SHA256 hashes of common, benign third-party libraries (e.g., jQuery, React, Google Analytics). This is used to filter out noise.
 
 ---
 
-## The Agent Loop: Continuous Operation Phases
+## The Agent Workflow: A Cyclical Process
 
-### Phase 1: Target Discovery (Seed Generation)
+The agent operates in a continuous loop, with each phase feeding into the next.
 
-**Objective:** To find new, high-quality seed domains and applications to investigate.
+### Phase 1: Target Ingestion
 
-The agent's primary task in this phase is to monitor various sources for previously unknown web assets.
+**Objective:** To populate the `URLQueue` with new seed domains.
 
-**Actions:**
-
-1.  **Monitor Certificate Transparency Logs:** Continuously watch CT log streams (e.g., using services like `certstream`) to discover newly issued SSL certificates for domains and subdomains. This is an excellent source of fresh, newly deployed assets.
-2.  **Scan Public Code Repositories:** Periodically search platforms like GitHub and GitLab for code related to public bug bounty programs. Use search queries like `"security.txt"`, `"/.well-known/security.txt"`, or keywords related to a company's infrastructure to find associated domains.
-3.  **Ingest Bug Bounty Program Lists:** Automatically scrape lists of in-scope domains from public bug bounty platforms (HackerOne, Bugcrowd, Intigriti, etc.). This ensures the agent's activities remain within authorized boundaries.
-4.  **Process Public Datasets:** Ingest large-scale domain datasets (e.g., TLD zone files, public DNS data) to identify new parent domains to add to the discovery queue.
-
-### Phase 2: Scope Expansion & Reconnaissance
-
-**Objective:** To take a seed domain and expand it into a comprehensive list of scannable URLs.
-
-Once a new domain is discovered, the agent must perform broad reconnaissance to map out its attack surface.
+This is the entry point for the agent. It should be configured to run periodically.
 
 **Actions:**
 
-1.  **Subdomain Enumeration:** Use tools like `subfinder` or `amass` to perform deep subdomain enumeration on the seed domain.
-2.  **Historical URL Gathering:** Feed all discovered subdomains into **JSBot**'s Wayback Machine feature (`-w` or `--wayback`). This single step can expand a few dozen subdomains into tens of thousands of unique, historical URLs, uncovering old endpoints and forgotten scripts.
-3.  **Active Crawling:** Perform a shallow crawl on the main subdomains to identify initially visible pages and links that may not be in historical archives.
-4.  **Asset Collection:** The final output of this phase is a massive, de-duplicated list of URLs ready for analysis.
+1.  **Monitor Certificate Transparency:** Use a client to connect to a CT log stream (e.g., `certstream`) to find new domains and subdomains in real-time. Add discovered root domains to the `URLQueue`.
+2.  **Scrape Bug Bounty Programs:** Periodically run scrapers against platforms like HackerOne and Bugcrowd to fetch lists of in-scope domains for public programs. Add these domains to the `URLQueue`.
+3.  **Ingest Public Code Repositories:** Search platforms like GitHub for files that indicate a web presence, such as `security.txt`, using queries like `"/.well-known/security.txt"`. Extract the associated domains and add them to the `URLQueue`.
 
-### Phase 3: JavaScript Collection & Analysis
+### Phase 2: Scope Expansion
 
-**Objective:** To execute `JSBot` at scale and save all relevant JavaScript artifacts.
-
-This is the core analysis phase where the collected URLs are processed.
+**Objective:** To expand a seed domain into a comprehensive list of scannable URLs.
 
 **Actions:**
 
-1.  **Execute Scaled Scans:** Run `JSBot` against the URL list generated in Phase 2. The script should be configured for automation:
-    *   `--show-errors`: To log and potentially retry failed requests.
-    *   `--save` (`-s`): **Crucially**, this saves every unique JavaScript file to a central storage location, named by its SHA256 hash. This creates a permanent, de-duplicated database of all encountered scripts.
-    *   `--no-clean-url`: To preserve URL parameters, as they can sometimes influence script behavior.
-2.  **Parse and Store Findings:** Pipe the JSON output from `JSBot` into a database (e.g., Elasticsearch, PostgreSQL, or a simple JSONL file store). This database links findings to the script hash and the source URLs.
+1.  **Dequeue a Domain:** Take one domain from the `URLQueue`.
+2.  **Enumerate Subdomains:** Use an external tool to find all associated subdomains.
+    ```bash
+    subfinder -d example.com -o subdomains.txt
+    ```
+3.  **Gather Historical URLs:** For each discovered domain and subdomain, use JSBot's Wayback Machine integration to gather a massive list of historical URLs. This is the most effective way to uncover old and forgotten endpoints.
+    ```bash
+    python scan.py --wayback subdomains.txt --link-mode | jq -r '.matched_text' | sort -u >> wayback_urls.txt
+    ```
+4.  **Enqueue for Analysis:** Add all unique URLs from `wayback_urls.txt` back into the `URLQueue`.
 
-### Phase 4: Prioritization & Triage
+### Phase 3: Analysis & Collection
 
-**Objective:** To score and rank findings, transforming raw data into actionable intelligence for a human researcher.
-
-An unaided stream of findings can be overwhelming. This phase uses a scoring algorithm to highlight the most interesting targets.
+**Objective:** To run `JSBot` at scale, populating the `ScriptDB` and `FindingsDB`.
 
 **Actions:**
 
-1.  **Implement a Scoring Algorithm:** Automatically score each finding based on a weighted set of criteria:
-    *   **Pattern Severity:** A finding in the "Eval Injection" category receives a higher score than "Cookie Manipulation."
-    *   **Asset Criticality:** A script found on `auth.example.com` is more critical than one on `blog.example.com`. Use keywords in domain names (e.g., `api`, `admin`, `auth`, `dev`) to influence the score.
-    *   **Code Originality:** Decrease the score if the script's hash or filename matches known third-party libraries (`jquery.min.js`, `react.dom.js`, etc.). Increase the score for bespoke, custom-written JavaScript.
-    *   **Finding Density:** A script with multiple, varied findings (e.g., both a `postMessage` sink and a `location.href` redirect) is a high-value target and should be scored exponentially higher.
-2.  **Generate Prioritized Output:** The agent's final output should be a ranked list or dashboard (e.g., "Top 100 Most Interesting Scripts This Week"). This allows a human researcher to immediately focus on what matters most.
+1.  **Dequeue a Batch:** Take a batch of URLs from the `URLQueue`.
+2.  **Execute JSBot Scan:** Run `JSBot` with the `--save` flag to ensure all unique scripts are saved to the `ScriptDB`. Use the `--ignore-hashes` flag to avoid re-analyzing known-benign libraries.
+    ```bash
+    # known_hashes.txt is the KnownHashesDB
+    python scan.py --save --ignore-hashes known_hashes.txt url_batch.txt > findings.jsonl
+    ```
+3.  **Store Findings:** Parse the `findings.jsonl` output and load each JSON object into the `FindingsDB`, ensuring it is linked to the script's SHA256 hash.
+
+### Phase 4: Prioritization Engine
+
+**Objective:** To score and rank findings to identify the most promising targets for human review.
+
+**Actions:**
+
+1.  **Query Findings:** Fetch all new, unscored findings from the `FindingsDB`.
+2.  **Apply Scoring Algorithm:** For each finding associated with a unique script hash, calculate a priority score.
+
+    **Score = (Severity * Criticality) + DensityBonus**
+
+    *   **Severity:** A score based on the finding's `category`.
+        *   `Eval Injection`: 10
+        *   `Open Redirect`: 8
+        *   `DOM Clobbering`: 7
+        *   `Potentially Unsafe Sink`: 5
+        *   `Cookie Manipulation`: 3
+    *   **Criticality:** A score based on keywords in the `source_url`.
+        *   Contains `auth`, `admin`, `api`, `dev`, `sso`, `payment`: 1.5x multiplier
+        *   Otherwise: 1.0x multiplier
+    *   **DensityBonus:** If a single script hash has findings from 3 or more unique categories, add a bonus of +15 to its total score. This highlights complex, custom scripts.
+
+3.  **Generate Ranked Output:** Store the scores in the `FindingsDB`. The primary output for a human researcher is a query that sorts scripts by their highest associated score in descending order.
 
 ### Phase 5: Feedback & Re-seeding
 
-**Objective:** To use the results of the analysis to fuel new discovery cycles.
-
-This phase makes the agent loop self-sustaining and ever-improving.
+**Objective:** To discover new assets from high-priority scripts and feed them back into the loop.
 
 **Actions:**
 
-1.  **Extract New Domains:** Run `JSBot` in `--link-mode` on all the saved, high-priority JavaScript files. This will extract any domains, subdomains, and API endpoints hardcoded within the scripts.
-2.  **Re-seed the Loop:** Add these newly discovered domains back into the **Target Discovery** (Phase 1) queue. This is a powerful way to uncover hidden, non-public infrastructure.
-3.  **Monitor for Changes:** The agent should periodically re-scan high-priority URLs. By comparing the hashes of the JavaScript files found, it can immediately flag when a new version of a script is deployed, triggering a fresh analysis.
+1.  **Identify High-Value Scripts:** Select the Top 20 highest-scoring scripts from the `FindingsDB` that have not been processed in this phase before.
+2.  **Extract Links:** For each script's hash, retrieve its content from the `ScriptDB` and run `JSBot` on it in `--link-mode`.
+    ```bash
+    # script_content.js is the file from ScriptDB
+    python scan.py --link-mode script_content.js | jq -r '.matched_text' | sort -u
+    ```
+3.  **Discover New Domains:** Parse the extracted URLs to find new, unique domains or subdomains.
+4.  **Re-seed:** Add these newly discovered domains back into the **`URLQueue`** for Phase 1, thus completing the loop.
