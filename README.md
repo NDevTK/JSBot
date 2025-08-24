@@ -1,6 +1,3 @@
-### README.md
-
----
 # JSBot: Autonomous JavaScript Security Reconnaissance Tool
 
 JSBot is a powerful and extensible Python script for security researchers and autonomous agents to crawl web pages, extract JavaScript files, and analyze them for potentially interesting or vulnerable patterns. It automates the discovery of inline and external JavaScript, scans for security-related code snippets, and presents the findings in a structured, machine-readable format.
