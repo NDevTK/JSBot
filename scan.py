@@ -6,7 +6,7 @@ import json
 import sys
 from hashlib import sha256
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from random import shuffle
 
 # --- Dependency Availability Checks ---
@@ -31,7 +31,7 @@ IGNORED_HASHES = set()
 
 # --- Configuration ---
 class Config:
-    USER_AGENT = 'JSBot/2.1 (Autonomous Security Agent)'
+    USER_AGENT = 'JSBot/3.0 (Autonomous Security Agent)'
 
 # --- Enhanced Regex for Security Checks ---
 PATTERNS = {
@@ -42,6 +42,8 @@ PATTERNS = {
     "Potentially Unsafe Sink": r"""\b(postMessage|localStorage|sessionStorage|indexedDB|openDatabase)\b""",
     "Link Finder": r"""https?:\/\/[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_\+.~#?&//=]*"""
 }
+# Regex to find relative or absolute paths to JS files within content
+JS_PATH_FINDER = r"""['"](/[^"']+\.js|[^"']+\.js)['"]"""
 
 # --- Utility Functions ---
 
@@ -50,7 +52,7 @@ def get_sha256(data):
     return sha256(data.encode('utf-8')).hexdigest()
 
 def format_javascript(js_code):
-    """Beautifies JavaScript code if the library is available."""
+    """Beautifies JavaScript code. Does not de-obfuscate."""
     if JSBEAUTIFIER_AVAILABLE and ARGS.format_js:
         return jsbeautifier.beautify(js_code)
     return js_code
@@ -64,10 +66,8 @@ def log_message(level, message):
     elif level == "FINDING":
         print(json.dumps(message))
 
-def check_script_safety(script_content, url, script_url=None):
+def check_script_safety(script_content, script_hash, url, script_url=None):
     """Checks script content against defined regex patterns."""
-    findings = []
-    # In link-mode, only run the Link Finder pattern. Otherwise, run all other patterns.
     patterns_to_run = {"Link Finder": PATTERNS["Link Finder"]} if ARGS.link_mode else {k: v for k, v in PATTERNS.items() if k != "Link Finder"}
 
     for category, pattern in patterns_to_run.items():
@@ -76,6 +76,7 @@ def check_script_safety(script_content, url, script_url=None):
             finding = {
                 "source_url": url,
                 "script_url": script_url or "inline",
+                "script_hash": script_hash,  # CRITICAL: Link the finding to the script content
                 "category": category,
                 "matched_text": match.group(0),
                 "line_number": script_content.count('\n', 0, match.start()) + 1
@@ -90,8 +91,8 @@ def check_script_safety(script_content, url, script_url=None):
 
 # --- Core Logic ---
 
-async def process_javascript(js_code, url, script_url=None):
-    """Processes and analyzes a piece of JavaScript code."""
+async def process_javascript(js_code, url, client, script_url=None):
+    """Processes, analyzes, and saves a piece of JavaScript code."""
     if not js_code:
         return
 
@@ -105,7 +106,7 @@ async def process_javascript(js_code, url, script_url=None):
         return
     SEEN_SCRIPTS.add(hashed_script)
 
-    check_script_safety(js_code, url, script_url)
+    check_script_safety(js_code, hashed_script, url, script_url)
 
     if ARGS.save:
         try:
@@ -113,6 +114,33 @@ async def process_javascript(js_code, url, script_url=None):
                 f.write(f"// Source: {url}\n// Script URL: {script_url or 'inline'}\n\n{js_code}")
         except IOError as e:
             log_message("ERROR", f"Failed to save script {hashed_script}: {e}")
+    
+    # Enhanced Script Discovery: Look for more JS paths inside this script
+    await find_and_process_js_paths(js_code, url, client)
+
+
+async def find_and_process_js_paths(content, base_url, client):
+    """Finds potential JS file paths in content and schedules them for processing."""
+    tasks = []
+    for match in re.finditer(JS_PATH_FINDER, content):
+        path = match.group(1)
+        if path.startswith('//'):
+            path = f"https:{path}"
+            
+        script_url = urljoin(base_url, path)
+        hashed_url = get_sha256(script_url)
+        
+        if hashed_url in CHECKED_JS_URLS:
+            continue
+        CHECKED_JS_URLS.add(hashed_url)
+
+        log_message("INFO", f"Discovered potential JS file via regex: {script_url}")
+        try:
+            script_response = await client.get(script_url, timeout=10)
+            tasks.append(process_javascript(script_response.text, base_url, client, script_url=script_url))
+        except httpx.RequestError as e:
+            log_message("ERROR", f"Failed to fetch discovered script {script_url}: {e}")
+    await asyncio.gather(*tasks)
 
 async def crawl_url(url, client, workers):
     """Crawls a single URL, extracts and processes scripts."""
@@ -125,39 +153,40 @@ async def crawl_url(url, client, workers):
 
             log_message("INFO", f"Crawling: {url}")
             response = await client.get(url, timeout=10)
-
             content_type = response.headers.get('content-type', '').lower()
-            if 'javascript' in content_type:
-                await process_javascript(response.text, url, script_url=str(response.url))
-                return
-            if 'html' not in content_type:
-                log_message("INFO", f"Skipping non-HTML content at {url}")
-                return
 
-            parser = BeautifulSoup(response.text, 'lxml')
-            tasks = []
-            for script in parser.find_all('script'):
-                script_src = script.get('src')
-                if script_src:
-                    if ARGS.no_external:
-                        continue
-                    script_url = urljoin(str(response.url), script_src)
-                    
+            # Direct JS file
+            if 'javascript' in content_type:
+                await process_javascript(response.text, url, client, script_url=str(response.url))
+                return
+            
+            # HTML content
+            if 'html' in content_type:
+                parser = BeautifulSoup(response.text, 'lxml')
+                tasks = []
+                # Process inline scripts
+                for script in parser.find_all('script'):
+                    if not script.get('src'):
+                        tasks.append(process_javascript(script.string or "", url, client))
+                # Process external scripts from <script src="...">
+                for script in parser.find_all('script', src=True):
+                    script_url = urljoin(str(response.url), script['src'])
                     hashed_script_url = get_sha256(script_url)
                     if hashed_script_url in CHECKED_JS_URLS:
                         continue
                     CHECKED_JS_URLS.add(hashed_script_url)
-
                     try:
                         script_response = await client.get(script_url, timeout=10)
-                        tasks.append(process_javascript(script_response.text, url, script_url=script_url))
+                        tasks.append(process_javascript(script_response.text, url, client, script_url=script_url))
                     except httpx.RequestError as e:
                         log_message("ERROR", f"Failed to fetch script {script_url}: {e}")
+                
+                await asyncio.gather(*tasks)
+                # Enhanced discovery on the raw HTML body
+                await find_and_process_js_paths(response.text, str(response.url), client)
 
-                elif script.string:
-                    tasks.append(process_javascript(script.string, url))
-            
-            await asyncio.gather(*tasks)
+            else:
+                log_message("INFO", f"Skipping non-HTML/JS content at {url}")
 
         except httpx.RequestError as e:
             log_message("ERROR", f"HTTP request failed for {url}: {e}")
@@ -165,12 +194,11 @@ async def crawl_url(url, client, workers):
             log_message("ERROR", f"An unexpected error occurred for {url}: {e}")
 
 
-# --- Wayback Machine Functions ---
 def fetch_wayback_urls(domains):
+    """Fetches historical URLs from the Wayback Machine."""
     if not WAYBACK_AVAILABLE:
         log_message("ERROR", "WaybackPy not installed. Skipping wayback machine fetch.")
         return []
-
     all_urls = set()
     for domain in domains:
         domain = domain.strip()
@@ -178,9 +206,7 @@ def fetch_wayback_urls(domains):
         log_message("INFO", f"Fetching wayback URLs for: {domain}")
         try:
             cdx = WaybackMachineCDXServerAPI(
-                url=domain,
-                user_agent=Config.USER_AGENT,
-                collapses=["urlkey"],
+                url=domain, user_agent=Config.USER_AGENT, collapses=["urlkey"],
                 filters=["statuscode:200", "mimetype:(text/html|application/javascript)"]
             )
             snapshots = {s.original for s in cdx.snapshots()}
@@ -190,11 +216,11 @@ def fetch_wayback_urls(domains):
             log_message("ERROR", f"Wayback Machine request failed for {domain}: {e}")
     return list(all_urls)
 
-# --- Main Execution ---
 async def main(args):
+    """Main execution function."""
     global ARGS
     ARGS = args
-
+    
     if args.ignore_hashes:
         try:
             with open(args.ignore_hashes, 'r', encoding='utf-8') as f:
@@ -215,12 +241,11 @@ async def main(args):
             return
 
     urls_to_scan = set(initial_urls)
-
     if args.wayback:
         wayback_urls = fetch_wayback_urls(list(urls_to_scan))
         urls_to_scan.update(wayback_urls)
 
-    if args.no_clean_url is False:
+    if not args.no_clean_url:
         cleaned_urls = {url.split('?')[0].split('#')[0] for url in urls_to_scan}
         urls_to_scan = cleaned_urls
 
@@ -229,12 +254,22 @@ async def main(args):
     
     log_message("INFO", f"Starting scan with {len(final_urls)} unique URLs.")
     
+    # --- Client Configuration with Custom Headers/Cookies ---
+    headers = {'User-Agent': Config.USER_AGENT}
+    if args.header:
+        for header in args.header:
+            if ':' in header:
+                key, value = header.split(':', 1)
+                headers[key.strip()] = value.strip()
+    if args.cookie:
+        headers['Cookie'] = args.cookie
+
     limits = httpx.Limits(max_connections=args.concurrency, max_keepalive_connections=args.concurrency)
     workers = asyncio.Semaphore(args.concurrency)
     
     async with httpx.AsyncClient(
         http2=True, limits=limits, follow_redirects=not args.no_redirects,
-        verify=not args.insecure, headers={'User-Agent': Config.USER_AGENT}
+        verify=not args.insecure, headers=headers
     ) as client:
         tasks = [crawl_url(url, client, workers) for url in final_urls]
         await asyncio.gather(*tasks)
@@ -243,23 +278,30 @@ async def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description="JSBot 2.1 - An autonomous script to find interesting JavaScript for security research.",
+        description="JSBot 3.0 - An autonomous script to find interesting JavaScript for security research.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     
     parser.add_argument('url_file', help="Path to a file with URLs, or '-' to read from stdin.")
-    parser.add_argument('-s', '--save', action='store_true', help="Save unique JS files to disk, named by SHA256 hash.")
-    parser.add_argument('-v', '--verbose', action='store_true', help="Enable verbose informational output.")
-    parser.add_argument('--show-errors', action='store_true', help="Show error messages for failed requests.")
-    parser.add_argument('-c', '--concurrency', type=int, default=20, help="Number of concurrent requests. (Default: 20)")
-    parser.add_argument('--ignore-hashes', help="Path to a file containing SHA256 hashes of JS files to ignore.")
-    parser.add_argument('--no-external', action='store_true', help="Don't fetch external JavaScript files.")
-    parser.add_argument('--no-redirects', action='store_true', help="Don't follow HTTP redirects.")
-    parser.add_argument('-k', '--insecure', action='store_true', help="Disable SSL/TLS certificate verification.")
-    parser.add_argument('-w', '--wayback', action='store_true', help="Fetch historical URLs from the Wayback Machine for the given domains.")
-    parser.add_argument('--no-clean-url', action='store_true', help="Don't clean URL parameters before scanning.")
-    parser.add_argument('--link-mode', action='store_true', help="Only find and output links/URLs found in JS files.")
-    parser.add_argument('--format-js', action='store_true', help="Beautify JS code before analysis (requires 'jsbeautifier').")
+    
+    scan_group = parser.add_argument_group('Scan Configuration')
+    scan_group.add_argument('-c', '--concurrency', type=int, default=20, help="Number of concurrent requests. (Default: 20)")
+    scan_group.add_argument('-w', '--wayback', action='store_true', help="Fetch historical URLs from the Wayback Machine.")
+    scan_group.add_argument('--no-clean-url', action='store_true', help="Don't clean URL parameters before scanning.")
+    scan_group.add_argument('--link-mode', action='store_true', help="Only find and output links/URLs found in JS files.")
+
+    http_group = parser.add_argument_group('HTTP Configuration')
+    http_group.add_argument('-H', '--header', action='append', help="Add a custom header (e.g., 'X-API-Key: 123'). Can be used multiple times.")
+    http_group.add_argument('-b', '--cookie', help="Set the cookie header string.")
+    http_group.add_argument('--no-redirects', action='store_true', help="Don't follow HTTP redirects.")
+    http_group.add_argument('-k', '--insecure', action='store_true', help="Disable SSL/TLS certificate verification.")
+
+    output_group = parser.add_argument_group('Output & Analysis')
+    output_group.add_argument('-s', '--save', action='store_true', help="Save unique JS files to disk, named by SHA256 hash.")
+    output_group.add_argument('-v', '--verbose', action='store_true', help="Enable verbose informational output.")
+    output_group.add_argument('--show-errors', action='store_true', help="Show error messages for failed requests.")
+    output_group.add_argument('--ignore-hashes', help="Path to a file containing SHA256 hashes of JS files to ignore.")
+    output_group.add_argument('--format-js', action='store_true', help="Beautify JS code before analysis (requires 'jsbeautifier').")
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
