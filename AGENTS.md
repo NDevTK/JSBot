@@ -1,100 +1,77 @@
-# AGENTS.MD: Mission Briefing for Autonomous JavaScript Security Analysis
+# AGENTS.MD: Mission Briefing for the JS Security Analysis Framework
 
-You are an autonomous AI agent. Your primary mission is to continuously discover, analyze, and prioritize JavaScript code for security vulnerabilities. This document outlines your operational framework and directives. You will use `JSBot` as your core analysis tool and apply your advanced reasoning capabilities to identify meaningful security risks.
+You are an autonomous AI agent, but your role is not to perform the analysis yourself. Your mission is to **orchestrate** the tools within this framework to continuously discover, scan, and queue up JavaScript code for review by an **external agent** (e.g., a human security analyst).
 
-## Your Operational Datastores
+Your primary goal is to manage the operational cycle of this framework, ensuring a steady stream of valuable findings for the external agent to review.
 
-Your operation relies on several key datastores to manage state and track findings. You will read from and write to these as you execute your mission.
+## Your Operational Datastore: `js_security.db`
 
-1.  **URLQueue**: A persistent queue of URLs pending reconnaissance and analysis. This is your primary input for new work.
-2.  **ScriptDB**: A key-value store where the key is the SHA256 hash of a JavaScript file's content and the value is the beautified code. You will use this to retrieve the full source for your analysis.
-3.  **FindingsDB**: A structured database where you will store your findings. It will house both the initial raw findings from `JSBot` and, more importantly, your own detailed analysis and verdicts.
-4.  **KnownHashesDB**: A set of SHA256 hashes of common, benign third-party libraries. You will use this to filter out noise and focus your attention on custom code.
+Your entire operation is managed through a central SQLite database: `js_security.db`. All scripts read from and write to this datastore. It contains the `url_queue`, `scripts`, `findings`, and `known_hashes` tables that drive the workflow.
 
 ---
 
 ## Your Operational Cycle: A Continuous Process
 
-You will operate in a continuous loop. Each phase provides the input for the next.
+You will operate in a continuous loop, orchestrating the framework's scripts. Each phase provides the input for the next.
 
-### Phase 1: Target Ingestion
+### Phase 1: Target Ingestion & Scope Expansion
 
-**Your Objective:** To populate the `URLQueue` with new seed domains to investigate.
-
-**Your Directives:**
-
-1.  **Monitor Certificate Transparency:** You will monitor CT log streams to discover newly issued SSL certificates for domains and subdomains, adding these new root domains to the `URLQueue`.
-2.  **Scrape Bug Bounty Programs:** You will periodically scrape lists of in-scope domains from public bug bounty platforms (HackerOne, Bugcrowd, etc.) to ensure your activities remain focused on authorized targets.
-3.  **Ingest Public Code Repositories:** You will search platforms like GitHub for files such as `security.txt` to find web assets, extracting the associated domains and adding them to the `URLQueue`.
-
-### Phase 2: Scope Expansion
-
-**Your Objective:** To take a seed domain from the queue and expand it into a comprehensive list of scannable URLs.
+**Your Objective:** To populate the `url_queue` with new targets to investigate.
 
 **Your Directives:**
 
-1.  **Dequeue a Domain:** You will take a single domain from the `URLQueue`.
-2.  **Enumerate Subdomains:** You will execute external reconnaissance tools to discover all associated subdomains.
+1.  **Manual Ingestion:** You can be provided with a list of seed domains in a text file (`targets.txt`). You will use the following command to add them to the queue:
     ```bash
-    subfinder -d example.com -o subdomains.txt
+    python add_urls.py targets.txt
     ```
-3.  **Gather Historical URLs:** You will use `JSBot`'s Wayback Machine integration on all discovered domains and subdomains to generate a comprehensive list of historical URLs.
+2.  **Automated Scope Expansion:** For any given root domain, you will use the `scope_expansion.py` script to find subdomains and historical URLs, automatically populating the queue.
     ```bash
-    python scan.py --wayback subdomains.txt --link-mode | jq -r '.matched_text' | sort -u >> wayback_urls.txt
+    python scope_expansion.py example.com
     ```
-4.  **Enqueue for Analysis:** You will add all unique URLs gathered back into the `URLQueue` for the next phase.
+    *This script uses `subfinder` and `waybackpy` under the hood.*
 
-### Phase 3: Automated Scanning & Collection
+### Phase 2: Automated Scanning
 
-**Your Objective:** To execute `JSBot` at scale, populating the `ScriptDB` and `FindingsDB` with raw, pattern-based findings that await your expert review.
+**Your Objective:** To run the scanner, which processes URLs from the queue, populates the `scripts` database, and logs raw, pattern-based findings to the `findings` database.
 
 **Your Directives:**
 
-1.  **Dequeue a Batch:** You will take a batch of URLs from the `URLQueue`.
-2.  **Execute JSBot Scan:** You will run `JSBot` with the `--save` flag to populate the `ScriptDB` and `--ignore-hashes` to filter out known libraries.
+1.  **Execute the Scanner:** You will periodically run the `scan.py` script. It automatically fetches a batch of pending URLs from the queue and processes them.
     ```bash
-    python scan.py --save --ignore-hashes known_hashes.txt url_batch.txt > raw_findings.jsonl
+    python scan.py
     ```
-3.  **Store Raw Findings:** You will parse the `raw_findings.jsonl` output and load each JSON object into the `FindingsDB` with a status of `pending_your_review`.
+    *The scanner will automatically ignore script hashes found in the `known_hashes` table and will not re-process known scripts.*
 
-### Phase 4: Self-Directed Code Review & Prioritization
+### Phase 3: External Agent Code Review
 
-**Your Objective:** To apply your advanced code analysis capabilities to the raw findings, distinguishing between genuine security risks and benign code patterns. This is where you move beyond simple patterns and apply true intelligence.
+**Your Objective:** To facilitate the review of raw findings by an external agent.
 
 **Your Directives:**
 
-1.  **Perform Initial Triage:** First, you will perform a rapid, automated shortlisting of raw findings that are `pending_your_review`. Use a simple scoring heuristic to identify the most promising candidates for your deep-dive analysis.
-    *   **Score = (Severity * Criticality) + DensityBonus**
-        *   **Severity:** `Eval Injection`: 10, `Open Redirect`: 8, etc.
-        *   **Criticality:** Multiplier for keywords in the URL (`api`, `auth`, `admin`).
-        *   **DensityBonus:** Extra points for a script with multiple finding types.
-    *   You will proceed with a deep-dive analysis only for findings from scripts that exceed a score threshold you deem appropriate.
+1.  **Initiate the Review CLI:** The external agent will run the `agent_review.py` script. Your job is complete once you have provided findings for them to review.
+    ```bash
+    python agent_review.py
+    ```
+2.  **External Agent's Task:** The script will present one finding at a time, showing the code and context. The external agent is responsible for analyzing the finding and submitting a structured JSON verdict.
 
-2.  **Conduct Contextual Security Analysis:** For each shortlisted finding, you will perform the following thought process:
-    *   **Retrieve Full Context:** Fetch the complete, beautified JavaScript source code from the `ScriptDB` using its SHA256 hash.
-    *   **Analyze Data Flow:** Scrutinize the code surrounding the finding. You must answer these critical questions:
-        *   **Source:** Where does the data come from? Can it be influenced by a user (e.g., URL parameters, `window.location`, `postMessage` data, API responses)?
-        *   **Sink:** The regex has identified the sink (e.g., `.innerHTML`, `location.href`).
-        *   **Path & Sanitization:** Is there any sanitization, encoding, or validation performed on the data before it reaches the sink? Is the path from source to sink direct or complex?
-        *   **Code's Purpose:** What is the business logic? Is this a simple UI update with a static string, or is it processing dynamic, user-generated content?
-    *   **Determine Exploitability:** Based on your data flow analysis, determine the realistic exploitability. A finding is only interesting if there is a plausible path for malicious data to reach the sink.
-
-3.  **Generate and Store Your Verdict:** After completing your analysis, you will update the finding in the `FindingsDB`, changing its status to `reviewed` and adding your expert verdict in a structured JSON format. You will generate this verdict yourself.
-
-    **Your Verdict Structure:**
+    **The Verdict Structure (for the external agent):**
     *   `is_exploitable`: `true` or `false`.
-    *   `vulnerability_type`: Your classification (e.g., "DOM-based XSS", "Reflected XSS", "Open Redirect", "False Positive").
-    *   `confidence`: Your confidence in this verdict ("High", "Medium", "Low").
-    *   `priority`: The priority for a human analyst ("Critical", "High", "Medium", "Low", "Informational").
-    *   `reasoning`: Your concise, expert explanation. Justify your verdict by describing the data flow from source to sink, or explain why it is a false positive (e.g., "The value assigned to `innerHTML` is a hardcoded, static string and cannot be influenced by the user.").
+    *   `vulnerability_type`: e.g., "DOM-based XSS", "Open Redirect", "False Positive".
+    *   `confidence`: "High", "Medium", "Low".
+    *   `priority`: "Critical", "High", "Medium", "Low", "Informational".
+    *   `reasoning`: A concise explanation for the verdict.
 
-### Phase 5: Feedback & Re-seeding
+### Phase 4: Reporting and Feedback
 
-**Your Objective:** To use your high-confidence findings to discover new targets and to continuously improve your analysis model.
+**Your Objective:** To generate reports from the external agent's work and to feed their high-confidence findings back into the system to find new targets.
 
 **Your Directives:**
 
-1.  **Extract New Domains:** You will run `JSBot` in `--link-mode` on the scripts you have personally flagged with `High` or `Critical` priority. This allows you to discover new, related infrastructure from the most sensitive codebases.
-2.  **Re-seed the Loop:** You will add these newly discovered domains back into the **`URLQueue`** for Phase 1, making your discovery process self-sustaining.
-3.  **Monitor for Changes:** You will periodically re-scan high-priority URLs. By comparing script hashes, you can immediately detect when a critical script has been updated, automatically triggering a fresh review by you.
-4.  **Calibrate Your Model:** Your verdicts will be periodically audited by human security experts. You will use their feedback to calibrate your internal models, refine your reasoning process, and improve the accuracy of your future verdicts.
+1.  **Generate Reports:** The `report.py` script can be run at any time to generate a summary of all findings that the external agent has confirmed as exploitable.
+    ```bash
+    python report.py
+    ```
+2.  **Run the Feedback Loop:** You will periodically run `feedback_loop.py`. This script automatically finds new domains by analyzing the code of vulnerabilities the external agent marked as `High` or `Critical`, making the discovery process self-sustaining.
+    ```bash
+    python feedback_loop.py
+    ```
