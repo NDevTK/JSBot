@@ -1,0 +1,10 @@
+# Database file
+js_security.db
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE folders
+.vscode/
+.idea/

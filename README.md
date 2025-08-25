@@ -1,104 +1,99 @@
-# JSBot: Autonomous JavaScript Security Reconnaissance Tool
+# JS Security Analysis Framework
 
-JSBot is a powerful and extensible Python script for security researchers and autonomous agents to crawl web pages, extract JavaScript files, and analyze them for potentially interesting or vulnerable patterns. It automates the discovery of inline and external JavaScript, scans for security-related code snippets, and presents the findings in a structured, machine-readable format.
+This project is a comprehensive, multi-stage framework for discovering, scanning, and analyzing JavaScript code for security vulnerabilities. It moves beyond a single script into a full-fledged, database-driven system that allows for continuous, stateful security reconnaissance and a CLI-based workflow for external agent review.
 
-Its primary purpose is to serve as the core analysis engine in an automated security pipeline, allowing for continuous, large-scale reconnaissance of web application JavaScript.
+Its primary purpose is to serve as a complete pipeline for security research, from target discovery to final reporting.
 
-## Key Features
+## System Overview
 
--   **Automation-Friendly**: Accepts URLs from files or `stdin`, making it easy to chain with other tools in a pipeline.
--   **Structured JSON Output**: Findings are printed as JSON objects, ideal for ingestion into databases or other analysis tools.
--   **Intelligent Filtering**: Can ignore known, benign third-party scripts via a hash-based ignore file, focusing analysis on custom code.
--   **Enhanced Security Patterns**: Uses an expanded and categorized list of regular expressions to identify potential vulnerabilities.
--   **Asynchronous & Concurrent**: Built with `asyncio` and `httpx` for high-speed, concurrent scanning.
--   **Wayback Machine Integration**: Can automatically fetch and scan historical URLs to dramatically expand scope.
--   **Flexible Command-Line Interface**: Rich set of arguments to customize scans (e.g., control concurrency, disable redirects, save scripts).
--   **Link Finder Mode**: A dedicated mode (`--link-mode`) to extract all URLs found within JavaScript files.
--   **Extensible**: Organized code structure makes it easy to add new security patterns and functionality.
+The framework is composed of several distinct Python scripts that work together, using a central SQLite database (`js_security.db`) to manage state. The workflow is as follows:
 
-## Requirements
+1.  **Target Ingestion**: New target domains are added to a central work queue using `add_urls.py` or discovered automatically using `scope_expansion.py`.
+2.  **Scanning**: The `scan.py` engine runs continuously, pulling URLs from the queue, crawling them, finding JavaScript files, and logging any potential findings from its pattern-based analysis into the database.
+3.  **Manual Review**: An external agent (e.g., a human security analyst) uses the `agent_review.py` interactive CLI to examine each pending finding. The tool displays the code and context, and the agent provides a structured JSON verdict on its exploitability.
+4.  **Reporting**: The `report.py` script generates a clean, human-readable report of all findings that the agent has confirmed as exploitable.
+5.  **Feedback Loop**: The `feedback_loop.py` script automatically finds new targets by analyzing the code of confirmed high-priority vulnerabilities, creating a self-improving system.
 
-The script requires Python 3.8+ and several external libraries.
+## Installation
 
-You can install all dependencies using the provided `requirements.txt` file:
+The framework requires Python 3.8+ and several external libraries.
 
-```
+#### 1. Python Dependencies
+
+You can install all required Python libraries using the provided `requirements.txt` file:
+```bash
 pip install -r requirements.txt
 ```
 
-## Usage
+#### 2. External Tools
 
-The script is run from the command line, accepting a URL file or `stdin` as its main input.
+The `scope_expansion.py` script relies on the `subfinder` tool from ProjectDiscovery. You must install it and ensure it is available in your system's `PATH`.
+*   Installation instructions can be found here: [https://github.com/projectdiscovery/subfinder](https://github.com/projectdiscovery/subfinder)
 
-### Basic Syntax
+## Usage & Workflow
 
+Here is a step-by-step guide to using the framework.
+
+#### Step 1: Initialize the Database
+
+Before running any other script, initialize the SQLite database:
 ```bash
-# Scan URLs from a file
-python scan.py [options] urls.txt
-
-# Pipe URLs from another tool (e.g., subfinder)
-subfinder -d example.com | python scan.py -
+python database.py
 ```
+This will create the `js_security.db` file in your directory.
 
-### Command-Line Arguments
+#### Step 2: Add Targets to the Queue
 
-```
-usage: scan.py [-h] [-s] [-v] [--show-errors] [-c CONCURRENCY] [--ignore-hashes IGNORE_HASHES] [--no-external] [--no-redirects] [-k] [-w] [--no-clean-url] [--link-mode] [--format-js] url_file
+You can add targets in two ways:
 
-JSBot 2.1 - An autonomous script to find interesting JavaScript for security research.
+*   **Manually**: Create a text file with one URL or domain per line and use `add_urls.py`.
+    ```bash
+    # urls.txt contains domains like "example.com"
+    python add_urls.py urls.txt
+    ```
+*   **Automatically**: Use `scope_expansion.py` to find subdomains and historical URLs for a root domain.
+    ```bash
+    python scope_expansion.py example.com
+    ```
 
-positional arguments:
-  url_file              Path to a file with URLs, or '-' to read from stdin.
+#### Step 3: Run the Scanner
 
-options:
-  -h, --help            show this help message and exit
-  -s, --save            Save unique JS files to disk, named by SHA256 hash.
-  -v, --verbose         Enable verbose informational output.
-  --show-errors         Show error messages for failed requests.
-  -c CONCURRENCY, --concurrency CONCURRENCY
-                        Number of concurrent requests. (Default: 20)
-  --ignore-hashes IGNORE_HASHES
-                        Path to a file containing SHA256 hashes of JS files to ignore.
-  --no-external         Don't fetch external JavaScript files.
-  --no-redirects        Don't follow HTTP redirects.
-  -k, --insecure        Disable SSL/TLS certificate verification.
-  -w, --wayback         Fetch historical URLs from the Wayback Machine for the given domains.
-  --no-clean-url        Don't clean URL parameters before scanning.
-  --link-mode           Only find and output links/URLs found in JS files.
-  --format-js           Beautify JS code before analysis (requires 'jsbeautifier').
-```
-
-## Example Usage Scenarios
-
-#### 1. Standard Scan from a File
-
-Run a standard scan on a list of URLs, saving findings to a JSONL file.
-
+The scanner runs in batches, processing URLs from the queue. You can run this script periodically.
 ```bash
-python scan.py --verbose urls.txt > results.jsonl
+python scan.py
 ```
 
-#### 2. Usage in an Automation Chain
+#### Step 4: Review Findings
 
-Use `subfinder` to discover subdomains and pipe them directly into JSBot, leveraging the Wayback Machine to find historical URLs for analysis.
-
+To review the findings generated by the scanner, run the interactive agent review CLI. The script will present one finding at a time and prompt you to submit a verdict.
 ```bash
-subfinder -d example.com | python scan.py -w - > results.jsonl```
-
-#### 3. Focused Analysis by Ignoring Common Libraries
-
-Scan a site but ignore common, benign libraries like jQuery and React to focus only on custom-written code.
-
-```bash
-# known_hashes.txt contains the SHA256 hashes of libraries to ignore
-python scan.py --ignore-hashes known_hashes.txt urls.txt
+python agent_review.py
 ```
 
-#### 4. Saving Scripts for Offline Analysis
+Follow the on-screen prompts to enter your JSON verdict.
 
-Crawl all pages and save every unique JavaScript file encountered for later analysis.
+#### Step 5: Generate Reports
 
+To see a report of all findings you have marked as exploitable, run:
 ```bash
-# This will create .js files named by their SHA256 hash
-python scan.py -s urls.txt
+python report.py
 ```
+
+#### Step 6: Run the Feedback Loop (Optional)
+
+To automatically find new targets from your confirmed findings, run:
+```bash
+python feedback_loop.py
+```
+
+## Script Details
+
+*   `database.py`: Defines the SQLite database schema and contains all data access functions. Used by all other scripts.
+*   `add_urls.py`: A CLI tool to add new URLs to the work queue from a file.
+*   `scope_expansion.py`: A CLI tool to find subdomains and historical URLs for a given domain and add them to the queue.
+*   `scan.py`: The core scanning engine. Fetches URLs from the queue, crawls them, and saves scripts and findings to the database.
+*   `agent_review.py`: An interactive CLI for an external agent to review findings and submit verdicts.
+*   `report.py`: A CLI tool to generate a summary report of all confirmed vulnerabilities.
+*   `feedback_loop.py`: A script that finds new targets by analyzing confirmed findings.
+*   `manual_verdict.py`: A utility script for testing; not part of the main workflow.
+*   `test_urls.txt`: A utility file for testing; not part of the main workflow.
