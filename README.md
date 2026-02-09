@@ -1,104 +1,164 @@
-# JSBot: Autonomous JavaScript Security Reconnaissance Tool
+# JSBot
 
-JSBot is a powerful and extensible Python script for security researchers and autonomous agents to crawl web pages, extract JavaScript files, and analyze them for potentially interesting or vulnerable patterns. It automates the discovery of inline and external JavaScript, scans for security-related code snippets, and presents the findings in a structured, machine-readable format.
+JavaScript security scanner with source-to-sink taint analysis and smart target discovery.
 
-Its primary purpose is to serve as the core analysis engine in an automated security pipeline, allowing for continuous, large-scale reconnaissance of web application JavaScript.
+Crawls web pages, extracts JavaScript, and identifies data flows from user-controllable inputs into dangerous sinks. Prioritizes targets most likely to contain vulnerabilities so you find XSS on `dev.example.com/admin/callback?redirect=` before wasting time on `www.example.com`.
 
-## Key Features
-
--   **Automation-Friendly**: Accepts URLs from files or `stdin`, making it easy to chain with other tools in a pipeline.
--   **Structured JSON Output**: Findings are printed as JSON objects, ideal for ingestion into databases or other analysis tools.
--   **Intelligent Filtering**: Can ignore known, benign third-party scripts via a hash-based ignore file, focusing analysis on custom code.
--   **Enhanced Security Patterns**: Uses an expanded and categorized list of regular expressions to identify potential vulnerabilities.
--   **Asynchronous & Concurrent**: Built with `asyncio` and `httpx` for high-speed, concurrent scanning.
--   **Wayback Machine Integration**: Can automatically fetch and scan historical URLs to dramatically expand scope.
--   **Flexible Command-Line Interface**: Rich set of arguments to customize scans (e.g., control concurrency, disable redirects, save scripts).
--   **Link Finder Mode**: A dedicated mode (`--link-mode`) to extract all URLs found within JavaScript files.
--   **Extensible**: Organized code structure makes it easy to add new security patterns and functionality.
-
-## Requirements
-
-The script requires Python 3.8+ and several external libraries.
-
-You can install all dependencies using the provided `requirements.txt` file:
+## Install
 
 ```
 pip install -r requirements.txt
 ```
 
-## Usage
-
-The script is run from the command line, accepting a URL file or `stdin` as its main input.
-
-### Basic Syntax
+## Quick Start
 
 ```bash
-# Scan URLs from a file
-python scan.py [options] urls.txt
+# Scan a list of URLs
+python scan.py urls.txt > results.jsonl
 
-# Pipe URLs from another tool (e.g., subfinder)
-subfinder -d example.com | python scan.py -
+# Pipe from subdomain discovery, enable everything
+subfinder -d example.com | python scan.py -w --discover --spider --smart-sort -v - > results.jsonl
+
+# Only scan high-value targets
+python scan.py --smart-sort --min-score 5 --no-clean-url urls.txt > results.jsonl
 ```
 
-### Command-Line Arguments
+## What It Finds
+
+JSBot detects when user-controllable **sources** flow into dangerous **sinks** within the same function scope.
+
+**Sources** (user input): `location.hash`, `location.search`, `document.URL`, `document.referrer`, `window.name`, `postMessage` event data, `URLSearchParams`, `localStorage.getItem`, `document.cookie`, `e.target.value`
+
+**Sinks** (dangerous operations): `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval`, `Function()`, `setTimeout` with strings, `location.assign`, `location.replace`, jQuery `.html()/.append()`, `v-html`, `dangerouslySetInnerHTML`, `document.cookie` writes, `.postMessage()`
+
+### Finding Types
+
+**`taint_flow`** — source and sink in the same function scope. These are the ones you care about.
+
+```json
+{
+  "source_url": "https://dev.example.com/app",
+  "script_url": "https://dev.example.com/js/app.js",
+  "script_hash": "a1b2c3...",
+  "finding_type": "taint_flow",
+  "sink_category": "DOM XSS",
+  "sink_match": "innerHTML =",
+  "sink_line": 42,
+  "source_category": "location.hash",
+  "source_match": "location.hash",
+  "source_line": 38,
+  "severity": 9,
+  "context": ["  var input = location.hash.slice(1);", "  processInput(input);", "  el.innerHTML = input;"]
+}
+```
+
+**`sink_only`** — dangerous sink found but no user-controllable source in scope. Severity is halved. Still worth reviewing if the function receives data from callers.
+
+```json
+{
+  "source_url": "https://example.com/page",
+  "script_url": "https://example.com/js/utils.js",
+  "script_hash": "d4e5f6...",
+  "finding_type": "sink_only",
+  "sink_category": "Eval Injection",
+  "sink_match": "eval(",
+  "sink_line": 15,
+  "source_category": null,
+  "source_match": null,
+  "source_line": null,
+  "severity": 5,
+  "context": ["  function run(code) {", "    eval(code);", "  }"]
+}
+```
+
+Findings are deduplicated by script hash + sink + source + line numbers. Same code seen on multiple pages is reported once.
+
+## Target Discovery
+
+### URL Scoring (`--smart-sort`)
+
+URLs are scored and scanned in priority order:
+
+| Signal | Points | Examples |
+|--------|--------|---------|
+| Path segment matches keyword | +3 each | `/admin/`, `/api/`, `/callback/`, `/oauth/` |
+| Query parameter name matches keyword | +5 each | `?redirect=`, `?url=`, `?callback=` |
+| Non-www subdomain | +2 | `dev.example.com`, `api.example.com` |
+| Subdomain contains keyword | +4 | `staging.`, `internal.`, `beta.` |
+| Has any query parameters | +2 | Any URL with `?` |
+
+Path matching uses whole segments — `/latest/` won't false-match on `test`. Scores are computed before URL cleaning, so even when params are stripped for dedup the highest score from any variant carries forward.
+
+Use `--min-score N` to skip low-value URLs entirely.
+
+### Path Discovery (`--discover`)
+
+Fetches `robots.txt` and `sitemap.xml` from each domain. Disallowed paths in robots.txt are often the most interesting endpoints — admin panels, internal APIs, debug routes that someone tried to hide.
+
+### Spider Mode (`--spider`)
+
+Follows same-domain `<a href>` links found on crawled pages. Runs as a single pass after the main crawl (depth 1) to avoid spiraling.
+
+## All Options
 
 ```
-usage: scan.py [-h] [-s] [-v] [--show-errors] [-c CONCURRENCY] [--ignore-hashes IGNORE_HASHES] [--no-external] [--no-redirects] [-k] [-w] [--no-clean-url] [--link-mode] [--format-js] url_file
+Scan Configuration:
+  -c, --concurrency N     Concurrent requests (default: 20)
+  -w, --wayback           Expand scope with Wayback Machine historical URLs
+  --no-clean-url          Keep query parameters (default strips them for dedup)
+  --link-mode             Only extract URLs found in JS files
 
-JSBot 2.1 - An autonomous script to find interesting JavaScript for security research.
+Taint Analysis:
+  --context-lines N       Lines of context in findings (default: 3)
 
-positional arguments:
-  url_file              Path to a file with URLs, or '-' to read from stdin.
+Target Discovery:
+  --smart-sort            Prioritize URLs by vulnerability likelihood
+  --discover              Find paths from robots.txt and sitemap.xml
+  --spider                Follow links to discover deeper endpoints
+  --min-score N           Skip URLs scoring below N (default: 0)
 
-options:
-  -h, --help            show this help message and exit
-  -s, --save            Save unique JS files to disk, named by SHA256 hash.
-  -v, --verbose         Enable verbose informational output.
-  --show-errors         Show error messages for failed requests.
-  -c CONCURRENCY, --concurrency CONCURRENCY
-                        Number of concurrent requests. (Default: 20)
-  --ignore-hashes IGNORE_HASHES
-                        Path to a file containing SHA256 hashes of JS files to ignore.
-  --no-external         Don't fetch external JavaScript files.
-  --no-redirects        Don't follow HTTP redirects.
-  -k, --insecure        Disable SSL/TLS certificate verification.
-  -w, --wayback         Fetch historical URLs from the Wayback Machine for the given domains.
-  --no-clean-url        Don't clean URL parameters before scanning.
-  --link-mode           Only find and output links/URLs found in JS files.
-  --format-js           Beautify JS code before analysis (requires 'jsbeautifier').
+HTTP:
+  -H, --header HEADER     Custom header (repeatable)
+  -b, --cookie COOKIE     Cookie header string
+  --no-redirects          Don't follow redirects
+  -k, --insecure          Skip TLS verification
+
+Output:
+  -s, --save              Save unique JS files to disk (named by SHA256)
+  -v, --verbose           Verbose logging to stderr
+  --show-errors           Show HTTP error details
+  --ignore-hashes FILE    SHA256 hashes of scripts to skip
+  --format-js             Beautify JS before analysis
 ```
 
-## Example Usage Scenarios
+## Examples
 
-#### 1. Standard Scan from a File
-
-Run a standard scan on a list of URLs, saving findings to a JSONL file.
+**Bug bounty recon** — discover subdomains, pull historical URLs, find hidden paths, spider for depth, scan highest-value targets first:
 
 ```bash
-python scan.py --verbose urls.txt > results.jsonl
+subfinder -d target.com | python scan.py -w --discover --spider --smart-sort -v - > findings.jsonl
 ```
 
-#### 2. Usage in an Automation Chain
-
-Use `subfinder` to discover subdomains and pipe them directly into JSBot, leveraging the Wayback Machine to find historical URLs for analysis.
+**Targeted scan with auth** — scan an authenticated app:
 
 ```bash
-subfinder -d example.com | python scan.py -w - > results.jsonl```
-
-#### 3. Focused Analysis by Ignoring Common Libraries
-
-Scan a site but ignore common, benign libraries like jQuery and React to focus only on custom-written code.
-
-```bash
-# known_hashes.txt contains the SHA256 hashes of libraries to ignore
-python scan.py --ignore-hashes known_hashes.txt urls.txt
+python scan.py -b "session=abc123" -H "X-CSRF-Token: xyz" --no-clean-url urls.txt > findings.jsonl
 ```
 
-#### 4. Saving Scripts for Offline Analysis
-
-Crawl all pages and save every unique JavaScript file encountered for later analysis.
+**Save all scripts for manual review:**
 
 ```bash
-# This will create .js files named by their SHA256 hash
-python scan.py -s urls.txt
+python scan.py -s --ignore-hashes known_libs.txt urls.txt > findings.jsonl
+```
+
+**Filter to only taint flows** (skip sink-only noise):
+
+```bash
+python scan.py urls.txt | jq 'select(.finding_type == "taint_flow")'
+```
+
+**Grep findings for specific sink types:**
+
+```bash
+python scan.py urls.txt | jq 'select(.sink_category == "DOM XSS" and .severity >= 8)'
 ```
