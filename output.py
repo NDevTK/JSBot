@@ -4,7 +4,6 @@ import sys
 
 # --- Global State ---
 SEEN_FINDINGS = set()
-SEEN_LINKS = set()
 
 # Module-level reference to args, set by scan.py at startup
 ARGS = None

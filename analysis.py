@@ -1,4 +1,4 @@
-"""AST parsing, taint flow analysis, cross-file state, regex fallback."""
+"""AST parsing, taint flow analysis, cross-file state."""
 import re
 import asyncio
 import httpx
@@ -6,33 +6,26 @@ from hashlib import sha256
 from urllib.parse import urljoin
 
 from patterns import (
-    SOURCES, SINKS, LINK_FINDER_PATTERN, JS_PATH_FINDER, SECRET_PATTERNS,
+    SOURCES, SINKS, JS_PATH_FINDER, SECRET_PATTERNS,
     PROTO_POLLUTION_PATTERNS, SSRF_PATTERNS, INSECURE_RANDOMNESS_PATTERNS,
     DYNAMIC_SCRIPT_PATTERNS, POSTMESSAGE_HANDLER_PATTERN, POSTMESSAGE_ORIGIN_CHECK,
 )
-from output import log_message, SEEN_FINDINGS, SEEN_LINKS
+from output import log_message, SEEN_FINDINGS
 from scoring import score_script
 from sourcemaps import try_fetch_sourcemap, get_original_source
 
-# --- Dependency Checks ---
-try:
-    import jsbeautifier
-    JSBEAUTIFIER_AVAILABLE = True
-except ImportError:
-    JSBEAUTIFIER_AVAILABLE = False
-
-try:
-    import tree_sitter_javascript as tsjs
-    from tree_sitter import Language, Parser
-    TREESITTER_AVAILABLE = True
-except ImportError:
-    TREESITTER_AVAILABLE = False
+import jsbeautifier
+import tree_sitter_javascript as tsjs
+from tree_sitter import Language, Parser
 
 # --- Global State (managed by scan.py) ---
 SEEN_SCRIPTS = set()
 CHECKED_JS_URLS = set()
 IGNORED_HASHES = set()
-ARGS = None  # Set by scan.py
+ARGS = None  # Set by scan.py at startup
+
+# --- Constants ---
+CONTEXT_LINES = 3
 
 
 def get_sha256(data):
@@ -41,125 +34,8 @@ def get_sha256(data):
 
 
 def format_javascript(js_code):
-    """Beautifies JavaScript code if available and enabled."""
-    if JSBEAUTIFIER_AVAILABLE and ARGS and ARGS.format_js:
-        return jsbeautifier.beautify(js_code)
-    return js_code
-
-
-# --- Regex-Based Scope Splitting (Fallback) ---
-
-def split_into_scopes(js_code):
-    """Splits JavaScript into function-level scope blocks using regex.
-
-    Falls back to treating the entire file as one scope if no function
-    boundaries are found.
-    """
-    lines = js_code.split('\n')
-    func_pattern = re.compile(
-        r'(?:'
-        r'function\s*\w*\s*\('
-        r'|'
-        r'(?:\w+|\))\s*=>\s*\{'
-        r'|'
-        r'\w+\s*\([^)]*\)\s*\{'
-        r')'
-    )
-
-    func_starts = []
-    for i, line in enumerate(lines):
-        for _ in func_pattern.finditer(line):
-            func_starts.append(i)
-
-    if not func_starts:
-        return [(0, len(lines) - 1, js_code)]
-
-    scopes = []
-    code = js_code
-    covered_ranges = []
-
-    for func_line in func_starts:
-        line_start = sum(len(lines[j]) + 1 for j in range(func_line))
-        brace_pos = code.find('{', line_start)
-        if brace_pos == -1:
-            continue
-
-        depth = 0
-        pos = brace_pos
-        in_single_quote = False
-        in_double_quote = False
-        in_template = False
-        in_line_comment = False
-        in_block_comment = False
-        end_pos = len(code)
-
-        while pos < len(code):
-            ch = code[pos]
-            next_ch = code[pos + 1] if pos + 1 < len(code) else ''
-
-            if in_line_comment:
-                if ch == '\n':
-                    in_line_comment = False
-            elif in_block_comment:
-                if ch == '*' and next_ch == '/':
-                    in_block_comment = False
-                    pos += 1
-            elif in_single_quote:
-                if ch == '\\':
-                    pos += 1
-                elif ch == "'":
-                    in_single_quote = False
-            elif in_double_quote:
-                if ch == '\\':
-                    pos += 1
-                elif ch == '"':
-                    in_double_quote = False
-            elif in_template:
-                if ch == '\\':
-                    pos += 1
-                elif ch == '`':
-                    in_template = False
-            else:
-                if ch == '/' and next_ch == '/':
-                    in_line_comment = True
-                    pos += 1
-                elif ch == '/' and next_ch == '*':
-                    in_block_comment = True
-                    pos += 1
-                elif ch == "'":
-                    in_single_quote = True
-                elif ch == '"':
-                    in_double_quote = True
-                elif ch == '`':
-                    in_template = True
-                elif ch == '{':
-                    depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0:
-                        end_pos = pos
-                        break
-            pos += 1
-
-        block_text = code[brace_pos:end_pos + 1]
-        block_start_line = code[:brace_pos].count('\n')
-        block_end_line = code[:end_pos + 1].count('\n')
-        scopes.append((block_start_line, block_end_line, block_text))
-        covered_ranges.append((block_start_line, block_end_line))
-
-    # Build global scope from lines NOT inside any function
-    global_lines = []
-    for i, line in enumerate(lines):
-        inside = any(start <= i <= end for start, end in covered_ranges)
-        if not inside:
-            global_lines.append(line)
-        else:
-            global_lines.append('')
-    global_text = '\n'.join(global_lines)
-    if global_text.strip():
-        scopes.append((0, len(lines) - 1, global_text))
-
-    return scopes
+    """Beautifies JavaScript code."""
+    return jsbeautifier.beautify(js_code)
 
 
 # --- AST-Based Analysis (tree-sitter) ---
@@ -380,11 +256,8 @@ _ast_analyzer = None
 def get_ast_analyzer():
     """Get or create the singleton AST analyzer."""
     global _ast_analyzer
-    if _ast_analyzer is None and TREESITTER_AVAILABLE:
-        try:
-            _ast_analyzer = ASTAnalyzer()
-        except Exception:
-            pass
+    if _ast_analyzer is None:
+        _ast_analyzer = ASTAnalyzer()
     return _ast_analyzer
 
 
@@ -400,7 +273,7 @@ def get_context_lines(js_code, line_number, context_size):
 
 def _emit_grouped_findings(findings, script_content, script_hash, url, script_url, method):
     """Emit taint findings, grouping when a single source reaches multiple sinks."""
-    context_size = ARGS.context_lines if ARGS and hasattr(ARGS, 'context_lines') else 3
+    context_size = CONTEXT_LINES
 
     # Group by (source_category, source_line)
     grouped = {}
@@ -457,68 +330,8 @@ def _emit_grouped_findings(findings, script_content, script_hash, url, script_ur
             })
 
 
-def analyze_taint_flow_regex(script_content, script_hash, url, script_url=None):
-    """Regex-based source-to-sink taint analysis within function scopes."""
-    context_size = ARGS.context_lines if ARGS and hasattr(ARGS, 'context_lines') else 3
-    include_sink_only = ARGS and hasattr(ARGS, 'include_sink_only') and ARGS.include_sink_only
-    scopes = split_into_scopes(script_content)
-    collected = []
-
-    for scope_start, scope_end, block_text in scopes:
-        found_sources = []
-        for source_name, source_pattern in SOURCES.items():
-            for m in re.finditer(source_pattern, block_text, re.IGNORECASE):
-                source_line = scope_start + block_text[:m.start()].count('\n') + 1
-                found_sources.append({
-                    "category": source_name,
-                    "match": m.group(0),
-                    "line": source_line,
-                })
-
-        for sink_name, sink_info in SINKS.items():
-            for m in re.finditer(sink_info["pattern"], block_text, re.IGNORECASE):
-                sink_line = scope_start + block_text[:m.start()].count('\n') + 1
-
-                if found_sources:
-                    closest_source = min(found_sources, key=lambda s: abs(s["line"] - sink_line))
-                    collected.append({
-                        "sink_category": sink_name,
-                        "sink_match": m.group(0),
-                        "sink_line": sink_line,
-                        "source_category": closest_source["category"],
-                        "source_match": closest_source["match"],
-                        "source_line": closest_source["line"],
-                        "severity": sink_info["severity"],
-                    })
-                elif include_sink_only:
-                    finding_key = f"{script_hash}:{sink_name}:{sink_line}:none:none"
-                    if finding_key in SEEN_FINDINGS:
-                        continue
-                    SEEN_FINDINGS.add(finding_key)
-                    log_message("FINDING", {
-                        "source_url": url,
-                        "script_url": script_url or "inline",
-                        "script_hash": script_hash,
-                        "finding_type": "sink_only",
-                        "sink_category": sink_name,
-                        "sink_match": m.group(0),
-                        "sink_line": sink_line,
-                        "source_category": None,
-                        "source_match": None,
-                        "source_line": None,
-                        "severity": sink_info["severity"] // 2,
-                        "confidence": "low",
-                        "analysis_method": "regex",
-                        "context": get_context_lines(script_content, sink_line, context_size),
-                    })
-
-    _emit_grouped_findings(collected, script_content, script_hash, url, script_url, "regex")
-
-
 def analyze_taint_flow_ast(script_content, script_hash, url, analyzer, tree, script_url=None):
     """AST-based source-to-sink taint analysis within function scopes."""
-    context_size = ARGS.context_lines if ARGS and hasattr(ARGS, 'context_lines') else 3
-    include_sink_only = ARGS and hasattr(ARGS, 'include_sink_only') and ARGS.include_sink_only
     source_bytes = script_content.encode('utf-8')
     collected = []
 
@@ -548,34 +361,13 @@ def analyze_taint_flow_ast(script_content, script_hash, url, analyzer, tree, scr
                     "source_line": closest_source["line"],
                     "severity": sink["severity"],
                 })
-            elif include_sink_only:
-                finding_key = f"{script_hash}:{sink['category']}:{sink['line']}:none:none"
-                if finding_key in SEEN_FINDINGS:
-                    continue
-                SEEN_FINDINGS.add(finding_key)
-                log_message("FINDING", {
-                    "source_url": url,
-                    "script_url": script_url or "inline",
-                    "script_hash": script_hash,
-                    "finding_type": "sink_only",
-                    "sink_category": sink["category"],
-                    "sink_match": sink["match"],
-                    "sink_line": sink["line"],
-                    "source_category": None,
-                    "source_match": None,
-                    "source_line": None,
-                    "severity": sink["severity"] // 2,
-                    "confidence": "low",
-                    "analysis_method": "ast",
-                    "context": get_context_lines(script_content, sink["line"], context_size),
-                })
 
     _emit_grouped_findings(collected, script_content, script_hash, url, script_url, "ast")
 
 
 def analyze_secrets(script_content, script_hash, url, script_url=None):
     """Detect hardcoded secrets and API keys."""
-    context_size = ARGS.context_lines if ARGS and hasattr(ARGS, 'context_lines') else 3
+    context_size = CONTEXT_LINES
     for secret_name, secret_info in SECRET_PATTERNS.items():
         for m in re.finditer(secret_info["pattern"], script_content):
             line = script_content[:m.start()].count('\n') + 1
@@ -602,7 +394,7 @@ def analyze_secrets(script_content, script_hash, url, script_url=None):
 
 def analyze_postmessage(script_content, script_hash, url, analyzer, tree, script_url=None):
     """Detect postMessage handlers without origin checks."""
-    context_size = ARGS.context_lines if ARGS and hasattr(ARGS, 'context_lines') else 3
+    context_size = CONTEXT_LINES
     source_bytes = script_content.encode('utf-8')
 
     findings = analyzer.find_postmessage_handlers(tree, source_bytes)
@@ -630,7 +422,7 @@ def analyze_postmessage(script_content, script_hash, url, analyzer, tree, script
 
 def analyze_proto_pollution(script_content, script_hash, url, script_url=None):
     """Detect prototype pollution patterns."""
-    context_size = ARGS.context_lines if ARGS and hasattr(ARGS, 'context_lines') else 3
+    context_size = CONTEXT_LINES
     for name, info in PROTO_POLLUTION_PATTERNS.items():
         for m in re.finditer(info["pattern"], script_content):
             line = script_content[:m.start()].count('\n') + 1
@@ -655,7 +447,7 @@ def analyze_proto_pollution(script_content, script_hash, url, script_url=None):
 
 def analyze_ssrf(script_content, script_hash, url, script_url=None):
     """Detect potential SSRF patterns (fetch/xhr with dynamic URLs)."""
-    context_size = ARGS.context_lines if ARGS and hasattr(ARGS, 'context_lines') else 3
+    context_size = CONTEXT_LINES
     for name, info in SSRF_PATTERNS.items():
         for m in re.finditer(info["pattern"], script_content):
             line = script_content[:m.start()].count('\n') + 1
@@ -680,7 +472,7 @@ def analyze_ssrf(script_content, script_hash, url, script_url=None):
 
 def analyze_insecure_randomness(script_content, script_hash, url, script_url=None):
     """Detect Math.random() near security-sensitive contexts."""
-    context_size = ARGS.context_lines if ARGS and hasattr(ARGS, 'context_lines') else 3
+    context_size = CONTEXT_LINES
     # Only flag Math.random if near security keywords
     security_ctx = re.compile(
         r'\b(?:token|nonce|secret|csrf|random.*id|session|key|salt|password|otp)\b',
@@ -716,7 +508,7 @@ def analyze_insecure_randomness(script_content, script_hash, url, script_url=Non
 
 def analyze_dynamic_scripts(script_content, script_hash, url, script_url=None):
     """Detect dynamic script element creation."""
-    context_size = ARGS.context_lines if ARGS and hasattr(ARGS, 'context_lines') else 3
+    context_size = CONTEXT_LINES
     for name, info in DYNAMIC_SCRIPT_PATTERNS.items():
         for m in re.finditer(info["pattern"], script_content):
             line = script_content[:m.start()].count('\n') + 1
@@ -827,7 +619,7 @@ class CrossFileState:
         if not tainted_globals:
             return
 
-        context_size = ARGS.context_lines if ARGS and hasattr(ARGS, 'context_lines') else 3
+        context_size = CONTEXT_LINES
         for read in self.global_reads_into_sinks:
             if read["global_name"] not in tainted_globals:
                 continue
@@ -886,33 +678,13 @@ class CrossFileState:
 
 def check_script_safety(script_content, script_hash, url, script_url=None):
     """Routes script to appropriate analysis methods."""
-    if ARGS and ARGS.link_mode:
-        for match in re.finditer(LINK_FINDER_PATTERN, script_content, re.IGNORECASE):
-            finding = {
-                "source_url": url,
-                "script_url": script_url or "inline",
-                "script_hash": script_hash,
-                "category": "Link Finder",
-                "matched_text": match.group(0),
-                "line_number": script_content.count('\n', 0, match.start()) + 1,
-            }
-            hashed_link = get_sha256(match.group(0))
-            if hashed_link not in SEEN_LINKS:
-                log_message("FINDING", finding)
-                SEEN_LINKS.add(hashed_link)
-        return
-
-    # Try AST-based analysis first
+    # AST-based analysis
     analyzer = get_ast_analyzer()
-    tree = None
-    if analyzer:
-        tree = analyzer.parse(script_content)
+    tree = analyzer.parse(script_content)
 
-    if analyzer and tree:
+    if tree:
         analyze_taint_flow_ast(script_content, script_hash, url, analyzer, tree, script_url)
         analyze_postmessage(script_content, script_hash, url, analyzer, tree, script_url)
-    else:
-        analyze_taint_flow_regex(script_content, script_hash, url, script_url)
 
     # Pattern-based detections (always run, regex-based)
     analyze_secrets(script_content, script_hash, url, script_url)

@@ -9,18 +9,8 @@ from bs4 import BeautifulSoup
 
 from output import log_message
 
-# --- Dependency Availability Checks ---
-try:
-    from waybackpy import WaybackMachineCDXServerAPI
-    WAYBACK_AVAILABLE = True
-except ImportError:
-    WAYBACK_AVAILABLE = False
-
-try:
-    import psycopg2
-    PSYCOPG2_AVAILABLE = True
-except ImportError:
-    PSYCOPG2_AVAILABLE = False
+from waybackpy import WaybackMachineCDXServerAPI
+import psycopg2
 
 
 # --- Certificate Transparency Discovery ---
@@ -218,9 +208,6 @@ def ct_fetch_next_month(domain, state):
 
 def fetch_wayback_urls(domains, user_agent):
     """Fetches historical URLs from the Wayback Machine."""
-    if not WAYBACK_AVAILABLE:
-        log_message("ERROR", "WaybackPy not installed. Skipping wayback machine fetch.")
-        return []
     all_urls = set()
     for domain in domains:
         domain = domain.strip()

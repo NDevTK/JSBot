@@ -33,19 +33,6 @@ from discovery import (
     ct_load_state, ct_save_state, ct_fetch_next_month,
 )
 
-# --- Dependency Availability Checks ---
-try:
-    from waybackpy import WaybackMachineCDXServerAPI
-    WAYBACK_AVAILABLE = True
-except ImportError:
-    WAYBACK_AVAILABLE = False
-
-try:
-    import psycopg2
-    PSYCOPG2_AVAILABLE = True
-except ImportError:
-    PSYCOPG2_AVAILABLE = False
-
 # --- Global State ---
 CHECKED_URLS = set()
 DISCOVERED_URLS = set()
@@ -113,8 +100,6 @@ async def domain_discovery_worker(domain_queue, url_queue, client, args):
                 continue
             discovered = await discover_paths(domain, client)
             for url in discovered:
-                if args.min_score > 0 and score_url(url) < args.min_score:
-                    continue
                 url_hash = get_sha256(url)
                 if url_hash not in DISCOVERED_URLS:
                     DISCOVERED_URLS.add(url_hash)
@@ -152,9 +137,6 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
             if parsed.hostname and parsed.hostname in DEAD_DOMAINS:
                 continue
 
-            if args.min_score > 0 and score_url(url) < args.min_score:
-                continue
-
             log_message("INFO", f"Crawling: {url}")
             response = await client.get(url, timeout=timeout)
             content_type = response.headers.get('content-type', '').lower()
@@ -170,7 +152,6 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
 
             # HTML content
             elif 'html' in content_type:
-                analyzer = get_ast_analyzer()
                 page_parser = BeautifulSoup(response.text, 'lxml')
 
                 # Collect all scripts for this page
@@ -199,7 +180,7 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
 
                 # Build PageTracker for cross-file analysis
                 tracker = None
-                if analyzer and script_items:
+                if script_items:
                     cross_file = CrossFileState()
                     tracker = PageTracker(
                         page_url=url,
@@ -239,15 +220,14 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
                         pass
 
                 # Spider: feed links back into url_queue
-                if args.spider:
-                    parsed_url = urlparse(url)
-                    base_domain = '.'.join((parsed_url.hostname or '').split('.')[-2:])
-                    new_links = spider_links(response.text, response.url, base_domain)
-                    for link in new_links:
-                        link_hash = get_sha256(link)
-                        if link_hash not in DISCOVERED_URLS and link_hash not in CHECKED_URLS:
-                            DISCOVERED_URLS.add(link_hash)
-                            await url_queue.put(link)
+                parsed_url = urlparse(url)
+                base_domain = '.'.join((parsed_url.hostname or '').split('.')[-2:])
+                new_links = spider_links(response.text, response.url, base_domain)
+                for link in new_links:
+                    link_hash = get_sha256(link)
+                    if link_hash not in DISCOVERED_URLS and link_hash not in CHECKED_URLS:
+                        DISCOVERED_URLS.add(link_hash)
+                        await url_queue.put(link)
 
             else:
                 log_message("INFO", f"Skipping non-HTML/JS content at {url}")
@@ -306,8 +286,7 @@ async def js_audit_worker(js_queue, client, args, executor):
                 )
 
                 # Source map (async fetch, sync re-analysis)
-                if (not getattr(args, 'no_sourcemaps', False)
-                        and item.script_url and item.script_url != "inline"):
+                if item.script_url and item.script_url != "inline":
                     try:
                         sourcemap = await try_fetch_sourcemap(item.script_url, js_code, client)
                         if sourcemap:
@@ -375,17 +354,16 @@ async def _decrement_page_tracker(page_tracker, executor, loop):
         return
     async with page_tracker.lock:
         page_tracker.remaining -= 1
-        if page_tracker.remaining <= 0:
+        if page_tracker.remaining <= 0 and page_tracker.cross_file.scripts:
             analyzer = get_ast_analyzer()
-            if analyzer and page_tracker.cross_file.scripts:
-                try:
-                    await loop.run_in_executor(
-                        executor,
-                        page_tracker.cross_file.collect_globals, analyzer,
-                    )
-                    page_tracker.cross_file.emit_cross_file_findings(page_tracker.page_url)
-                except Exception as e:
-                    log_message("ERROR", f"Cross-file analysis failed for {page_tracker.page_url}: {e}")
+            try:
+                await loop.run_in_executor(
+                    executor,
+                    page_tracker.cross_file.collect_globals, analyzer,
+                )
+                page_tracker.cross_file.emit_cross_file_findings(page_tracker.page_url)
+            except Exception as e:
+                log_message("ERROR", f"Cross-file analysis failed for {page_tracker.page_url}: {e}")
 
 
 # --- Producer Coroutines ---
@@ -477,9 +455,8 @@ async def ct_producer(url_queue, domain_queue, args, executor):
             log_message("INFO", f"CT: {len(new_subs)} new subdomains to scan")
             for sub in new_subs:
                 await url_queue.put(f'https://{sub}/')
-            if args.discover:
-                for sub in new_subs:
-                    await domain_queue.put(sub)
+            for sub in new_subs:
+                await domain_queue.put(sub)
             state['scanned_subdomains'] = sorted(
                 set(state['scanned_subdomains']) | new_subs
             )
@@ -546,14 +523,13 @@ async def run_pipeline(args, client, initial_urls):
         producers.append(asyncio.create_task(ct_wrapper()))
 
     # Wayback producer — runs in background while initial URLs are already being crawled
-    if args.wayback:
-        async def wb_wrapper():
-            await url_tracker.register()
-            try:
-                await wayback_producer(url_queue, domain_queue, initial_urls, executor)
-            finally:
-                await url_tracker.unregister()
-        producers.append(asyncio.create_task(wb_wrapper()))
+    async def wb_wrapper():
+        await url_tracker.register()
+        try:
+            await wayback_producer(url_queue, domain_queue, initial_urls, executor)
+        finally:
+            await url_tracker.unregister()
+    producers.append(asyncio.create_task(wb_wrapper()))
 
     # Domain discovery workers are also url_queue producers
     for _ in range(num_domain_workers):
@@ -681,30 +657,10 @@ if __name__ == '__main__':
     else:
         args._input_type = 'domain'
 
-    # --- Opinionated defaults — JSBot decides ---
     args.concurrency = 20
-    args.wayback = WAYBACK_AVAILABLE
-    args.smart_sort = True
-    args.discover = True
-    args.spider = True
-    args.min_score = 0
-    args.context_lines = 3
-    args.include_sink_only = False
-    args.link_mode = False
-    args.format_js = True
-    args.no_sourcemaps = False
-    args.no_clean_url = False
-    args.no_redirects = False
-    args.insecure = False
 
     # CT discovery: automatic for domain input
     args.ct = args.input if args._input_type == 'domain' else None
-
-    if args.ct and not PSYCOPG2_AVAILABLE:
-        print(f"[*] CT log discovery needs psycopg2-binary (pip install psycopg2-binary). "
-              f"Scanning {args.input} as URL.", file=sys.stderr)
-        args.ct = None
-        args._input_type = 'url'
 
     try:
         asyncio.run(main(args))

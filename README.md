@@ -2,17 +2,13 @@
 
 Opinionated JavaScript security scanner. Give it a domain, it does the rest.
 
-JSBot handles target discovery, crawling, JS extraction, deduplication, and security analysis as a single pipeline. Point it at a domain — it finds subdomains via CT logs, pulls historical URLs from the Wayback Machine, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps for original code, deduplicates scripts by structural hash, analyzes with tree-sitter AST parsing (regex fallback), tracks taint flows across scripts on the same page, and scores every script for security research interestingness. You don't pick the tools or tune the settings — JSBot decides.
+JSBot handles target discovery, crawling, JS extraction, deduplication, and security analysis as a single pipeline. Point it at a domain — it finds subdomains via CT logs, pulls historical URLs from the Wayback Machine, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps for original code, deduplicates scripts by structural hash, analyzes with tree-sitter AST parsing, tracks taint flows across scripts on the same page, and scores every script for security research interestingness. You don't pick the tools or tune the settings — JSBot decides.
 
 ## Install
 
 ```
 pip install -r requirements.txt
 ```
-
-Core: `httpx[http2]`, `beautifulsoup4`, `lxml`, `jsbeautifier`
-AST analysis: `tree-sitter`, `tree-sitter-javascript` (optional — falls back to regex)
-Discovery: `waybackpy` (for Wayback), `psycopg2-binary` (for CT logs)
 
 ## Usage
 
@@ -50,9 +46,9 @@ That's it. Everything else is automatic.
 
 ## What It Finds
 
-### Taint Flows (AST + regex)
+### Taint Flows (AST)
 
-User-controllable **sources** flowing into dangerous **sinks** within the same function scope. AST mode uses tree-sitter for real function boundaries and filters false positives (e.g., `eval("2+2")` with only literal arguments is suppressed). Falls back to regex scope splitting when tree-sitter is unavailable.
+User-controllable **sources** flowing into dangerous **sinks** within the same function scope. Uses tree-sitter for real function boundaries and filters false positives (e.g., `eval("2+2")` with only literal arguments is suppressed).
 
 **Sources**: `location.hash/search/href/pathname`, `document.URL/referrer`, `window.name`, `event.data` (postMessage), `URLSearchParams`, `localStorage/sessionStorage.getItem`, `document.cookie`, `e.target.value`
 
@@ -117,7 +113,6 @@ AST-based: finds `addEventListener("message", handler)` where the handler body d
 
 Tracks `window.X = taintedValue` assignments across all scripts on the same page. If script A writes tainted data to a global and script B reads that global into a sink, JSBot emits a `cross_file_taint` finding. Also detects dangerous global functions — `window.renderHTML = (html) => { el.innerHTML = html }` — that any script can call.
 
-Requires tree-sitter (AST mode only).
 
 ### Source Map Analysis
 
@@ -182,8 +177,8 @@ URLs are scored and scanned highest-first:
 
 | Type | Method | Description |
 |------|--------|-------------|
-| `taint_flow` | AST/regex | Source flows into sink in same scope |
-| `taint_flow_grouped` | AST/regex | One source reaches multiple sinks |
+| `taint_flow` | AST | Source flows into sink in same scope |
+| `taint_flow_grouped` | AST | One source reaches multiple sinks |
 | `secret` | regex | Hardcoded API key, token, or credential |
 | `prototype_pollution` | regex | `__proto__`, Object.assign, bracket chains |
 | `postmessage_no_origin` | AST | Message listener without origin check |
