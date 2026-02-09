@@ -1,8 +1,8 @@
 # JSBot
 
-Opinionated JavaScript security scanner. Finds what matters in JS without manual tuning.
+Opinionated JavaScript security scanner. Give it a domain, it does the rest.
 
-JSBot crawls pages, extracts JavaScript, deduplicates by structural hash, analyzes with tree-sitter AST parsing (regex fallback), fetches source maps for original code, tracks taint flows across scripts on the same page, detects secrets/prototype pollution/SSRF/postMessage issues, and scores every script for security research interestingness. It decides the best way to discover targets, prioritize them, and analyze them — you just point it at URLs.
+JSBot handles target discovery, crawling, JS extraction, deduplication, and security analysis as a single pipeline. Point it at a domain — it finds subdomains via CT logs, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps for original code, deduplicates scripts by structural hash, analyzes with tree-sitter AST parsing (regex fallback), tracks taint flows across scripts on the same page, and scores every script for security research interestingness. You don't pick the tools or tune the settings — JSBot decides.
 
 ## Install
 
@@ -12,31 +12,28 @@ pip install -r requirements.txt
 
 Core: `httpx[http2]`, `beautifulsoup4`, `lxml`, `jsbeautifier`
 AST analysis: `tree-sitter`, `tree-sitter-javascript` (optional — falls back to regex)
-Discovery: `waybackpy` (for `--wayback`), `psycopg2-binary` (for `--ct`)
+Discovery: `waybackpy` (for Wayback), `psycopg2-binary` (for CT logs)
 
 ## Quick Start
 
 ```bash
-# Point it at URLs — discovery, spidering, smart sorting, source maps, and beautification are all on by default
+# Give it a domain — CT log subdomain discovery, Wayback history, spidering, source maps, all automatic
+python scan.py --ct example.com -w -v > results.jsonl
+
+# Or give it URLs if you already have them
 python scan.py urls.txt > results.jsonl
 
-# Pipe from subdomain tools
-subfinder -d example.com | httpx | python scan.py - > results.jsonl
-
-# CT log recon — discover subdomains from certificate transparency and scan each one
-python scan.py --ct example.com -v > results.jsonl
-
-# Add Wayback Machine historical URLs
-python scan.py -w urls.txt > results.jsonl
-
-# Disable all auto-discovery for a fast, targeted scan
-python scan.py --minimal urls.txt > results.jsonl
+# Stdin works too
+echo "https://example.com" | python scan.py - > results.jsonl
 
 # Authenticated scan
-python scan.py -b "session=abc123" -H "X-CSRF-Token: xyz" urls.txt > results.jsonl
+python scan.py --ct example.com -b "session=abc123" -H "X-CSRF-Token: xyz" > results.jsonl
+
+# Fast targeted scan — skip discovery, just crawl and analyze
+python scan.py --minimal urls.txt > results.jsonl
 ```
 
-Zero flags needed for a good scan. `--minimal` strips auto-discovery back to bare crawl-and-analyze.
+Zero flags needed for a good scan. Discovery, spidering, smart sorting, source maps, and beautification are all on by default. `--minimal` strips it back to bare crawl-and-analyze.
 
 ## What It Finds
 
@@ -151,13 +148,9 @@ Discovers subdomains from Certificate Transparency logs via the crt.sh PostgreSQ
 
 1. Queries crt.sh one month at a time (current backward to 2019)
 2. Extracts subdomains from certificate SANs
-3. Scans each batch before fetching the next month
+3. Feeds discovered URLs into the scan pipeline immediately — scanning and discovery run concurrently
 4. Caches results in `.ct_cache/` — re-running resumes where it left off
 5. Reports related domains (shared SANs from the same organization)
-
-```bash
-python scan.py --ct target.com -v > results.jsonl
-```
 
 ### Path Discovery
 
@@ -227,20 +220,17 @@ Output & Analysis:
 ## Examples
 
 ```bash
-# Default scan — just works
+# Full recon on a domain — finds subdomains, crawls, spiders, analyzes
+python scan.py --ct target.com -w -v > findings.jsonl
+
+# Scan specific URLs
 python scan.py urls.txt > findings.jsonl
-
-# Full recon pipeline
-subfinder -d target.com | httpx | python scan.py -w -v - > findings.jsonl
-
-# CT discovery
-python scan.py --ct target.com -v > findings.jsonl
 
 # Fast targeted scan, no discovery
 python scan.py --minimal urls.txt > findings.jsonl
 
 # Authenticated app
-python scan.py -b "session=abc" -H "X-CSRF-Token: xyz" urls.txt > findings.jsonl
+python scan.py --ct target.com -b "session=abc" -H "X-CSRF-Token: xyz" > findings.jsonl
 
 # Save scripts, skip known libraries
 python scan.py -s --ignore-hashes known_libs.txt urls.txt > findings.jsonl
