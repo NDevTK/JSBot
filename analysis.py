@@ -940,7 +940,7 @@ def check_script_safety(script_content, script_hash, url, script_url=None):
             })
 
 
-def _structural_hash(js_code):
+def structural_hash(js_code):
     """Compute a structural hash that normalizes whitespace/comments."""
     # Strip single-line comments, block comments, and normalize whitespace
     stripped = re.sub(r'//[^\n]*', '', js_code)
@@ -956,7 +956,7 @@ async def process_javascript(js_code, url, client, script_url=None, cross_file_s
 
     js_code = format_javascript(js_code)
     raw_hash = get_sha256(js_code)
-    structural = _structural_hash(js_code)
+    structural = structural_hash(js_code)
 
     # Check both raw hash (--ignore-hashes compat) and structural hash for dedup
     if raw_hash in IGNORED_HASHES:

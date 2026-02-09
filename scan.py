@@ -1,25 +1,32 @@
 """JSBot 5.0 — Opinionated JavaScript security scanner.
 
-Orchestrator: CLI, crawling, scan loops. Analysis lives in analysis.py,
-patterns in patterns.py, discovery in discovery.py, scoring in scoring.py.
+Async pipeline: domain discovery → page crawling → JS audit.
+All three stages run concurrently via asyncio.Queue.
 """
 import argparse
 import asyncio
-import httpx
+import concurrent.futures
+import re
 import sys
-from urllib.parse import urljoin, urlparse
+from collections import namedtuple
+from dataclasses import dataclass, field
 from random import shuffle
+from urllib.parse import urljoin, urlparse
 
+import httpx
 from bs4 import BeautifulSoup
 
 import output
 from output import log_message
 from scoring import score_url
+from patterns import JS_PATH_FINDER
 from analysis import (
-    process_javascript, find_and_process_js_paths, get_sha256,
+    format_javascript, structural_hash, get_sha256, get_ast_analyzer,
+    check_script_safety,
     SEEN_SCRIPTS, CHECKED_JS_URLS, IGNORED_HASHES,
-    CrossFileState, get_ast_analyzer,
+    CrossFileState,
 )
+from sourcemaps import try_fetch_sourcemap, get_original_source
 from discovery import (
     discover_paths, spider_links, fetch_wayback_urls,
     ct_load_state, ct_save_state, ct_fetch_next_month,
@@ -46,39 +53,122 @@ DISCOVERED_URLS = set()
 class Config:
     USER_AGENT = 'JSBot/5.0 (Autonomous Security Agent)'
 
+# --- Pipeline Data Structures ---
+_POISON = object()
 
-async def crawl_url(url, client, workers, args, spider_queue=None):
-    """Crawls a single URL, extracts and processes scripts."""
-    async with workers:
+JsWorkItem = namedtuple('JsWorkItem', [
+    'js_code', 'page_url', 'script_url', 'page_tracker',
+])
+
+
+@dataclass
+class PageTracker:
+    """Coordinates cross-file analysis — counts scripts remaining for one page."""
+    page_url: str
+    cross_file: CrossFileState
+    total: int
+    remaining: int = field(init=False)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    def __post_init__(self):
+        self.remaining = self.total
+
+
+class ProducerTracker:
+    """Tracks active producers for a queue. Sends poison pills when all finish."""
+
+    def __init__(self, queue, num_consumers):
+        self._queue = queue
+        self._num_consumers = num_consumers
+        self._active = 0
+        self._lock = asyncio.Lock()
+        self._done = False
+
+    async def register(self):
+        async with self._lock:
+            self._active += 1
+
+    async def unregister(self):
+        async with self._lock:
+            self._active -= 1
+            if self._active <= 0 and not self._done:
+                self._done = True
+                for _ in range(self._num_consumers):
+                    await self._queue.put(_POISON)
+
+
+# --- Worker Coroutines ---
+
+async def domain_discovery_worker(domain_queue, url_queue, client, args):
+    """Pulls domains from domain_queue, runs discover_paths, puts URLs into url_queue."""
+    while True:
+        domain = await domain_queue.get()
+        if domain is _POISON:
+            domain_queue.task_done()
+            break
+        try:
+            discovered = await discover_paths(domain, client)
+            for url in discovered:
+                if args.min_score > 0 and score_url(url) < args.min_score:
+                    continue
+                url_hash = get_sha256(url)
+                if url_hash not in DISCOVERED_URLS:
+                    DISCOVERED_URLS.add(url_hash)
+                    await url_queue.put(url)
+            if discovered:
+                log_message("INFO", f"Discovery for {domain}: {len(discovered)} URLs")
+        except Exception as e:
+            log_message("ERROR", f"Discovery failed for {domain}: {e}")
+        finally:
+            domain_queue.task_done()
+
+
+async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
+    """Pulls URLs, fetches pages, puts scripts into js_queue, spiders back into url_queue."""
+    timeout = httpx.Timeout(10.0, connect=5.0)
+
+    while True:
+        url = await url_queue.get()
+        if url is _POISON:
+            url_queue.task_done()
+            break
+
+        await url_tracker.register()
         try:
             hashed_url = get_sha256(url)
             if hashed_url in CHECKED_URLS:
-                return
+                continue
             CHECKED_URLS.add(hashed_url)
 
+            if args.min_score > 0 and score_url(url) < args.min_score:
+                continue
+
             log_message("INFO", f"Crawling: {url}")
-            response = await client.get(url, timeout=10)
+            response = await client.get(url, timeout=timeout)
             content_type = response.headers.get('content-type', '').lower()
 
             # Direct JS file
             if 'javascript' in content_type:
-                await process_javascript(response.text, url, client, script_url=str(response.url))
-                return
+                await js_queue.put(JsWorkItem(
+                    js_code=response.text,
+                    page_url=url,
+                    script_url=str(response.url),
+                    page_tracker=None,
+                ))
 
             # HTML content
-            if 'html' in content_type:
-                # Cross-file state collects scripts from this page
-                cross_file = CrossFileState()
+            elif 'html' in content_type:
                 analyzer = get_ast_analyzer()
-
                 page_parser = BeautifulSoup(response.text, 'lxml')
-                tasks = []
+
+                # Collect all scripts for this page
+                script_items = []
                 for script in page_parser.find_all('script'):
                     if not script.get('src'):
-                        tasks.append(process_javascript(
-                            script.string or "", url, client,
-                            cross_file_state=cross_file if analyzer else None,
-                        ))
+                        js = script.string or ""
+                        if js.strip():
+                            script_items.append((js, None))
+
                 for script in page_parser.find_all('script', src=True):
                     script_url = urljoin(str(response.url), script['src'])
                     hashed_script_url = get_sha256(script_url)
@@ -86,27 +176,58 @@ async def crawl_url(url, client, workers, args, spider_queue=None):
                         continue
                     CHECKED_JS_URLS.add(hashed_script_url)
                     try:
-                        script_response = await client.get(script_url, timeout=10)
-                        tasks.append(process_javascript(
-                            script_response.text, url, client, script_url=script_url,
-                            cross_file_state=cross_file if analyzer else None,
-                        ))
+                        resp = await client.get(script_url, timeout=timeout)
+                        if resp.status_code < 400 and 'javascript' in resp.headers.get('content-type', '').lower():
+                            script_items.append((resp.text, script_url))
+                        elif resp.status_code < 400:
+                            # No content-type check for <script src> — server might not set it
+                            script_items.append((resp.text, script_url))
                     except httpx.RequestError as e:
                         log_message("ERROR", f"Failed to fetch script {script_url}: {e}")
 
-                await asyncio.gather(*tasks)
-                await find_and_process_js_paths(response.text, str(response.url), client)
+                # Build PageTracker for cross-file analysis
+                tracker = None
+                if analyzer and script_items:
+                    cross_file = CrossFileState()
+                    tracker = PageTracker(
+                        page_url=url,
+                        cross_file=cross_file,
+                        total=len(script_items),
+                    )
 
-                # Cross-file analysis: check for taint flows across scripts
-                if analyzer and cross_file.scripts:
+                # Enqueue each script
+                for js_code, script_url in script_items:
+                    await js_queue.put(JsWorkItem(
+                        js_code=js_code,
+                        page_url=url,
+                        script_url=script_url,
+                        page_tracker=tracker,
+                    ))
+
+                # Discover JS paths referenced in HTML
+                for match in re.finditer(JS_PATH_FINDER, response.text):
+                    path = match.group(1)
+                    if path.startswith('//'):
+                        path = f"https:{path}"
+                    js_url = urljoin(str(response.url), path)
+                    hashed = get_sha256(js_url)
+                    if hashed in CHECKED_JS_URLS:
+                        continue
+                    CHECKED_JS_URLS.add(hashed)
                     try:
-                        cross_file.collect_globals(analyzer)
-                        cross_file.emit_cross_file_findings(url)
-                    except Exception as e:
-                        log_message("ERROR", f"Cross-file analysis failed for {url}: {e}")
+                        js_resp = await client.get(js_url, timeout=timeout)
+                        if js_resp.status_code < 400:
+                            await js_queue.put(JsWorkItem(
+                                js_code=js_resp.text,
+                                page_url=url,
+                                script_url=js_url,
+                                page_tracker=None,
+                            ))
+                    except httpx.RequestError:
+                        pass
 
-                # Spider mode: collect same-domain links
-                if spider_queue is not None and args.spider:
+                # Spider: feed links back into url_queue
+                if args.spider:
                     parsed_url = urlparse(url)
                     base_domain = '.'.join((parsed_url.hostname or '').split('.')[-2:])
                     new_links = spider_links(response.text, response.url, base_domain)
@@ -114,7 +235,7 @@ async def crawl_url(url, client, workers, args, spider_queue=None):
                         link_hash = get_sha256(link)
                         if link_hash not in DISCOVERED_URLS and link_hash not in CHECKED_URLS:
                             DISCOVERED_URLS.add(link_hash)
-                            spider_queue.append(link)
+                            await url_queue.put(link)
 
             else:
                 log_message("INFO", f"Skipping non-HTML/JS content at {url}")
@@ -122,129 +243,317 @@ async def crawl_url(url, client, workers, args, spider_queue=None):
         except httpx.RequestError as e:
             log_message("ERROR", f"HTTP request failed for {url}: {e}")
         except Exception as e:
-            log_message("ERROR", f"An unexpected error occurred for {url}: {e}")
+            log_message("ERROR", f"Unexpected error for {url}: {e}")
+        finally:
+            await url_tracker.unregister()
+            url_queue.task_done()
 
 
-async def scan_url_batch(args, client, workers, urls):
-    """Score, sort, and scan a batch of URLs."""
-    url_scores = {url: score_url(url) for url in urls}
+async def js_audit_worker(js_queue, client, args, executor):
+    """Pulls JS from js_queue, runs analysis (heavy work in ThreadPoolExecutor)."""
+    loop = asyncio.get_event_loop()
+    fetch_timeout = httpx.Timeout(10.0, connect=5.0)
 
+    while True:
+        item = await js_queue.get()
+        if item is _POISON:
+            js_queue.task_done()
+            break
+
+        try:
+            js_code = item.js_code
+            if not js_code or not js_code.strip():
+                # Still need to decrement PageTracker for empty scripts
+                await _decrement_page_tracker(item.page_tracker, executor, loop)
+                continue
+
+            js_code = format_javascript(js_code)
+            raw_hash = get_sha256(js_code)
+            struct_hash = structural_hash(js_code)
+
+            # Dedup (on event loop thread — safe)
+            skip_analysis = False
+            if raw_hash in IGNORED_HASHES:
+                skip_analysis = True
+            elif raw_hash in SEEN_SCRIPTS or struct_hash in SEEN_SCRIPTS:
+                skip_analysis = True
+            else:
+                SEEN_SCRIPTS.add(raw_hash)
+                SEEN_SCRIPTS.add(struct_hash)
+
+            if not skip_analysis:
+                # Heavy sync work → thread pool
+                await loop.run_in_executor(
+                    executor,
+                    check_script_safety, js_code, raw_hash, item.page_url, item.script_url,
+                )
+
+                # Source map (async fetch, sync re-analysis)
+                if (not getattr(args, 'no_sourcemaps', False)
+                        and item.script_url and item.script_url != "inline"):
+                    try:
+                        sourcemap = await try_fetch_sourcemap(item.script_url, js_code, client)
+                        if sourcemap:
+                            original = get_original_source(sourcemap)
+                            if original and len(original) > 50:
+                                original_hash = get_sha256(original)
+                                if original_hash not in SEEN_SCRIPTS:
+                                    SEEN_SCRIPTS.add(original_hash)
+                                    log_message("INFO", f"Re-analyzing source map for {item.script_url}")
+                                    await loop.run_in_executor(
+                                        executor,
+                                        check_script_safety, original, original_hash,
+                                        item.page_url, item.script_url + " (source map)",
+                                    )
+                    except Exception as e:
+                        log_message("ERROR", f"Source map failed for {item.script_url}: {e}")
+
+                # Save to disk
+                if args.save:
+                    try:
+                        with open(f"{raw_hash}.js", 'w', encoding='utf-8') as f:
+                            f.write(f"// Source: {item.page_url}\n"
+                                    f"// Script URL: {item.script_url or 'inline'}\n\n{js_code}")
+                    except IOError as e:
+                        log_message("ERROR", f"Failed to save script {raw_hash}: {e}")
+
+                # Discover JS paths referenced inside JS code
+                for match in re.finditer(JS_PATH_FINDER, js_code):
+                    path = match.group(1)
+                    if path.startswith('//'):
+                        path = f"https:{path}"
+                    script_url = urljoin(item.page_url, path)
+                    hashed_url = get_sha256(script_url)
+                    if hashed_url in CHECKED_JS_URLS:
+                        continue
+                    CHECKED_JS_URLS.add(hashed_url)
+                    log_message("INFO", f"Discovered JS via regex: {script_url}")
+                    try:
+                        resp = await client.get(script_url, timeout=fetch_timeout)
+                        if resp.status_code < 400:
+                            await js_queue.put(JsWorkItem(
+                                js_code=resp.text,
+                                page_url=item.page_url,
+                                script_url=script_url,
+                                page_tracker=None,
+                            ))
+                    except httpx.RequestError:
+                        pass
+
+            # Cross-file tracking (always, even for deduped scripts)
+            if item.page_tracker is not None:
+                pt = item.page_tracker
+                pt.cross_file.add_script(js_code, item.script_url or "inline", raw_hash)
+                await _decrement_page_tracker(pt, executor, loop)
+
+        except Exception as e:
+            log_message("ERROR", f"JS audit error: {e}")
+        finally:
+            js_queue.task_done()
+
+
+async def _decrement_page_tracker(page_tracker, executor, loop):
+    """Decrement a PageTracker and run cross-file analysis when all scripts are done."""
+    if page_tracker is None:
+        return
+    async with page_tracker.lock:
+        page_tracker.remaining -= 1
+        if page_tracker.remaining <= 0:
+            analyzer = get_ast_analyzer()
+            if analyzer and page_tracker.cross_file.scripts:
+                try:
+                    await loop.run_in_executor(
+                        executor,
+                        page_tracker.cross_file.collect_globals, analyzer,
+                    )
+                    page_tracker.cross_file.emit_cross_file_findings(page_tracker.page_url)
+                except Exception as e:
+                    log_message("ERROR", f"Cross-file analysis failed for {page_tracker.page_url}: {e}")
+
+
+# --- Producer Coroutines ---
+
+async def seed_urls_into_pipeline(initial_urls, url_queue, domain_queue, args, executor):
+    """Seed initial URLs and domains into the pipeline."""
+    urls_to_seed = set(initial_urls)
+
+    # Wayback: run in executor since it's blocking
+    if args.wayback:
+        loop = asyncio.get_event_loop()
+        log_message("INFO", "Fetching Wayback Machine URLs...")
+        wayback_urls = await loop.run_in_executor(
+            executor, fetch_wayback_urls, list(urls_to_seed), Config.USER_AGENT,
+        )
+        urls_to_seed.update(wayback_urls)
+        log_message("INFO", f"Wayback added {len(wayback_urls)} URLs")
+
+    # URL cleaning
     if not args.no_clean_url:
-        cleaned_scores = {}
-        for url in urls:
-            cleaned = url.split('?')[0].split('#')[0]
-            if cleaned not in cleaned_scores or url_scores[url] > cleaned_scores[cleaned]:
-                cleaned_scores[cleaned] = url_scores[url]
-        urls = set(cleaned_scores.keys())
-        url_scores = cleaned_scores
+        cleaned = {}
+        for url in urls_to_seed:
+            clean = url.split('?')[0].split('#')[0]
+            existing_score = cleaned.get(clean, -1)
+            new_score = score_url(url)
+            if new_score > existing_score:
+                cleaned[clean] = new_score
+        urls_to_seed = set(cleaned.keys())
 
+    # Extract domains for discovery
     if args.discover:
         domains = set()
-        for url in urls:
+        for url in urls_to_seed:
             parsed = urlparse(url)
             if parsed.hostname:
                 domains.add(parsed.hostname)
-        if domains:
-            log_message("INFO", f"Running path discovery on {len(domains)} domains...")
-            discover_tasks = [discover_paths(domain, client) for domain in domains]
-            results = await asyncio.gather(*discover_tasks)
-            for path_set in results:
-                for new_url in path_set:
-                    if new_url not in url_scores:
-                        url_scores[new_url] = score_url(new_url)
-                urls.update(path_set)
-            log_message("INFO", f"Discovery added {sum(len(r) for r in results)} new URLs.")
+        for domain in domains:
+            await domain_queue.put(domain)
 
-    final_urls = list(urls)
+    # Sort and seed
+    url_list = list(urls_to_seed)
     if args.smart_sort:
-        final_urls.sort(key=lambda u: url_scores.get(u, 0), reverse=True)
+        url_list.sort(key=score_url, reverse=True)
     else:
-        shuffle(final_urls)
+        shuffle(url_list)
 
-    if args.min_score > 0:
-        final_urls = [u for u in final_urls if url_scores.get(u, 0) >= args.min_score]
+    for url in url_list:
+        url_hash = get_sha256(url)
+        if url_hash not in DISCOVERED_URLS:
+            DISCOVERED_URLS.add(url_hash)
+            await url_queue.put(url)
 
-    if not final_urls:
-        return
-
-    log_message("INFO", f"Scanning {len(final_urls)} URLs...")
-
-    spider_queue = [] if args.spider else None
-    tasks = [crawl_url(url, client, workers, args, spider_queue) for url in final_urls]
-    await asyncio.gather(*tasks)
-
-    if spider_queue:
-        log_message("INFO", f"Spider discovered {len(spider_queue)} new URLs. Scanning...")
-        if args.smart_sort:
-            spider_queue.sort(key=score_url, reverse=True)
-        if args.min_score > 0:
-            spider_queue = [u for u in spider_queue if score_url(u) >= args.min_score]
-        spider_tasks = [crawl_url(url, client, workers, args) for url in spider_queue]
-        await asyncio.gather(*spider_tasks)
+    log_message("INFO", f"Seeded {len(url_list)} initial URLs into pipeline")
 
 
-async def standard_scan(args, client, workers, initial_urls):
-    """Original scan flow: load URLs, optionally wayback, scan all at once."""
-    urls_to_scan = set(initial_urls)
-    if args.wayback:
-        wayback_urls = fetch_wayback_urls(list(urls_to_scan), Config.USER_AGENT)
-        urls_to_scan.update(wayback_urls)
-    await scan_url_batch(args, client, workers, urls_to_scan)
-
-
-async def ct_scan_loop(args, client, workers, seed_urls):
-    """Incremental CT discovery: fetch one month, scan new subdomains, repeat."""
-    import concurrent.futures
-
+async def ct_producer(url_queue, domain_queue, args, executor):
+    """Fetches CT months in executor, streams URLs/domains into queues."""
     domain = args.ct
-    state = ct_load_state(domain)
-    scanned = set(state['scanned_subdomains'])
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    loop = asyncio.get_event_loop()
+    state = await loop.run_in_executor(executor, ct_load_state, domain)
 
-    # Scan seed URLs first
-    if seed_urls:
-        log_message("INFO", f"Scanning {len(seed_urls)} seed URLs before CT discovery...")
-        await scan_url_batch(args, client, workers, set(seed_urls))
-
-    # Report related domains from previous runs
     if state['related_domains']:
-        log_message("INFO", f"Known related domains: {', '.join(state['related_domains'][:20])}" +
-                    (f" ... +{len(state['related_domains'])-20} more" if len(state['related_domains']) > 20 else ""))
+        log_message("INFO", f"Known related domains: "
+                    f"{', '.join(state['related_domains'][:20])}"
+                    + (f" ... +{len(state['related_domains'])-20} more"
+                       if len(state['related_domains']) > 20 else ""))
 
     while True:
         log_message("INFO", f"CT: fetching next month for {domain}...")
-        loop = asyncio.get_event_loop()
         new_subs, new_related, exhausted = await loop.run_in_executor(
-            executor, ct_fetch_next_month, domain, state
+            executor, ct_fetch_next_month, domain, state,
         )
 
         if exhausted:
             log_message("INFO", "CT: all months exhausted.")
             break
 
-        if not new_subs and not new_related:
-            continue
-
         if new_related:
-            log_message("INFO", f"CT: found {len(new_related)} new related domains: {', '.join(sorted(new_related))}")
+            log_message("INFO", f"CT: {len(new_related)} new related domains: "
+                        f"{', '.join(sorted(new_related))}")
 
         if new_subs:
-            log_message("INFO", f"CT: found {len(new_subs)} new subdomains to scan")
-            urls = {f'https://{sub}/' for sub in new_subs}
-            await scan_url_batch(args, client, workers, urls)
-            scanned.update(new_subs)
-            state['scanned_subdomains'] = sorted(scanned)
+            log_message("INFO", f"CT: {len(new_subs)} new subdomains to scan")
+            for sub in new_subs:
+                await url_queue.put(f'https://{sub}/')
+            if args.discover:
+                for sub in new_subs:
+                    await domain_queue.put(sub)
+            state['scanned_subdomains'] = sorted(
+                set(state['scanned_subdomains']) | new_subs
+            )
 
-        ct_save_state(state, domain)
+        await loop.run_in_executor(executor, ct_save_state, state, domain)
 
-    ct_save_state(state, domain)
-    log_message("INFO", f"CT scan complete: {len(scanned)} total subdomains scanned")
+    await loop.run_in_executor(executor, ct_save_state, state, domain)
+    log_message("INFO", f"CT complete: {len(state['scanned_subdomains'])} subdomains total")
 
+
+# --- Pipeline Orchestrator ---
+
+async def run_pipeline(args, client, initial_urls):
+    """Set up queues, workers, and producers; run until all work is done."""
+    domain_queue = asyncio.Queue(maxsize=100)
+    url_queue = asyncio.Queue(maxsize=500)
+    js_queue = asyncio.Queue(maxsize=200)
+
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(4, args.concurrency // 2),
+    )
+
+    num_domain_workers = 2
+    num_crawl_workers = args.concurrency
+    num_js_workers = max(4, args.concurrency // 2)
+
+    # url_queue producer tracker — poison pills go to page_crawl_workers
+    url_tracker = ProducerTracker(url_queue, num_crawl_workers)
+
+    # Start workers
+    domain_tasks = [
+        asyncio.create_task(domain_discovery_worker(domain_queue, url_queue, client, args))
+        for _ in range(num_domain_workers)
+    ]
+    crawl_tasks = [
+        asyncio.create_task(page_crawl_worker(url_queue, js_queue, client, args, url_tracker))
+        for _ in range(num_crawl_workers)
+    ]
+    js_tasks = [
+        asyncio.create_task(js_audit_worker(js_queue, client, args, executor))
+        for _ in range(num_js_workers)
+    ]
+
+    # Start producers
+    producers = []
+
+    # Seed URLs producer
+    async def seed_producer():
+        await url_tracker.register()
+        try:
+            await seed_urls_into_pipeline(initial_urls, url_queue, domain_queue, args, executor)
+        finally:
+            await url_tracker.unregister()
+    producers.append(asyncio.create_task(seed_producer()))
+
+    # CT producer
+    if args.ct:
+        async def ct_wrapper():
+            await url_tracker.register()
+            try:
+                await ct_producer(url_queue, domain_queue, args, executor)
+            finally:
+                await url_tracker.unregister()
+        producers.append(asyncio.create_task(ct_wrapper()))
+
+    # Domain discovery workers are also url_queue producers
+    for _ in range(num_domain_workers):
+        await url_tracker.register()
+
+    # Wait for all producers to finish seeding
+    await asyncio.gather(*producers)
+
+    # Shut down domain_queue
+    for _ in range(num_domain_workers):
+        await domain_queue.put(_POISON)
+    await asyncio.gather(*domain_tasks)
+
+    # Domain workers done — unregister them as url producers
+    for _ in range(num_domain_workers):
+        await url_tracker.unregister()
+
+    # url_tracker will send poison pills to crawl workers when all producers are done
+    await asyncio.gather(*crawl_tasks)
+
+    # Crawl workers done — shut down js_queue
+    for _ in range(num_js_workers):
+        await js_queue.put(_POISON)
+    await asyncio.gather(*js_tasks)
+
+    executor.shutdown(wait=False)
+
+
+# --- Main ---
 
 async def main(args):
-    """Main execution function."""
+    """Main execution function — sets up and runs the async pipeline."""
     import analysis
-    # Wire up shared args reference to modules
     output.ARGS = args
     analysis.ARGS = args
 
@@ -280,17 +589,17 @@ async def main(args):
     if args.cookie:
         headers['Cookie'] = args.cookie
 
-    limits = httpx.Limits(max_connections=args.concurrency, max_keepalive_connections=args.concurrency)
-    workers = asyncio.Semaphore(args.concurrency)
+    limits = httpx.Limits(
+        max_connections=args.concurrency,
+        max_keepalive_connections=args.concurrency,
+    )
 
     async with httpx.AsyncClient(
-        http2=True, limits=limits, follow_redirects=not args.no_redirects,
-        verify=not args.insecure, headers=headers
+        http2=True, limits=limits,
+        follow_redirects=not args.no_redirects,
+        verify=not args.insecure, headers=headers,
     ) as client:
-        if args.ct:
-            await ct_scan_loop(args, client, workers, initial_urls)
-        else:
-            await standard_scan(args, client, workers, initial_urls)
+        await run_pipeline(args, client, initial_urls)
 
     log_message("INFO", "Scan finished.")
 
