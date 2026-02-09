@@ -6,6 +6,7 @@ All three stages run concurrently via asyncio.Queue.
 import argparse
 import asyncio
 import concurrent.futures
+import os
 import re
 import sys
 from collections import namedtuple
@@ -48,6 +49,7 @@ except ImportError:
 # --- Global State ---
 CHECKED_URLS = set()
 DISCOVERED_URLS = set()
+DEAD_DOMAINS = set()  # domains that failed with connection errors — skip future requests
 
 # --- Configuration ---
 class Config:
@@ -107,6 +109,8 @@ async def domain_discovery_worker(domain_queue, url_queue, client, args):
             domain_queue.task_done()
             break
         try:
+            if domain in DEAD_DOMAINS:
+                continue
             discovered = await discover_paths(domain, client)
             for url in discovered:
                 if args.min_score > 0 and score_url(url) < args.min_score:
@@ -117,6 +121,9 @@ async def domain_discovery_worker(domain_queue, url_queue, client, args):
                     await url_queue.put(url)
             if discovered:
                 log_message("INFO", f"Discovery for {domain}: {len(discovered)} URLs")
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            DEAD_DOMAINS.add(domain)
+            log_message("ERROR", f"Domain unreachable, skipping: {domain} ({e})")
         except Exception as e:
             log_message("ERROR", f"Discovery failed for {domain}: {e}")
         finally:
@@ -139,6 +146,11 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
             if hashed_url in CHECKED_URLS:
                 continue
             CHECKED_URLS.add(hashed_url)
+
+            # Skip URLs on domains we already know are dead
+            parsed = urlparse(url)
+            if parsed.hostname and parsed.hostname in DEAD_DOMAINS:
+                continue
 
             if args.min_score > 0 and score_url(url) < args.min_score:
                 continue
@@ -240,6 +252,11 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
             else:
                 log_message("INFO", f"Skipping non-HTML/JS content at {url}")
 
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            host = urlparse(url).hostname
+            if host:
+                DEAD_DOMAINS.add(host)
+            log_message("ERROR", f"Domain unreachable, skipping future requests: {url} ({e})")
         except httpx.RequestError as e:
             log_message("ERROR", f"HTTP request failed for {url}: {e}")
         except Exception as e:
@@ -373,55 +390,61 @@ async def _decrement_page_tracker(page_tracker, executor, loop):
 
 # --- Producer Coroutines ---
 
-async def seed_urls_into_pipeline(initial_urls, url_queue, domain_queue, args, executor):
-    """Seed initial URLs and domains into the pipeline."""
-    urls_to_seed = set(initial_urls)
+def _clean_urls(urls):
+    """Strip query params/fragments, keep highest-scored version of each URL."""
+    cleaned = {}
+    for url in urls:
+        clean = url.split('?')[0].split('#')[0]
+        existing_score = cleaned.get(clean, -1)
+        new_score = score_url(url)
+        if new_score > existing_score:
+            cleaned[clean] = new_score
+    return set(cleaned.keys())
 
-    # Wayback: run in executor since it's blocking
-    if args.wayback:
-        loop = asyncio.get_event_loop()
-        log_message("INFO", "Fetching Wayback Machine URLs...")
-        wayback_urls = await loop.run_in_executor(
-            executor, fetch_wayback_urls, list(urls_to_seed), Config.USER_AGENT,
-        )
-        urls_to_seed.update(wayback_urls)
-        log_message("INFO", f"Wayback added {len(wayback_urls)} URLs")
 
-    # URL cleaning
-    if not args.no_clean_url:
-        cleaned = {}
-        for url in urls_to_seed:
-            clean = url.split('?')[0].split('#')[0]
-            existing_score = cleaned.get(clean, -1)
-            new_score = score_url(url)
-            if new_score > existing_score:
-                cleaned[clean] = new_score
-        urls_to_seed = set(cleaned.keys())
+async def _seed_urls(urls, url_queue, domain_queue):
+    """Clean, sort, and push a set of URLs into the pipeline queues."""
+    cleaned = _clean_urls(urls)
 
     # Extract domains for discovery
-    if args.discover:
-        domains = set()
-        for url in urls_to_seed:
-            parsed = urlparse(url)
-            if parsed.hostname:
-                domains.add(parsed.hostname)
-        for domain in domains:
-            await domain_queue.put(domain)
+    domains = set()
+    for url in cleaned:
+        parsed = urlparse(url)
+        if parsed.hostname:
+            domains.add(parsed.hostname)
+    for domain in domains:
+        await domain_queue.put(domain)
 
-    # Sort and seed
-    url_list = list(urls_to_seed)
-    if args.smart_sort:
-        url_list.sort(key=score_url, reverse=True)
-    else:
-        shuffle(url_list)
-
+    # Sort by interestingness and seed
+    url_list = sorted(cleaned, key=score_url, reverse=True)
+    added = 0
     for url in url_list:
         url_hash = get_sha256(url)
         if url_hash not in DISCOVERED_URLS:
             DISCOVERED_URLS.add(url_hash)
             await url_queue.put(url)
+            added += 1
+    return added
 
-    log_message("INFO", f"Seeded {len(url_list)} initial URLs into pipeline")
+
+async def seed_urls_into_pipeline(initial_urls, url_queue, domain_queue, args, executor):
+    """Seed initial URLs into the pipeline immediately."""
+    added = await _seed_urls(initial_urls, url_queue, domain_queue)
+    log_message("INFO", f"Seeded {added} initial URLs into pipeline")
+
+
+async def wayback_producer(url_queue, domain_queue, initial_urls, executor):
+    """Fetch Wayback Machine URLs in background and feed them into the pipeline."""
+    loop = asyncio.get_event_loop()
+    log_message("INFO", "Fetching Wayback Machine URLs...")
+    wayback_urls = await loop.run_in_executor(
+        executor, fetch_wayback_urls, list(initial_urls), Config.USER_AGENT,
+    )
+    if not wayback_urls:
+        log_message("INFO", "Wayback: no new URLs found")
+        return
+    added = await _seed_urls(wayback_urls, url_queue, domain_queue)
+    log_message("INFO", f"Wayback added {added} new URLs")
 
 
 async def ct_producer(url_queue, domain_queue, args, executor):
@@ -479,7 +502,7 @@ async def run_pipeline(args, client, initial_urls):
         max_workers=max(4, args.concurrency // 2),
     )
 
-    num_domain_workers = 2
+    num_domain_workers = 5
     num_crawl_workers = args.concurrency
     num_js_workers = max(4, args.concurrency // 2)
 
@@ -521,6 +544,16 @@ async def run_pipeline(args, client, initial_urls):
             finally:
                 await url_tracker.unregister()
         producers.append(asyncio.create_task(ct_wrapper()))
+
+    # Wayback producer — runs in background while initial URLs are already being crawled
+    if args.wayback:
+        async def wb_wrapper():
+            await url_tracker.register()
+            try:
+                await wayback_producer(url_queue, domain_queue, initial_urls, executor)
+            finally:
+                await url_tracker.unregister()
+        producers.append(asyncio.create_task(wb_wrapper()))
 
     # Domain discovery workers are also url_queue producers
     for _ in range(num_domain_workers):
@@ -566,18 +599,21 @@ async def main(args):
             log_message("ERROR", f"Unable to read ignore_hashes file '{args.ignore_hashes}': {e}")
             return
 
-    # Load initial URLs
+    # Load initial URLs based on auto-detected input type
     initial_urls = []
-    if args.url_file:
-        if args.url_file == '-' or not sys.stdin.isatty():
-            initial_urls = [line.strip() for line in sys.stdin if line.strip()]
-        else:
-            try:
-                with open(args.url_file, 'r', encoding='utf-8') as f:
-                    initial_urls = [line.strip() for line in f if line.strip()]
-            except IOError as e:
-                log_message("ERROR", f"Unable to read file '{args.url_file}': {e}")
-                return
+    if args._input_type == 'stdin':
+        initial_urls = [line.strip() for line in sys.stdin if line.strip()]
+    elif args._input_type == 'file':
+        try:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                initial_urls = [line.strip() for line in f if line.strip()]
+        except IOError as e:
+            log_message("ERROR", f"Unable to read file '{args.input}': {e}")
+            return
+    elif args._input_type == 'url':
+        initial_urls = [args.input]
+    elif args._input_type == 'domain':
+        initial_urls = [f'https://{args.input}/']
 
     # Client configuration
     headers = {'User-Agent': Config.USER_AGENT}
@@ -590,14 +626,13 @@ async def main(args):
         headers['Cookie'] = args.cookie
 
     limits = httpx.Limits(
-        max_connections=args.concurrency,
+        max_connections=args.concurrency + 15,  # crawl + domain + JS workers
         max_keepalive_connections=args.concurrency,
     )
 
     async with httpx.AsyncClient(
         http2=True, limits=limits,
-        follow_redirects=not args.no_redirects,
-        verify=not args.insecure, headers=headers,
+        follow_redirects=True, verify=True, headers=headers,
     ) as client:
         await run_pipeline(args, client, initial_urls)
 
@@ -606,82 +641,73 @@ async def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description="JSBot 5.0 — Opinionated JavaScript security scanner with AST analysis, secret detection, and smart discovery.",
-        formatter_class=argparse.RawTextHelpFormatter
+        description="JSBot — Opinionated JavaScript security scanner. Give it a domain, it does the rest.",
+        formatter_class=argparse.RawTextHelpFormatter,
     )
+    parser.add_argument('input', nargs='?', default=None,
+                        help="Domain, URL, file of URLs, or '-' for stdin.")
+    parser.add_argument('-H', '--header', action='append',
+                        help="Custom HTTP header (repeatable).")
+    parser.add_argument('-b', '--cookie',
+                        help="Cookie header value.")
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help="Verbose logging to stderr.")
+    parser.add_argument('--show-errors', action='store_true',
+                        help="Show HTTP error details on stderr.")
+    parser.add_argument('-s', '--save', action='store_true',
+                        help="Save unique JS files to disk (SHA256-named).")
+    parser.add_argument('--ignore-hashes',
+                        help="File of SHA256 hashes to skip.")
 
-    parser.add_argument('url_file', nargs='?', default=None, help="Path to a file with URLs, or '-' to read from stdin.")
-
-    scan_group = parser.add_argument_group('Scan Configuration')
-    scan_group.add_argument('-c', '--concurrency', type=int, default=20, help="Number of concurrent requests. (Default: 20)")
-    scan_group.add_argument('-w', '--wayback', action='store_true', help="Fetch historical URLs from the Wayback Machine.")
-    scan_group.add_argument('--no-clean-url', action='store_true', help="Don't clean URL parameters before scanning.")
-    scan_group.add_argument('--link-mode', action='store_true', help="Only find and output links/URLs found in JS files.")
-    scan_group.add_argument('--minimal', action='store_true', help="Disable all auto-discovery (discover, spider, smart-sort).")
-
-    taint_group = parser.add_argument_group('Taint Analysis')
-    taint_group.add_argument('--context-lines', type=int, default=3, help="Lines of context around findings. (Default: 3)")
-    taint_group.add_argument('--include-sink-only', action='store_true', help="Include sink-only findings (no source matched).")
-
-    discovery_group = parser.add_argument_group('Target Discovery')
-    discovery_group.add_argument('--ct', metavar='DOMAIN', help="Discover subdomains via Certificate Transparency logs (crt.sh).")
-    discovery_group.add_argument('--smart-sort', action='store_true', default=True, help="Score and prioritize URLs by vulnerability likelihood. (Default: on)")
-    discovery_group.add_argument('--no-smart-sort', action='store_true', help="Disable URL scoring/sorting.")
-    discovery_group.add_argument('--discover', action='store_true', default=True, help="Discover paths from robots.txt and sitemap.xml. (Default: on)")
-    discovery_group.add_argument('--no-discover', action='store_true', help="Disable path discovery.")
-    discovery_group.add_argument('--spider', action='store_true', default=True, help="Follow <a href> links to discover deeper endpoints. (Default: on)")
-    discovery_group.add_argument('--no-spider', action='store_true', help="Disable spider mode.")
-    discovery_group.add_argument('--min-score', type=int, default=0, help="Skip URLs scoring below this threshold. (Default: 0)")
-
-    http_group = parser.add_argument_group('HTTP Configuration')
-    http_group.add_argument('-H', '--header', action='append', help="Add a custom header (e.g., 'X-API-Key: 123').")
-    http_group.add_argument('-b', '--cookie', help="Set the cookie header string.")
-    http_group.add_argument('--no-redirects', action='store_true', help="Don't follow HTTP redirects.")
-    http_group.add_argument('-k', '--insecure', action='store_true', help="Disable SSL/TLS certificate verification.")
-
-    output_group = parser.add_argument_group('Output & Analysis')
-    output_group.add_argument('-s', '--save', action='store_true', help="Save unique JS files to disk, named by SHA256 hash.")
-    output_group.add_argument('-v', '--verbose', action='store_true', help="Enable verbose informational output.")
-    output_group.add_argument('--show-errors', action='store_true', help="Show error messages for failed requests.")
-    output_group.add_argument('--ignore-hashes', help="Path to a file containing SHA256 hashes of JS files to ignore.")
-    output_group.add_argument('--format-js', action='store_true', default=True, help="Beautify JS before analysis if jsbeautifier available. (Default: on)")
-    output_group.add_argument('--no-format', action='store_true', help="Disable JS beautification.")
-    output_group.add_argument('--no-sourcemaps', action='store_true', help="Disable automatic source map fetching.")
-
-    if len(sys.argv) == 1:
+    if len(sys.argv) == 1 and sys.stdin.isatty():
         parser.print_help(sys.stderr)
         sys.exit(1)
 
     args = parser.parse_args()
 
-    # Apply --minimal: disable all auto-discovery
-    if args.minimal:
-        args.discover = False
-        args.spider = False
-        args.smart_sort = False
+    # --- Auto-detect input type ---
+    if args.input is None:
+        if not sys.stdin.isatty():
+            args._input_type = 'stdin'
+        else:
+            parser.print_help(sys.stderr)
+            sys.exit(1)
+    elif args.input == '-':
+        args._input_type = 'stdin'
+    elif os.path.isfile(args.input):
+        args._input_type = 'file'
+    elif args.input.startswith(('http://', 'https://')):
+        args._input_type = 'url'
+    else:
+        args._input_type = 'domain'
 
-    # Apply --no-* flags
-    if args.no_discover:
-        args.discover = False
-    if args.no_spider:
-        args.spider = False
-    if args.no_smart_sort:
-        args.smart_sort = False
-    if args.no_format:
-        args.format_js = False
+    # --- Opinionated defaults — JSBot decides ---
+    args.concurrency = 20
+    args.wayback = WAYBACK_AVAILABLE
+    args.smart_sort = True
+    args.discover = True
+    args.spider = True
+    args.min_score = 0
+    args.context_lines = 3
+    args.include_sink_only = False
+    args.link_mode = False
+    args.format_js = True
+    args.no_sourcemaps = False
+    args.no_clean_url = False
+    args.no_redirects = False
+    args.insecure = False
 
-    if not args.url_file and not args.ct:
-        parser.error("Either url_file or --ct DOMAIN is required.")
+    # CT discovery: automatic for domain input
+    args.ct = args.input if args._input_type == 'domain' else None
 
-    if args.wayback and not WAYBACK_AVAILABLE:
-        print("[!] [ERROR] --wayback requires 'waybackpy'. Install it with: pip install waybackpy", file=sys.stderr)
-        sys.exit(1)
     if args.ct and not PSYCOPG2_AVAILABLE:
-        print("[!] [ERROR] --ct requires 'psycopg2-binary'. Install it with: pip install psycopg2-binary", file=sys.stderr)
-        sys.exit(1)
+        print(f"[*] CT log discovery needs psycopg2-binary (pip install psycopg2-binary). "
+              f"Scanning {args.input} as URL.", file=sys.stderr)
+        args.ct = None
+        args._input_type = 'url'
 
     try:
         asyncio.run(main(args))
     except KeyboardInterrupt:
-        print("\n[*] [INFO] Scan interrupted by user.", file=sys.stderr)
+        print("\n[*] Scan interrupted.", file=sys.stderr)
         sys.exit(0)

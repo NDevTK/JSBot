@@ -243,12 +243,14 @@ def fetch_wayback_urls(domains, user_agent):
 
 async def discover_paths(domain, client):
     """Discovers URLs from robots.txt and sitemap.xml for a domain."""
+    import httpx
     discovered = set()
     base = f"https://{domain}"
+    timeout = httpx.Timeout(10.0, connect=5.0)
 
     # robots.txt
     try:
-        resp = await client.get(f"{base}/robots.txt", timeout=10)
+        resp = await client.get(f"{base}/robots.txt", timeout=timeout)
         if resp.status_code == 200:
             for line in resp.text.splitlines():
                 line = line.strip()
@@ -259,13 +261,16 @@ async def discover_paths(domain, client):
                         if clean_path:
                             discovered.add(urljoin(base, clean_path))
             log_message("INFO", f"Found {len(discovered)} paths from robots.txt for {domain}")
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        # Domain is unreachable — don't bother with sitemap
+        raise
     except Exception as e:
         log_message("ERROR", f"Failed to fetch robots.txt for {domain}: {e}")
 
     # sitemap.xml
     sitemap_urls = set()
     try:
-        resp = await client.get(f"{base}/sitemap.xml", timeout=10)
+        resp = await client.get(f"{base}/sitemap.xml", timeout=timeout)
         if resp.status_code == 200:
             try:
                 root = ElementTree.fromstring(resp.text)
