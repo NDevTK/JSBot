@@ -1,8 +1,8 @@
 # JSBot
 
-JavaScript security scanner with source-to-sink taint analysis and smart target discovery.
+Opinionated JavaScript security scanner. Finds what matters in JS without manual tuning.
 
-Crawls web pages, extracts JavaScript, and identifies data flows from user-controllable inputs into dangerous sinks. Prioritizes targets most likely to contain vulnerabilities so you find XSS on `dev.example.com/admin/callback?redirect=` before wasting time on `www.example.com`.
+JSBot crawls pages, extracts JavaScript, deduplicates by structural hash, analyzes with tree-sitter AST parsing (regex fallback), fetches source maps for original code, tracks taint flows across scripts on the same page, detects secrets/prototype pollution/SSRF/postMessage issues, and scores every script for security research interestingness. It decides the best way to discover targets, prioritize them, and analyze them — you just point it at URLs.
 
 ## Install
 
@@ -10,111 +10,185 @@ Crawls web pages, extracts JavaScript, and identifies data flows from user-contr
 pip install -r requirements.txt
 ```
 
+Core: `httpx[http2]`, `beautifulsoup4`, `lxml`, `jsbeautifier`
+AST analysis: `tree-sitter`, `tree-sitter-javascript` (optional — falls back to regex)
+Discovery: `waybackpy` (for `--wayback`), `psycopg2-binary` (for `--ct`)
+
 ## Quick Start
 
 ```bash
-# Scan a list of URLs
+# Point it at URLs — discovery, spidering, smart sorting, source maps, and beautification are all on by default
 python scan.py urls.txt > results.jsonl
 
-# Pipe from subdomain discovery, enable everything
-subfinder -d example.com | python scan.py -w --discover --spider --smart-sort -v - > results.jsonl
+# Pipe from subdomain tools
+subfinder -d example.com | httpx | python scan.py - > results.jsonl
 
-# Only scan high-value targets
-python scan.py --smart-sort --min-score 5 --no-clean-url urls.txt > results.jsonl
+# CT log recon — discover subdomains from certificate transparency and scan each one
+python scan.py --ct example.com -v > results.jsonl
+
+# Add Wayback Machine historical URLs
+python scan.py -w urls.txt > results.jsonl
+
+# Disable all auto-discovery for a fast, targeted scan
+python scan.py --minimal urls.txt > results.jsonl
+
+# Authenticated scan
+python scan.py -b "session=abc123" -H "X-CSRF-Token: xyz" urls.txt > results.jsonl
 ```
+
+Zero flags needed for a good scan. `--minimal` strips auto-discovery back to bare crawl-and-analyze.
 
 ## What It Finds
 
-JSBot detects when user-controllable **sources** flow into dangerous **sinks** within the same function scope.
+### Taint Flows (AST + regex)
 
-**Sources** (user input): `location.hash`, `location.search`, `document.URL`, `document.referrer`, `window.name`, `postMessage` event data, `URLSearchParams`, `localStorage.getItem`, `document.cookie`, `e.target.value`
+User-controllable **sources** flowing into dangerous **sinks** within the same function scope. AST mode uses tree-sitter for real function boundaries and filters false positives (e.g., `eval("2+2")` with only literal arguments is suppressed). Falls back to regex scope splitting when tree-sitter is unavailable.
 
-**Sinks** (dangerous operations): `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval`, `Function()`, `setTimeout` with strings, `location.assign`, `location.replace`, jQuery `.html()/.append()`, `v-html`, `dangerouslySetInnerHTML`, `document.cookie` writes, `.postMessage()`
+**Sources**: `location.hash/search/href/pathname`, `document.URL/referrer`, `window.name`, `event.data` (postMessage), `URLSearchParams`, `localStorage/sessionStorage.getItem`, `document.cookie`, `e.target.value`
 
-### Finding Types
+**Sinks**: `innerHTML/outerHTML =`, `insertAdjacentHTML()`, `document.write()`, `eval()/Function()`, `setTimeout/setInterval` with strings, `location.assign/replace/href =`, jQuery `.html()/.append()/.prepend()/.after()/.before()`, `v-html`, `dangerouslySetInnerHTML`, `document.cookie =`, `.postMessage()`
 
-**`taint_flow`** — source and sink in the same function scope. These are the ones you care about.
+When a single source reaches multiple sinks, findings are grouped:
 
 ```json
 {
-  "source_url": "https://dev.example.com/app",
-  "script_url": "https://dev.example.com/js/app.js",
-  "script_hash": "a1b2c3...",
-  "finding_type": "taint_flow",
-  "sink_category": "DOM XSS",
-  "sink_match": "innerHTML =",
-  "sink_line": 42,
+  "finding_type": "taint_flow_grouped",
   "source_category": "location.hash",
-  "source_match": "location.hash",
-  "source_line": 38,
+  "source_line": 3,
+  "sink_count": 2,
+  "sinks": [
+    {"category": "DOM XSS", "match": "innerHTML =", "line": 10},
+    {"category": "document.write", "match": "document.write(", "line": 15}
+  ],
   "severity": 9,
-  "context": ["  var input = location.hash.slice(1);", "  processInput(input);", "  el.innerHTML = input;"]
+  "analysis_method": "ast"
 }
 ```
 
-**`sink_only`** — dangerous sink found but no user-controllable source in scope. Severity is halved. Still worth reviewing if the function receives data from callers.
+### Secrets
 
-```json
-{
-  "source_url": "https://example.com/page",
-  "script_url": "https://example.com/js/utils.js",
-  "script_hash": "d4e5f6...",
-  "finding_type": "sink_only",
-  "sink_category": "Eval Injection",
-  "sink_match": "eval(",
-  "sink_line": 15,
-  "source_category": null,
-  "source_match": null,
-  "source_line": null,
-  "severity": 5,
-  "context": ["  function run(code) {", "    eval(code);", "  }"]
-}
-```
+Hardcoded credentials detected by high-confidence regex patterns:
 
-Findings are deduplicated by script hash + sink + source + line numbers. Same code seen on multiple pages is reported once.
+| Pattern | Example | Severity |
+|---------|---------|----------|
+| AWS Access Key | `AKIA...` | 10 |
+| AWS Secret Key | `aws_secret_access_key = "..."` | 10 |
+| Stripe Secret Key | `sk_live_...` | 10 |
+| Private Key Block | `-----BEGIN RSA PRIVATE KEY-----` | 10 |
+| GitHub Token | `ghp_...` | 9 |
+| Slack Token | `xox[bpoa]-...` | 8 |
+| Google API Key | `AIza...` | 7 |
+| Generic API Key Assignment | `api_key = "..."` | 7 |
+| Hardcoded Password | `password = "..."` | 7 |
+| JWT Token | `eyJ...eyJ...` | 6 |
+
+### Prototype Pollution
+
+- `__proto__` references
+- `Object.assign/create`, `_.merge/extend/defaults/defaultsDeep`
+- Dynamic bracket assignment: `obj[a][b] = c`
+
+### postMessage Without Origin Check
+
+AST-based: finds `addEventListener("message", handler)` where the handler body doesn't check `event.origin`. These are exploitable from any origin via an attacker-controlled iframe.
+
+### SSRF Patterns
+
+- `fetch()` with dynamic URL (variable or template literal)
+- `XMLHttpRequest.open()` with dynamic URL
+
+### Other Detections
+
+- **Insecure Randomness**: `Math.random()` near security-sensitive keywords (token, nonce, csrf, session, password)
+- **Dynamic Script Creation**: `createElement("script")` with dynamic src
+- **Interesting Scripts**: Scripts scoring 30+ on a heuristic scale (auth logic, API key handling, crypto, CORS, postMessage, dynamic code gen) — flags code worth manual review even when no specific vulnerability is detected
+
+### Cross-File Taint Analysis
+
+Tracks `window.X = taintedValue` assignments across all scripts on the same page. If script A writes tainted data to a global and script B reads that global into a sink, JSBot emits a `cross_file_taint` finding. Also detects dangerous global functions — `window.renderHTML = (html) => { el.innerHTML = html }` — that any script can call.
+
+Requires tree-sitter (AST mode only).
+
+### Source Map Analysis
+
+Automatically fetches `.map` files for every script:
+
+1. Checks `//# sourceMappingURL=` comment
+2. Tries `<script_url>.map` convention
+3. Handles `data:` URI inline maps (base64)
+
+If `sourcesContent` is present, JSBot re-analyzes the original unminified source — better variable names, real structure, more accurate findings. Disable with `--no-sourcemaps`.
+
+### Deduplication
+
+Scripts are deduplicated two ways:
+- **Raw SHA256**: exact match, compatible with `--ignore-hashes`
+- **Structural hash**: strips comments and normalizes whitespace before hashing — catches the same code with different minification
+
+Same logic seen on 50 pages is analyzed once.
 
 ## Target Discovery
 
-### URL Scoring (`--smart-sort`)
+All discovery features are **on by default**. Use `--no-*` flags or `--minimal` to disable.
 
-URLs are scored and scanned in priority order:
+### URL Scoring
+
+URLs are scored and scanned highest-first:
 
 | Signal | Points | Examples |
 |--------|--------|---------|
-| Path segment matches keyword | +3 each | `/admin/`, `/api/`, `/callback/`, `/oauth/` |
-| Query parameter name matches keyword | +5 each | `?redirect=`, `?url=`, `?callback=` |
-| Non-www subdomain | +2 | `dev.example.com`, `api.example.com` |
-| Subdomain contains keyword | +4 | `staging.`, `internal.`, `beta.` |
-| Has any query parameters | +2 | Any URL with `?` |
+| Path segment keyword | +3 each | `/admin/`, `/api/`, `/callback/`, `/oauth/` |
+| Query parameter keyword | +5 each | `?redirect=`, `?url=`, `?callback=` |
+| Non-www subdomain | +2 | `dev.example.com` |
+| Subdomain keyword | +4 | `staging.`, `internal.`, `beta.` |
+| Has query parameters | +2 | Any URL with `?` |
 
-Path matching uses whole segments — `/latest/` won't false-match on `test`. Scores are computed before URL cleaning, so even when params are stripped for dedup the highest score from any variant carries forward.
+Use `--min-score N` to skip low-value targets.
 
-Use `--min-score N` to skip low-value URLs entirely.
+### CT Log Discovery (`--ct DOMAIN`)
 
-### Path Discovery (`--discover`)
+Discovers subdomains from Certificate Transparency logs via the crt.sh PostgreSQL database.
 
-Fetches `robots.txt` and `sitemap.xml` from each domain. Disallowed paths in robots.txt are often the most interesting endpoints — admin panels, internal APIs, debug routes that someone tried to hide.
+1. Queries crt.sh one month at a time (current backward to 2019)
+2. Extracts subdomains from certificate SANs
+3. Scans each batch before fetching the next month
+4. Caches results in `.ct_cache/` — re-running resumes where it left off
+5. Reports related domains (shared SANs from the same organization)
 
-### Spider Mode (`--spider`)
+```bash
+python scan.py --ct target.com -v > results.jsonl
+```
 
-Follows same-domain `<a href>` links found on crawled pages. Runs as a single pass after the main crawl (depth 1) to avoid spiraling.
+### Path Discovery
+
+Fetches `robots.txt` and `sitemap.xml` from each domain. Disallowed paths are often the most interesting.
+
+### Spider
+
+Follows same-domain `<a href>` links (depth 1) after the main crawl.
 
 ## All Options
 
 ```
 Scan Configuration:
   -c, --concurrency N     Concurrent requests (default: 20)
-  -w, --wayback           Expand scope with Wayback Machine historical URLs
-  --no-clean-url          Keep query parameters (default strips them for dedup)
+  -w, --wayback           Expand scope with Wayback Machine URLs
+  --no-clean-url          Keep query parameters (default strips for dedup)
   --link-mode             Only extract URLs found in JS files
+  --minimal               Disable all auto-discovery at once
 
 Taint Analysis:
   --context-lines N       Lines of context in findings (default: 3)
+  --include-sink-only     Include sink-only findings (no source in scope)
 
 Target Discovery:
-  --smart-sort            Prioritize URLs by vulnerability likelihood
-  --discover              Find paths from robots.txt and sitemap.xml
-  --spider                Follow links to discover deeper endpoints
+  --ct DOMAIN             Discover subdomains from CT logs
+  --smart-sort            Prioritize by vulnerability likelihood (default: on)
+  --no-smart-sort         Disable URL scoring
+  --discover              Find paths from robots.txt/sitemap.xml (default: on)
+  --no-discover           Disable path discovery
+  --spider                Follow links for deeper endpoints (default: on)
+  --no-spider             Disable spidering
   --min-score N           Skip URLs scoring below N (default: 0)
 
 HTTP:
@@ -123,42 +197,63 @@ HTTP:
   --no-redirects          Don't follow redirects
   -k, --insecure          Skip TLS verification
 
-Output:
-  -s, --save              Save unique JS files to disk (named by SHA256)
+Output & Analysis:
+  -s, --save              Save unique JS files to disk (SHA256-named)
   -v, --verbose           Verbose logging to stderr
   --show-errors           Show HTTP error details
   --ignore-hashes FILE    SHA256 hashes of scripts to skip
-  --format-js             Beautify JS before analysis
+  --format-js             Beautify JS before analysis (default: on)
+  --no-format             Disable JS beautification
+  --no-sourcemaps         Disable source map fetching
 ```
+
+## Finding Types Reference
+
+| Type | Method | Description |
+|------|--------|-------------|
+| `taint_flow` | AST/regex | Source flows into sink in same scope |
+| `taint_flow_grouped` | AST/regex | One source reaches multiple sinks |
+| `sink_only` | AST/regex | Sink without source in scope (opt-in: `--include-sink-only`) |
+| `secret` | regex | Hardcoded API key, token, or credential |
+| `prototype_pollution` | regex | `__proto__`, Object.assign, bracket chains |
+| `postmessage_no_origin` | AST | Message listener without origin check |
+| `ssrf` | regex | fetch/XHR with dynamic URL |
+| `insecure_randomness` | regex | Math.random() in security context |
+| `dynamic_script_creation` | regex | createElement("script") |
+| `interesting_script` | heuristic | Script scoring 30+ on interestingness scale |
+| `cross_file_taint` | AST | Tainted global written by one script, read into sink by another |
+| `dangerous_global_function` | AST | Function on window/globalThis containing sinks |
 
 ## Examples
 
-**Bug bounty recon** — discover subdomains, pull historical URLs, find hidden paths, spider for depth, scan highest-value targets first:
-
 ```bash
-subfinder -d target.com | python scan.py -w --discover --spider --smart-sort -v - > findings.jsonl
-```
+# Default scan — just works
+python scan.py urls.txt > findings.jsonl
 
-**Targeted scan with auth** — scan an authenticated app:
+# Full recon pipeline
+subfinder -d target.com | httpx | python scan.py -w -v - > findings.jsonl
 
-```bash
-python scan.py -b "session=abc123" -H "X-CSRF-Token: xyz" --no-clean-url urls.txt > findings.jsonl
-```
+# CT discovery
+python scan.py --ct target.com -v > findings.jsonl
 
-**Save all scripts for manual review:**
+# Fast targeted scan, no discovery
+python scan.py --minimal urls.txt > findings.jsonl
 
-```bash
+# Authenticated app
+python scan.py -b "session=abc" -H "X-CSRF-Token: xyz" urls.txt > findings.jsonl
+
+# Save scripts, skip known libraries
 python scan.py -s --ignore-hashes known_libs.txt urls.txt > findings.jsonl
-```
 
-**Filter to only taint flows** (skip sink-only noise):
+# Filter high-severity taint flows
+python scan.py urls.txt | jq 'select(.finding_type | startswith("taint_flow")) | select(.severity >= 8)'
 
-```bash
-python scan.py urls.txt | jq 'select(.finding_type == "taint_flow")'
-```
+# Just secrets
+python scan.py urls.txt | jq 'select(.finding_type == "secret")'
 
-**Grep findings for specific sink types:**
+# Cross-file issues only
+python scan.py urls.txt | jq 'select(.finding_type == "cross_file_taint")'
 
-```bash
-python scan.py urls.txt | jq 'select(.sink_category == "DOM XSS" and .severity >= 8)'
+# Scripts worth manual review
+python scan.py urls.txt | jq 'select(.finding_type == "interesting_script") | {url: .script_url, score: .interestingness_score, reasons}'
 ```

@@ -3,3 +3,6 @@ beautifulsoup4
 lxml
 jsbeautifier
 waybackpy
+psycopg2-binary
+tree-sitter
+tree-sitter-javascript
