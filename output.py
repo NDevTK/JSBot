@@ -23,4 +23,4 @@ def log_message(level, message):
         sh = message.get("script_hash")
         if sh and sh in SCRIPT_METADATA:
             message.update(SCRIPT_METADATA[sh])
-        print(json.dumps(message))
+        print(json.dumps(message), flush=True)

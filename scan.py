@@ -769,6 +769,28 @@ async def run_pipeline(args, client, initial_urls):
         finally:
             await url_tracker.unregister()
 
+    # --- Periodic findings flusher ---
+    anomaly_emitted = set()  # shared dedup set for anomaly findings
+
+    async def findings_flusher():
+        """Periodically flush Semgrep batch and anomaly findings."""
+        loop = asyncio.get_event_loop()
+        while True:
+            await asyncio.sleep(60)
+            if semgrep_batch.script_count > 0:
+                log_message("INFO", f"Running Semgrep on {semgrep_batch.script_count} scripts...")
+                findings = await loop.run_in_executor(executor, semgrep_batch.run_and_reset)
+                for f in findings:
+                    log_message("FINDING", f)
+                log_message("INFO", f"Semgrep: {len(findings)} findings")
+            anomaly_findings = anomaly_detector.score(anomaly_emitted)
+            for f in anomaly_findings:
+                log_message("FINDING", f)
+            if anomaly_findings:
+                log_message("INFO", f"Anomaly: {len(anomaly_findings)} findings")
+
+    flusher_task = asyncio.create_task(findings_flusher())
+
     # Launch all three concurrently
     producers = [asyncio.create_task(seed_producer())]
     if args.ct:
@@ -793,22 +815,24 @@ async def run_pipeline(args, client, initial_urls):
         await js_queue.put(_POISON)
     await asyncio.gather(*js_tasks)
 
-    # === Post-processing: Semgrep batch + anomaly scoring ===
+    # Cancel periodic flusher and do one final flush
+    flusher_task.cancel()
     loop = asyncio.get_event_loop()
 
     if semgrep_batch.script_count > 0:
-        log_message("INFO", f"Running Semgrep on {semgrep_batch.script_count} unique scripts...")
-        semgrep_findings = await loop.run_in_executor(executor, semgrep_batch.run)
+        log_message("INFO", f"Final Semgrep on {semgrep_batch.script_count} scripts...")
+        semgrep_findings = await loop.run_in_executor(executor, semgrep_batch.run_and_reset)
         for finding in semgrep_findings:
             log_message("FINDING", finding)
         log_message("INFO", f"Semgrep: {len(semgrep_findings)} findings")
-        semgrep_batch.cleanup()
 
-    anomaly_findings = anomaly_detector.score_all()
+    anomaly_findings = anomaly_detector.score(anomaly_emitted)
     for finding in anomaly_findings:
         log_message("FINDING", finding)
-    log_message("INFO", f"Anomaly detection: {len(anomaly_findings)} findings")
+    if anomaly_findings:
+        log_message("INFO", f"Anomaly: {len(anomaly_findings)} findings")
 
+    anomaly_detector.update_profiles()
     executor.shutdown(wait=False)
     _save_scan_state(scan_domain)
     _save_anomaly_profiles(scan_domain, anomaly_detector)

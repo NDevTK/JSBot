@@ -72,22 +72,9 @@ class AnomalyDetector:
         with self._lock:
             self._records.append(record)
 
-    def score_all(self):
-        """Score all scripts. Call after scan completes.
-
-        Change signals (vs previous scan profiles):
-          - new_script: script URL not seen before (severity 7)
-          - modified_script: same URL but structural hash changed (severity 8)
-          - origin_anomaly: script served from unknown hostname (severity 8)
-
-        Context signals (current scan only):
-          - not_minified: non-minified custom code on mostly-minified subdomain (severity 5)
-          - custom_code: custom code on library-heavy subdomain (severity 4)
-
-        Returns list of finding dicts.
-        """
-        # Build current-scan stats per subdomain
-        current_stats = {}  # subdomain -> {script_count, minified_count, library_count, origins}
+    def _build_stats(self):
+        """Build current-scan stats per subdomain from ingested records."""
+        current_stats = {}
         for rec in self._records:
             if rec.subdomain not in current_stats:
                 current_stats[rec.subdomain] = {
@@ -102,10 +89,36 @@ class AnomalyDetector:
                 stats['library_count'] += 1
             if rec.script_origin:
                 stats['origins'].add(rec.script_origin)
+        return current_stats
+
+    def score(self, emitted_keys=None):
+        """Score all ingested scripts. Safe to call repeatedly.
+
+        Change signals (vs previous scan profiles):
+          - new_script: script URL not seen before (severity 7)
+          - modified_script: same URL but structural hash changed (severity 8)
+          - origin_anomaly: script served from unknown hostname (severity 8)
+
+        Context signals (current scan only):
+          - not_minified: non-minified custom code on mostly-minified subdomain (severity 5)
+          - custom_code: custom code on library-heavy subdomain (severity 4)
+
+        Args:
+            emitted_keys: set of script_hashes already emitted. New findings are
+                          added to this set. Pass the same set across calls to dedup.
+
+        Returns list of finding dicts.
+        """
+        if emitted_keys is None:
+            emitted_keys = set()
+
+        current_stats = self._build_stats()
 
         findings = []
         for rec in self._records:
             if rec.is_known_library:
+                continue
+            if rec.script_hash in emitted_keys:
                 continue
 
             signals = []
@@ -146,6 +159,7 @@ class AnomalyDetector:
             if not signals:
                 continue
 
+            emitted_keys.add(rec.script_hash)
             findings.append({
                 'finding_type': 'anomaly',
                 'source_url': rec.page_url,
@@ -165,10 +179,11 @@ class AnomalyDetector:
                 },
             })
 
-        # Update profiles to current scan data (for next scan's persistence)
-        self._update_profiles(current_stats)
-
         return findings
+
+    def update_profiles(self):
+        """Rebuild profiles from current records. Call at end of scan for persistence."""
+        self._update_profiles(self._build_stats())
 
     def _update_profiles(self, current_stats):
         """Replace profiles with current scan data."""

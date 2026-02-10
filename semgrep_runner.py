@@ -155,6 +155,13 @@ class SemgrepBatch:
         semgrep_sev = result.get('extra', {}).get('severity', 'WARNING')
         return {'ERROR': 9, 'WARNING': 7, 'INFO': 4}.get(semgrep_sev, 5)
 
+    def run_and_reset(self, rules=None):
+        """Run Semgrep on current batch, return findings, reset for next batch."""
+        findings = self.run(rules)
+        self.cleanup()
+        self._hash_to_meta = {}
+        return findings
+
     def cleanup(self):
         """Remove temp directory."""
         if self._temp_dir and os.path.exists(self._temp_dir):
