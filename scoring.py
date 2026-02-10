@@ -72,15 +72,19 @@ def url_path_key(url):
 
 
 def path_segments(url):
-    """Return cumulative path prefixes for novelty tracking.
+    """Return host-scoped cumulative path prefixes for novelty tracking.
 
-    /a/b/c → {'/a', '/a/b', '/a/b/c'}
+    https://a.com/x/y → {'a.com:/x', 'a.com:/x/y'}
 
-    Prefixes instead of individual segments so common segments (en, us, v1,
-    static) don't kill novelty of structurally distinct paths.
+    Host prefix ensures cross-subdomain paths don't contaminate each other
+    (mail.google.com/api and docs.google.com/api are different apps).
+    Cumulative prefixes prevent common segments (en, us, v1) from killing
+    novelty of structurally distinct paths within the same host.
     """
-    parts = [s for s in urlparse(url).path.strip('/').split('/') if s]
-    return {('/' + '/'.join(parts[:i + 1])) for i in range(len(parts))}
+    parsed = urlparse(url)
+    host = parsed.hostname or ''
+    parts = [s for s in parsed.path.strip('/').split('/') if s]
+    return {(host + ':/' + '/'.join(parts[:i + 1])) for i in range(len(parts))}
 
 
 def novelty_score(url, seen_keys, seen_segments):
