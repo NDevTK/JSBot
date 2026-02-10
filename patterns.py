@@ -13,6 +13,7 @@ SOURCES = {
     "postMessage data":     r"""\b(?:event|e|evt|msg)\.data\b""",
     "URLSearchParams":      r"""\bURLSearchParams\b""",
     "getItem":              r"""\b(?:localStorage|sessionStorage)\.getItem\b""",
+    "storage_bracket":      r"""\b(?:localStorage|sessionStorage)\s*\[""",
     "cookie_read":          r"""\bdocument\.cookie\b(?!\s*=)""",
     "input.value":          r"""\b(?:target|currentTarget|srcElement)\.value\b""",
 }
@@ -57,6 +58,36 @@ SINKS = {
     "postMessage": {
         "pattern": r"""\.postMessage\s*\(""",
         "severity": 4,
+    },
+}
+
+# Taint-only sinks: used by find_taint_flows but NOT anomaly has_sinks detection.
+# These patterns are too broad for anomaly (setTimeout fires on 90% of scripts)
+# or need argument context that AST sink detection doesn't provide.
+TAINT_SINKS = {
+    "createContextualFragment": {
+        "pattern": r"""\bcreateContextualFragment\s*\(""",
+        "severity": 9,
+    },
+    "setAttribute Event Handler": {
+        "pattern": r"""\.setAttribute\s*\(\s*['"]on""",
+        "severity": 8,
+    },
+    "setTimeout/setInterval": {
+        "pattern": r"""\b(?:setTimeout|setInterval)\s*\(""",
+        "severity": 7,
+    },
+    "window.open": {
+        "pattern": r"""\bwindow\.open\s*\(""",
+        "severity": 6,
+    },
+    "Script/Link Source": {
+        "pattern": r"""\.(?:src|href|action|formAction)\s*=""",
+        "severity": 6,
+    },
+    "Fetch/XHR": {
+        "pattern": r"""\b(?:fetch|\.open)\s*\(""",
+        "severity": 5,
     },
 }
 

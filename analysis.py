@@ -5,7 +5,7 @@ import httpx
 from hashlib import sha256
 from urllib.parse import urljoin, urlparse
 
-from patterns import SOURCES, SINKS, JS_PATH_FINDER, ENDPOINT_PATTERNS, INTERESTING_STRING_PATTERNS
+from patterns import SOURCES, SINKS, TAINT_SINKS, JS_PATH_FINDER, ENDPOINT_PATTERNS, INTERESTING_STRING_PATTERNS
 from output import log_message, SEEN_FINDINGS, SCRIPT_METADATA
 from scoring import looks_minified, _is_known_library, check_known_cves
 from sourcemaps import try_fetch_sourcemap, get_original_source
@@ -18,7 +18,6 @@ from tree_sitter import Language, Parser
 # --- Global State (managed by scan.py) ---
 SEEN_SCRIPTS = set()
 CHECKED_JS_URLS = set()
-IGNORED_HASHES = set()
 ARGS = None  # Set by scan.py at startup
 
 
@@ -154,6 +153,26 @@ class ASTAnalyzer:
                             })
                             break
 
+            # new expressions: new Function(payload) → Eval Injection
+            if node.type == 'new_expression':
+                constructor = None
+                for child in node.children:
+                    if child.type == 'identifier':
+                        constructor = self.get_node_text(child, source_bytes)
+                        break
+                if constructor:
+                    for sink_name, sink_info in SINKS.items():
+                        if re.search(sink_info["pattern"], constructor + '(', re.IGNORECASE):
+                            if sink_name == "Eval Injection" and self._has_only_literal_args(node):
+                                continue
+                            results.append({
+                                "category": sink_name,
+                                "match": "new " + constructor + '(',
+                                "line": node.start_point[0] + 1,
+                                "severity": sink_info["severity"],
+                            })
+                            break
+
             # Call expressions: eval(), document.write(), insertAdjacentHTML(), etc.
             if node.type == 'call_expression':
                 fn = node.child_by_field_name('function')
@@ -231,16 +250,12 @@ class ASTAnalyzer:
     def find_taint_flows(self, tree, source_bytes):
         """Find intra-file dataflows from user-controlled sources to dangerous sinks.
 
-        Walks all assignments — if the RHS contains a taint source or references
-        a previously tainted variable, the LHS variable becomes tainted.  Then
-        checks whether any tainted variable name appears on a line that contains
-        a sink.  This catches the two most common vulnerability patterns:
+        Two detection modes:
+        1. Via variable: var x = location.hash; el.innerHTML = x;
+        2. Direct: el.innerHTML = location.hash;  (source directly on sink line)
 
-            var x = location.hash;  el.innerHTML = x;          // via variable
-            el.innerHTML = location.hash;                       // direct
-
-        The taint map is per-file (slightly over-approximate across scopes),
-        which is acceptable for a security scanner.
+        Also checks TAINT_SINKS (setTimeout, window.open, .src/.href assignment)
+        which are too broad for anomaly detection but valid for taint analysis.
         """
         tainted_vars = {}  # var_name -> source_name
         stack = [tree.root_node]
@@ -269,26 +284,59 @@ class ASTAnalyzer:
 
             stack.extend(node.children)
 
-        if not tainted_vars:
-            return []
-
-        # Find sinks that reference tainted variables
-        flows = []
+        # Collect all sinks: core SINKS (AST-based) + TAINT_SINKS (line regex)
         sinks = self.find_sinks_in_range(
             tree, source_bytes, 0, tree.root_node.end_point[0],
         )
-        lines = source_bytes.decode('utf-8', errors='replace').split('\n')
+        text = source_bytes.decode('utf-8', errors='replace')
+        lines = text.split('\n')
 
+        # Add TAINT_SINKS via line-level regex (too broad for anomaly, valid for taint)
+        seen_sink_lines = {(s['category'], s['line']) for s in sinks}
+        for category, info in TAINT_SINKS.items():
+            for m in re.finditer(info['pattern'], text):
+                line_num = text[:m.start()].count('\n') + 1
+                if (category, line_num) not in seen_sink_lines:
+                    seen_sink_lines.add((category, line_num))
+                    sinks.append({
+                        'category': category,
+                        'line': line_num,
+                        'severity': info['severity'],
+                    })
+
+        if not sinks:
+            return []
+
+        # Check each sink line for tainted variables or direct source patterns
+        flows = []
         for sink in sinks:
             sink_line = sink['line'] - 1  # 0-indexed
-            if 0 <= sink_line < len(lines):
-                sink_text = lines[sink_line]
-                for var_name, source_name in tainted_vars.items():
-                    if re.search(r'\b' + re.escape(var_name) + r'\b', sink_text):
+            if not (0 <= sink_line < len(lines)):
+                continue
+            sink_text = lines[sink_line]
+
+            # Mode 1: tainted variable on sink line
+            found = False
+            for var_name, source_name in tainted_vars.items():
+                if re.search(r'\b' + re.escape(var_name) + r'\b', sink_text):
+                    flows.append({
+                        'source': source_name,
+                        'sink': sink['category'],
+                        'tainted_var': var_name,
+                        'sink_line': sink['line'],
+                        'severity': sink['severity'],
+                    })
+                    found = True
+                    break
+
+            # Mode 2: source pattern directly on sink line (no intermediate variable)
+            if not found:
+                for source_name, source_pattern in SOURCES.items():
+                    if re.search(source_pattern, sink_text):
                         flows.append({
                             'source': source_name,
                             'sink': sink['category'],
-                            'tainted_var': var_name,
+                            'tainted_var': 'direct',
                             'sink_line': sink['line'],
                             'severity': sink['severity'],
                         })
@@ -806,10 +854,6 @@ async def process_javascript(js_code, url, client, script_url=None, cross_file_s
     raw_hash = get_sha256(js_code)
     structural = structural_hash(js_code)
 
-    # Check both raw hash (--ignore-hashes compat) and structural hash for dedup
-    if raw_hash in IGNORED_HASHES:
-        log_message("INFO", f"Skipping ignored script hash: {raw_hash}")
-        return
     if raw_hash in SEEN_SCRIPTS or structural in SEEN_SCRIPTS:
         return
     SEEN_SCRIPTS.add(raw_hash)

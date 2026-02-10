@@ -25,7 +25,7 @@ from patterns import JS_PATH_FINDER
 from analysis import (
     format_javascript, structural_hash, get_sha256, get_ast_analyzer,
     check_script_safety,
-    SEEN_SCRIPTS, CHECKED_JS_URLS, IGNORED_HASHES,
+    SEEN_SCRIPTS, CHECKED_JS_URLS,
     CrossFileState,
 )
 from sourcemaps import try_fetch_sourcemap, get_original_source
@@ -42,6 +42,7 @@ DEAD_DOMAINS = set()  # domains that failed with connection errors — skip futu
 SEEN_PATH_KEYS = set()  # normalized URL paths — for exact-URL novelty dedup
 SEEN_PATH_SEGMENTS = set()  # unique path segments — for novelty scoring across sessions
 _CHECKED_HEADER_HOSTS = set()  # subdomains already checked for header issues
+_SCAN_DOMAIN = None  # set during pipeline init, used by interrupt handler
 
 
 # --- Configuration ---
@@ -65,8 +66,8 @@ def _get_scan_domain(args, initial_urls):
     return None
 
 
-def _load_scan_state(domain):
-    """Load persisted path segments from previous scans."""
+def _load_scan_state(domain, rescan=False):
+    """Load persisted path segments and analyzed script hashes from previous scans."""
     if not domain:
         return
     path = os.path.join(_STATE_DIR, domain, 'scan_state.json')
@@ -78,12 +79,18 @@ def _load_scan_state(domain):
         loaded = data.get('seen_path_segments', [])
         SEEN_PATH_SEGMENTS.update(loaded)
         log_message("INFO", f"Loaded {len(loaded)} seen path segments from previous scans")
+        if not rescan:
+            hashes = data.get('seen_scripts', [])
+            SEEN_SCRIPTS.update(hashes)
+            log_message("INFO", f"Loaded {len(hashes)} analyzed script hashes (use --rescan to re-analyze)")
+        else:
+            log_message("INFO", "Rescan mode: ignoring previously analyzed script hashes")
     except Exception as e:
         log_message("ERROR", f"Failed to load scan state: {e}")
 
 
 def _save_scan_state(domain):
-    """Persist path segments for future scan novelty scoring."""
+    """Persist path segments and analyzed script hashes for future scans."""
     if not domain:
         return
     d = os.path.join(_STATE_DIR, domain)
@@ -91,8 +98,11 @@ def _save_scan_state(domain):
     path = os.path.join(d, 'scan_state.json')
     try:
         with open(path, 'w') as f:
-            json.dump({'seen_path_segments': sorted(SEEN_PATH_SEGMENTS)}, f)
-        log_message("INFO", f"Saved {len(SEEN_PATH_SEGMENTS)} path segments to scan state")
+            json.dump({
+                'seen_path_segments': sorted(SEEN_PATH_SEGMENTS),
+                'seen_scripts': sorted(SEEN_SCRIPTS),
+            }, f)
+        log_message("INFO", f"Saved {len(SEEN_PATH_SEGMENTS)} path segments, {len(SEEN_SCRIPTS)} script hashes")
     except Exception as e:
         log_message("ERROR", f"Failed to save scan state: {e}")
 
@@ -525,9 +535,7 @@ async def js_audit_worker(js_queue, client, args, executor,
 
             # Dedup (on event loop thread — safe)
             skip_analysis = False
-            if raw_hash in IGNORED_HASHES:
-                skip_analysis = True
-            elif raw_hash in SEEN_SCRIPTS or struct_hash in SEEN_SCRIPTS:
+            if raw_hash in SEEN_SCRIPTS or struct_hash in SEEN_SCRIPTS:
                 skip_analysis = True
             else:
                 SEEN_SCRIPTS.add(raw_hash)
@@ -696,8 +704,10 @@ async def cc_producer(url_queue, domain_queue, hosts, executor):
 
 async def run_pipeline(args, client, initial_urls):
     """Set up queues, workers, and producers; run until all work is done."""
+    global _SCAN_DOMAIN
     scan_domain = _get_scan_domain(args, initial_urls)
-    _load_scan_state(scan_domain)
+    _SCAN_DOMAIN = scan_domain
+    _load_scan_state(scan_domain, rescan=getattr(args, 'rescan', False))
 
     domain_queue = asyncio.Queue(maxsize=100)
     url_queue = HostBalancedQueue()  # balances across hosts at dequeue time
@@ -873,7 +883,7 @@ async def run_pipeline(args, client, initial_urls):
                 url_queue.record_finding(host)
 
     async def findings_flusher():
-        """Periodically flush anomaly findings."""
+        """Periodically flush anomaly findings and persist scan state."""
         while True:
             await asyncio.sleep(60)
             anomaly_findings = anomaly_detector.score(anomaly_emitted)
@@ -882,6 +892,8 @@ async def run_pipeline(args, client, initial_urls):
                 _boost_finding_host(f)
             if anomaly_findings:
                 log_message("INFO", f"Anomaly: {len(anomaly_findings)} findings")
+            # Periodic save — interrupted scans don't lose path segment data
+            _save_scan_state(scan_domain)
 
     flusher_task = asyncio.create_task(findings_flusher())
 
@@ -931,15 +943,6 @@ async def main(args):
     import analysis
     output.ARGS = args
     analysis.ARGS = args
-
-    if args.ignore_hashes:
-        try:
-            with open(args.ignore_hashes, 'r', encoding='utf-8') as f:
-                IGNORED_HASHES.update(line.strip() for line in f if line.strip())
-                log_message("INFO", f"Loaded {len(IGNORED_HASHES)} hashes to ignore.")
-        except IOError as e:
-            log_message("ERROR", f"Unable to read ignore_hashes file '{args.ignore_hashes}': {e}")
-            return
 
     # Load initial URLs based on auto-detected input type
     initial_urls = []
@@ -998,8 +1001,8 @@ if __name__ == '__main__':
                         help="Show HTTP error details on stderr.")
     parser.add_argument('-s', '--save', action='store_true',
                         help="Save unique JS files to disk (SHA256-named).")
-    parser.add_argument('--ignore-hashes',
-                        help="File of SHA256 hashes to skip.")
+    parser.add_argument('--rescan', action='store_true',
+                        help="Re-analyze all scripts (ignore previously analyzed hashes). Use after changing detection logic.")
 
     if len(sys.argv) == 1 and sys.stdin.isatty():
         parser.print_help(sys.stderr)
@@ -1031,5 +1034,7 @@ if __name__ == '__main__':
     try:
         asyncio.run(main(args))
     except KeyboardInterrupt:
-        print("\n[*] Scan interrupted.", file=sys.stderr)
+        # Save accumulated path segments so next run benefits from this session's work
+        _save_scan_state(_SCAN_DOMAIN)
+        print("\n[*] Scan interrupted. State saved.", file=sys.stderr)
         sys.exit(0)

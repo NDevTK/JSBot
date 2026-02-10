@@ -1,8 +1,8 @@
 # JSBot
 
-Opinionated JavaScript security scanner. Give it a domain, it does the rest.
+Opinionated JavaScript security scanner. Give it a domain, it does the rest. Run it again — it picks up where it left off.
 
-JSBot handles target discovery, crawling, JS extraction, deduplication, and security analysis as a single pipeline. Point it at a domain — it finds subdomains via CT logs, pulls historical URLs from Common Crawl, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps for original code, and deduplicates scripts by structural hash. Analysis covers intra-file taint flow (AST), cross-file taint flow (AST), anomaly detection (change + context signals), postMessage origin bypass, secret/credential detection, endpoint/string extraction for recon, library CVE detection, and response header analysis. Zero external analysis tools — everything runs inline via tree-sitter AST. You don't pick the tools or tune the settings — JSBot decides.
+JSBot handles target discovery, crawling, JS extraction, deduplication, and security analysis as a single pipeline. Point it at a domain — it finds subdomains via CT logs, pulls historical URLs from Common Crawl, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps for original code, and deduplicates scripts by structural hash. Analysis covers intra-file taint flow (AST), cross-file taint flow (AST), anomaly detection (change + context signals), postMessage origin bypass, secret/credential detection, endpoint/string extraction for recon, library CVE detection, and response header analysis. Each scan builds on the last — previously explored paths score lower on novelty so new content gets priority, while changed scripts and new subdomains are detected automatically. Zero external analysis tools — everything runs inline via tree-sitter AST. You don't pick the tools or tune the settings — JSBot decides.
 
 ## Install
 
@@ -33,7 +33,7 @@ JSBot auto-detects whether you gave it a domain, a URL, a file, or stdin. For do
 ## Options
 
 ```
-python scan.py [input] [-H HEADER] [-b COOKIE] [-v] [--show-errors] [-s] [--ignore-hashes FILE]
+python scan.py [input] [-H HEADER] [-b COOKIE] [-v] [--show-errors] [-s] [--rescan]
 
   input               Domain, URL, file of URLs, or '-' for stdin
   -H, --header        Custom HTTP header (repeatable)
@@ -41,7 +41,7 @@ python scan.py [input] [-H HEADER] [-b COOKIE] [-v] [--show-errors] [-s] [--igno
   -v, --verbose       Verbose logging to stderr
   --show-errors       Show HTTP error details on stderr
   -s, --save          Save unique JS files to disk (SHA256-named)
-  --ignore-hashes     File of SHA256 hashes to skip
+  --rescan            Re-analyze all scripts (use after changing detection logic)
 ```
 
 That's it. Everything else is automatic.
@@ -167,10 +167,10 @@ Automatically fetches `.map` files for every script. If `sourcesContent` is pres
 ### Deduplication
 
 Scripts are deduplicated two ways:
-- **Raw SHA256**: exact match, compatible with `--ignore-hashes`
+- **Raw SHA256**: exact content match
 - **Structural hash**: strips comments and normalizes whitespace before hashing
 
-Same logic seen on 50 pages is analyzed once.
+Same logic seen on 50 pages is analyzed once. Structural hashes persist across sessions — scripts that haven't changed since the last scan are skipped entirely. Use `--rescan` to force re-analysis after changing detection logic.
 
 ## Discovery
 
@@ -190,7 +190,24 @@ Standard path discovery: robots.txt disallowed paths (often the most interesting
 
 URLs are scored by **novelty + interestingness** and scanned highest-first. Novelty is the primary signal — URLs with path prefixes JSBot hasn't seen before get prioritized. Path prefixes are host-scoped (crawling `/api` on one subdomain doesn't reduce novelty of `/api` on another). Keyword bonuses boost paths containing `admin`, `api`, `debug`, `oauth`, `upload`, etc.
 
+Novelty persists across sessions. Path segments from previous scans are loaded at startup, so repeat scans automatically prioritize URLs the scanner hasn't explored yet. Nothing is skipped — previously seen paths just sort lower in the queue. New subdomains from fresh CT months, new Common Crawl entries, and newly spidered paths all score higher. Interesting old paths (containing `admin`, `api`, etc.) can still rank above boring new ones via keyword bonuses.
+
 Hosts that produce findings get **crawl credits** — the scanner automatically digs deeper into subdomains where it's finding results, while still maintaining broad coverage of unexplored hosts.
+
+## Cross-Session State
+
+JSBot persists state in `.ct_cache/{domain}/` so each scan builds on previous runs:
+
+| File | Purpose |
+|------|---------|
+| `state.json` | CT log state — which crt.sh months have been fetched |
+| `YYYY-MM.json` | Cached CT results per month (subdomains + related domains) |
+| `anomaly_profiles.json` | Per-subdomain script baselines for change detection |
+| `scan_state.json` | Path segments + analyzed script hashes from previous scans |
+
+State is saved on normal exit and on Ctrl+C interrupt. Scan state is also saved periodically during the scan so long-running scans don't lose progress.
+
+The first scan of a domain builds baselines. Subsequent scans skip scripts that haven't changed (by structural hash), detect changes (new/modified scripts, origin anomalies, CSP weakening), and automatically prioritize unexplored URLs. Use `--rescan` to force re-analysis of all scripts after updating detection logic. Delete `.ct_cache/{domain}/` to reset all state for a domain.
 
 ## Finding Types
 
@@ -221,8 +238,8 @@ python scan.py urls.txt > findings.jsonl
 # Save scripts for later review
 python scan.py target.com -s > findings.jsonl
 
-# Skip known libraries on repeat scans
-python scan.py target.com --ignore-hashes known_libs.txt > findings.jsonl
+# Re-analyze everything after updating detection logic
+python scan.py target.com --rescan > findings.jsonl
 
 # Filter results with jq
 python scan.py target.com | jq 'select(.severity >= 8)'
