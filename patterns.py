@@ -67,3 +67,46 @@ JS_PATH_FINDER = r"""['"](/[^"']+\.js|[^"']+\.js)['"]"""
 
 # --- Source Map URL Pattern ---
 SOURCE_MAP_URL_PATTERN = r"""//[#@]\s*sourceMappingURL\s*=\s*(\S+)"""
+
+# --- Endpoint Extraction Patterns ---
+# Each entry: (regex with group 1 = endpoint, category label)
+ENDPOINT_PATTERNS = [
+    # fetch/axios calls: fetch('/api/users'), axios.get('/admin/config')
+    (r"""(?:fetch|axios\.(?:get|post|put|delete|patch))\s*\(\s*['"`]([^'"`\n]{5,})['"`]""", "fetch_call"),
+    # XMLHttpRequest.open('GET', '/api/users')
+    (r"""\.open\s*\(\s*['"](?:GET|POST|PUT|DELETE|PATCH)['"]\s*,\s*['"]([^'"]+)['"]""", "xhr_open"),
+    # String literals that look like API/internal paths
+    (r"""['"](/(?:api|graphql|rest|v[0-9]+|internal|admin|auth|oauth|webhook|socket\.io)/[^'"\s]{2,})['"]""", "api_path"),
+    # WebSocket endpoints
+    (r"""['"`](wss?://[^'"`\s\n]+)['"`]""", "websocket"),
+]
+
+# --- Interesting String Patterns ---
+# Each entry: (regex with group 1 = value, type label, severity)
+INTERESTING_STRING_PATTERNS = [
+    # Internal/RFC1918 IPs in strings or URLs
+    (r"""(?:['"`]|https?://)((?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})(?::\d+)?)""",
+     "internal_ip", 6),
+    # AWS S3 bucket URLs
+    (r"""['"`]((?:[a-z0-9][-a-z0-9]{2,62}\.)?s3[-.](?:us|eu|ap|sa|ca|me|af)[-a-z0-9]*\.amazonaws\.com/[^'"`\s]*)['"`]""",
+     "s3_url", 7),
+    (r"""['"`]s3://([a-z0-9][-a-z0-9]{2,62}[^'"`\s]*)['"`]""", "s3_bucket", 7),
+    # Firebase realtime DB
+    (r"""['"`](https?://[a-z0-9][-a-z0-9]*\.firebaseio\.com[^'"`\s]*)['"`]""", "firebase_db", 7),
+    # Supabase
+    (r"""['"`](https?://[a-z0-9]+\.supabase\.co[^'"`\s]*)['"`]""", "supabase_url", 6),
+    # Google Cloud Storage
+    (r"""['"`](https?://storage\.googleapis\.com/[^'"`\s]+)['"`]""", "gcs_bucket", 6),
+    # Azure storage
+    (r"""['"`](https?://[a-z0-9]+\.(?:blob|table|queue)\.core\.windows\.net[^'"`\s]*)['"`]""",
+     "azure_storage", 6),
+    # JWT tokens hardcoded in source
+    (r"""['"`](eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+)['"`]""",
+     "jwt_token", 8),
+    # Debug/admin flags set to true
+    (r"""(?:debug|isDebug|debugMode|devMode|isDev|testMode|adminMode|isAdmin)\s*[:=]\s*(true|1)\b""",
+     "debug_flag", 5),
+    # Security-related TODOs/comments
+    (r"""(?://|/\*)\s*((?:TODO|FIXME|HACK|XXX|BUG)\s*:?\s*[^\n*]{0,40}(?:auth|secur|cred|passw|secret|token|xss|csrf|inject|bypass|vuln)[^\n*]{0,40})""",
+     "security_todo", 5),
+]

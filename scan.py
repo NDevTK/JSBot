@@ -42,6 +42,7 @@ DISCOVERED_URLS = set()
 DEAD_DOMAINS = set()  # domains that failed with connection errors — skip future requests
 SEEN_PATH_KEYS = set()  # normalized URL paths — for exact-URL novelty dedup
 SEEN_PATH_SEGMENTS = set()  # unique path segments — for novelty scoring across sessions
+_CHECKED_HEADER_HOSTS = set()  # subdomains already checked for header issues
 
 
 # --- Configuration ---
@@ -258,6 +259,81 @@ class ProducerTracker:
                     await self._queue.put(_POISON)
 
 
+# --- Response Header Analysis ---
+
+def _check_page_headers(response, page_url, anomaly_detector=None):
+    """Check response headers for exploitable misconfigurations + cross-scan changes.
+
+    CORS wildcard+credentials is always checked (rare, exploitable).
+    CSP is tracked across scans — only emits findings when policy weakens or is removed.
+    """
+    host = urlparse(page_url).hostname
+    if not host or host in _CHECKED_HEADER_HOSTS:
+        return
+    _CHECKED_HEADER_HOSTS.add(host)
+
+    headers = response.headers
+    issues = []
+
+    # CORS wildcard + credentials = exploitable (always check, rare and severe)
+    acao = headers.get('access-control-allow-origin', '')
+    acac = headers.get('access-control-allow-credentials', '').lower()
+    if acao == '*' and acac == 'true':
+        issues.append({
+            'type': 'cors_wildcard_credentials',
+            'detail': 'Access-Control-Allow-Origin: * with credentials',
+            'severity': 9,
+        })
+
+    # CSP state for anomaly detection (track changes, not static presence)
+    csp = headers.get('content-security-policy', '')
+    current_state = {
+        'has_csp': bool(csp),
+        'csp_unsafe_inline': "'unsafe-inline'" in csp,
+        'csp_unsafe_eval': "'unsafe-eval'" in csp,
+    }
+
+    if anomaly_detector is not None:
+        anomaly_detector.ingest_header_state(host, current_state)
+
+        # Compare against previous scan — only emit CSP findings on change
+        prev = anomaly_detector.get_previous_header_state(host)
+        if prev:
+            if prev.get('has_csp') and not current_state['has_csp']:
+                issues.append({
+                    'type': 'csp_removed',
+                    'detail': 'CSP header present in previous scan but now missing',
+                    'severity': 7,
+                })
+            elif prev.get('has_csp') and current_state['has_csp']:
+                if not prev.get('csp_unsafe_inline') and current_state['csp_unsafe_inline']:
+                    issues.append({
+                        'type': 'csp_weakened',
+                        'detail': 'CSP gained unsafe-inline since previous scan',
+                        'severity': 7,
+                    })
+                if not prev.get('csp_unsafe_eval') and current_state['csp_unsafe_eval']:
+                    issues.append({
+                        'type': 'csp_weakened',
+                        'detail': 'CSP gained unsafe-eval since previous scan',
+                        'severity': 7,
+                    })
+
+    if not issues:
+        return
+
+    max_sev = max(i['severity'] for i in issues)
+    log_message("FINDING", {
+        'finding_type': 'header_issue',
+        'source_url': page_url,
+        'subdomain': host,
+        'issues': issues,
+        'severity': max_sev,
+        'confidence': 'high',
+        'analysis_method': 'header_analysis',
+    })
+
+
 # --- Worker Coroutines ---
 
 async def domain_discovery_worker(domain_queue, url_queue, client, args):
@@ -289,7 +365,7 @@ async def domain_discovery_worker(domain_queue, url_queue, client, args):
             domain_queue.task_done()
 
 
-async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
+async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker, anomaly_detector=None):
     """Pulls URLs, fetches pages, puts scripts into js_queue, spiders back into url_queue."""
     timeout = httpx.Timeout(10.0, connect=5.0)
 
@@ -331,6 +407,7 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
 
             # HTML content
             elif 'html' in content_type:
+                _check_page_headers(response, page_url, anomaly_detector)
                 page_parser = BeautifulSoup(response.text, 'lxml')
 
                 # Collect all scripts for this page
@@ -648,7 +725,9 @@ async def run_pipeline(args, client, initial_urls):
         for _ in range(num_domain_workers)
     ]
     crawl_tasks = [
-        asyncio.create_task(page_crawl_worker(url_queue, js_queue, client, args, url_tracker))
+        asyncio.create_task(page_crawl_worker(
+            url_queue, js_queue, client, args, url_tracker, anomaly_detector,
+        ))
         for _ in range(num_crawl_workers)
     ]
     js_tasks = [

@@ -5,9 +5,9 @@ import httpx
 from hashlib import sha256
 from urllib.parse import urljoin, urlparse
 
-from patterns import SOURCES, SINKS, JS_PATH_FINDER
+from patterns import SOURCES, SINKS, JS_PATH_FINDER, ENDPOINT_PATTERNS, INTERESTING_STRING_PATTERNS
 from output import log_message, SEEN_FINDINGS, SCRIPT_METADATA
-from scoring import looks_minified, _is_known_library
+from scoring import looks_minified, _is_known_library, check_known_cves
 from sourcemaps import try_fetch_sourcemap, get_original_source
 from anomaly import ScriptRecord
 
@@ -248,6 +248,72 @@ class ASTAnalyzer:
             stack.extend(node.children)
         return results
 
+    def find_postmessage_handlers(self, tree, source_bytes):
+        """Find message event listeners, check origin validation and sink flow."""
+        results = []
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+
+            # addEventListener('message', handler)
+            if node.type == 'call_expression':
+                fn = node.child_by_field_name('function')
+                if fn:
+                    fn_name = None
+                    if fn.type == 'member_expression':
+                        prop = fn.child_by_field_name('property')
+                        if prop:
+                            fn_name = self.get_node_text(prop, source_bytes)
+                    elif fn.type == 'identifier':
+                        fn_name = self.get_node_text(fn, source_bytes)
+
+                    if fn_name == 'addEventListener':
+                        args = node.child_by_field_name('arguments')
+                        if args:
+                            arg_nodes = [c for c in args.children
+                                         if c.type not in ('(', ')', ',')]
+                            if len(arg_nodes) >= 2:
+                                event_type = self.get_node_text(
+                                    arg_nodes[0], source_bytes
+                                ).strip('\'"` ')
+                                if event_type == 'message':
+                                    results.append(self._analyze_msg_handler(
+                                        arg_nodes[1], node, tree, source_bytes
+                                    ))
+
+            # window.onmessage = handler
+            if node.type == 'assignment_expression':
+                left = node.child_by_field_name('left')
+                if left and left.type == 'member_expression':
+                    chain = self._get_member_chain(left, source_bytes)
+                    if chain and chain.endswith('.onmessage'):
+                        right = node.child_by_field_name('right')
+                        if right:
+                            results.append(self._analyze_msg_handler(
+                                right, node, tree, source_bytes
+                            ))
+
+            stack.extend(node.children)
+        return results
+
+    def _analyze_msg_handler(self, handler_node, context_node, tree, source_bytes):
+        """Analyze a message handler for origin checks and sink usage."""
+        handler_text = self.get_node_text(handler_node, source_bytes)
+        has_origin_check = bool(re.search(
+            r'\b(?:event|e|evt|msg|ev)\.origin\b', handler_text
+        ))
+        sinks = []
+        if handler_node.type in ('arrow_function', 'function_expression', 'function'):
+            sinks = self.find_sinks_in_range(
+                tree, source_bytes,
+                handler_node.start_point[0], handler_node.end_point[0]
+            )
+        return {
+            'line': context_node.start_point[0] + 1,
+            'has_origin_check': has_origin_check,
+            'sinks': sinks,
+        }
+
 
 # Singleton AST analyzer (created on first use)
 _ast_analyzer = None
@@ -408,11 +474,165 @@ class CrossFileState:
         return count
 
 
+# --- Inline Finding Extractors (called from check_script_safety) ---
+
+_STATIC_EXTENSIONS = frozenset({
+    '.js', '.css', '.png', '.jpg', '.jpeg', '.gif', '.svg',
+    '.ico', '.woff', '.woff2', '.ttf', '.eot', '.map',
+})
+
+
+def _extract_endpoints(script_content, script_hash, url, script_url):
+    """Extract interesting API endpoints from JS. Emits finding if novel endpoints found."""
+    novel = []
+    for pattern, category in ENDPOINT_PATTERNS:
+        for match in re.finditer(pattern, script_content, re.IGNORECASE):
+            endpoint = match.group(1).strip()
+            if len(endpoint) < 5 or endpoint.startswith(('data:', 'blob:')):
+                continue
+            # Skip static file extensions
+            path_part = endpoint.split('?')[0].split('#')[0]
+            if '.' in path_part.rsplit('/', 1)[-1]:
+                ext = '.' + path_part.rsplit('.', 1)[-1].lower()
+                if ext in _STATIC_EXTENSIONS:
+                    continue
+            dedup_key = f"ep:{endpoint}"
+            if dedup_key in SEEN_FINDINGS:
+                continue
+            SEEN_FINDINGS.add(dedup_key)
+            novel.append({
+                'url': endpoint,
+                'type': category,
+                'line': script_content[:match.start()].count('\n') + 1,
+            })
+
+    if not novel:
+        return
+
+    # Score based on most interesting endpoint
+    max_sev = 4
+    for ep in novel:
+        ep_lower = ep['url'].lower()
+        if any(kw in ep_lower for kw in ('admin', 'internal', 'debug', 'private')):
+            max_sev = max(max_sev, 6)
+        elif any(kw in ep_lower for kw in ('graphql', 'webhook', 'oauth', 'auth')):
+            max_sev = max(max_sev, 5)
+        elif ep['type'] == 'websocket':
+            max_sev = max(max_sev, 5)
+
+    log_message("FINDING", {
+        'finding_type': 'endpoint',
+        'source_url': url,
+        'script_url': script_url or 'inline',
+        'script_hash': script_hash,
+        'endpoints': novel,
+        'severity': max_sev,
+        'confidence': 'medium',
+        'analysis_method': 'regex',
+    })
+
+
+def _extract_interesting_strings(script_content, script_hash, url, script_url):
+    """Extract sensitive/recon strings from JS. Emits finding if novel strings found."""
+    novel = []
+    for pattern, str_type, severity in INTERESTING_STRING_PATTERNS:
+        for match in re.finditer(pattern, script_content, re.IGNORECASE):
+            value = match.group(1).strip()
+            if len(value) < 3:
+                continue
+            dedup_key = f"str:{str_type}:{value[:100]}"
+            if dedup_key in SEEN_FINDINGS:
+                continue
+            SEEN_FINDINGS.add(dedup_key)
+            novel.append({
+                'type': str_type,
+                'value': value[:200],
+                'line': script_content[:match.start()].count('\n') + 1,
+                'severity': severity,
+            })
+
+    if not novel:
+        return
+
+    max_sev = max(s['severity'] for s in novel)
+    log_message("FINDING", {
+        'finding_type': 'interesting_string',
+        'source_url': url,
+        'script_url': script_url or 'inline',
+        'script_hash': script_hash,
+        'strings': novel,
+        'severity': max_sev,
+        'confidence': 'medium',
+        'analysis_method': 'regex',
+    })
+
+
+def _check_postmessage_handlers(analyzer, tree, source_bytes, script_hash, url, script_url):
+    """Check for postMessage handlers with missing origin validation. Emits findings."""
+    handlers = analyzer.find_postmessage_handlers(tree, source_bytes)
+    for handler in handlers:
+        finding_key = f"postmsg:{script_hash}:{handler['line']}"
+        if finding_key in SEEN_FINDINGS:
+            continue
+        SEEN_FINDINGS.add(finding_key)
+
+        if not handler['has_origin_check']:
+            severity = 7
+            issue = 'no_origin_check'
+            if handler['sinks']:
+                severity = 9
+                issue = 'no_origin_check_with_sink'
+        elif handler['sinks']:
+            severity = 6
+            issue = 'data_to_sink'
+        else:
+            continue  # Origin check present, no sinks — not interesting
+
+        finding = {
+            'finding_type': 'postmessage_issue',
+            'source_url': url,
+            'script_url': script_url or 'inline',
+            'script_hash': script_hash,
+            'issue': issue,
+            'handler_line': handler['line'],
+            'severity': severity,
+            'confidence': 'medium',
+            'analysis_method': 'ast',
+        }
+        if handler['sinks']:
+            finding['sink_categories'] = list({s['category'] for s in handler['sinks']})
+        log_message("FINDING", finding)
+
+
+def _check_library_cves(script_content, script_hash, url, script_url):
+    """Check for known library CVEs. Emits findings."""
+    vulns = check_known_cves(script_content)
+    for vuln in vulns:
+        finding_key = f"cve:{vuln['library']}:{vuln['version']}:{vuln['cves'][0]}"
+        if finding_key in SEEN_FINDINGS:
+            continue
+        SEEN_FINDINGS.add(finding_key)
+        log_message("FINDING", {
+            'finding_type': 'known_cve',
+            'source_url': url,
+            'script_url': script_url or 'inline',
+            'script_hash': script_hash,
+            'library': vuln['library'],
+            'version': vuln['version'],
+            'cves': vuln['cves'],
+            'description': vuln['description'],
+            'fix_below': vuln['fix_below'],
+            'severity': vuln['severity'],
+            'confidence': 'high',
+            'analysis_method': 'version_detection',
+        })
+
+
 # --- Main Script Analysis Pipeline ---
 
 def check_script_safety(script_content, script_hash, url, script_url=None,
                         struct_hash=None, anomaly_detector=None, semgrep_batch=None):
-    """Collect script for Semgrep and anomaly detection."""
+    """Analyze script: anomaly detection, Semgrep, endpoints, strings, postMessage, CVEs."""
     minified = looks_minified(script_content)
     line_count = script_content.count('\n') + 1
     SCRIPT_METADATA[script_hash] = {
@@ -420,15 +640,17 @@ def check_script_safety(script_content, script_hash, url, script_url=None,
         "line_count": line_count,
     }
 
+    # Parse AST once — shared across anomaly, postMessage, and cross-file analysis
+    analyzer = get_ast_analyzer()
+    tree = analyzer.parse(script_content)
+    source_bytes = script_content.encode('utf-8') if tree else None
+
+    # --- Anomaly detection ---
     if anomaly_detector is not None and struct_hash is not None:
-        # Per-script source/sink detection for anomaly signals
         has_sources = False
         has_sinks = False
         sink_cats = ()
-        analyzer = get_ast_analyzer()
-        tree = analyzer.parse(script_content)
         if tree:
-            source_bytes = script_content.encode('utf-8')
             sources = analyzer.find_sources_in_range(tree, source_bytes, 0, line_count)
             sinks = analyzer.find_sinks_in_range(tree, source_bytes, 0, line_count)
             has_sources = len(sources) > 0
@@ -453,8 +675,16 @@ def check_script_safety(script_content, script_hash, url, script_url=None,
         )
         anomaly_detector.ingest(record)
 
+    # --- Semgrep ---
     if semgrep_batch is not None:
         semgrep_batch.add_script(script_content, script_hash, url, script_url)
+
+    # --- Inline findings (always run) ---
+    _extract_endpoints(script_content, script_hash, url, script_url)
+    _extract_interesting_strings(script_content, script_hash, url, script_url)
+    if tree:
+        _check_postmessage_handlers(analyzer, tree, source_bytes, script_hash, url, script_url)
+    _check_library_cves(script_content, script_hash, url, script_url)
 
 
 def structural_hash(js_code):

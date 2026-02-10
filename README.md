@@ -2,7 +2,7 @@
 
 Opinionated JavaScript security scanner. Give it a domain, it does the rest.
 
-JSBot handles target discovery, crawling, JS extraction, deduplication, and security analysis as a single pipeline. Point it at a domain — it finds subdomains via CT logs, pulls historical URLs from Common Crawl, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps for original code, and deduplicates scripts by structural hash. Analysis is three-pronged: Semgrep runs battle-tested rules for real vulnerabilities (XSS, secrets, SSRF), AST analysis tracks taint flow across scripts on the same page, and an anomaly system detects script changes across scans and flags vulnerability surface using source/sink detection. You don't pick the tools or tune the settings — JSBot decides.
+JSBot handles target discovery, crawling, JS extraction, deduplication, and security analysis as a single pipeline. Point it at a domain — it finds subdomains via CT logs, pulls historical URLs from Common Crawl, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps for original code, and deduplicates scripts by structural hash. Analysis covers static vulnerabilities (Semgrep), cross-file taint flow (AST), anomaly detection (change + context signals), postMessage origin bypass, endpoint/string extraction for recon, library CVE detection, and response header analysis. You don't pick the tools or tune the settings — JSBot decides.
 
 ## Install
 
@@ -90,6 +90,59 @@ Overlooked signals compound with vulnerability surface: overlooked + sinks → s
 
 Findings include `sink_categories` (e.g. `["DOM XSS", "Eval Injection"]`) so you can see the attack surface type without opening the script.
 
+### postMessage Analysis
+
+Dedicated AST analysis for message event handlers — one of the most common client-side bug classes. JSBot finds `addEventListener('message', ...)` and `window.onmessage = ...` patterns, then checks:
+
+- **Origin validation**: Does the handler check `event.origin` before acting?
+- **Sink flow**: Does `event.data` reach a dangerous sink (innerHTML, eval, etc.)?
+
+| Issue | Severity | Meaning |
+|-------|----------|---------|
+| `no_origin_check_with_sink` | 9 | No origin check + data flows to sink. Likely exploitable. |
+| `no_origin_check` | 7 | No origin check, but no obvious sink. Still worth reviewing. |
+| `data_to_sink` | 6 | Origin is checked, but data still reaches a sink. Check if the validation is sufficient. |
+
+### Endpoint Extraction
+
+Extracts API endpoints, internal paths, and WebSocket URLs from JavaScript source. These are recon findings — they reveal the backend attack surface without opening a single script.
+
+Captured patterns: `fetch()`, `axios.*()`, `XMLHttpRequest.open()`, string literals matching `/api/`, `/graphql/`, `/internal/`, `/admin/`, and `wss://` WebSocket URLs. Static file extensions (`.js`, `.css`, `.png`, etc.) are filtered out.
+
+Severity scales with endpoint interestingness: admin/internal/debug paths get severity 6, auth/graphql/webhook paths get 5, others get 4.
+
+### Interesting String Extraction
+
+Extracts sensitive recon data embedded in JavaScript:
+
+- **Internal IPs** (severity 6) — RFC1918 addresses (`10.x`, `172.16-31.x`, `192.168.x`) in strings or URLs
+- **Cloud URLs** (severity 6-7) — AWS S3 buckets, Firebase realtime DBs, Supabase, Google Cloud Storage, Azure storage
+- **JWT tokens** (severity 8) — Hardcoded JWTs in source code. Claims reveal user roles, service names, expiration.
+- **Debug flags** (severity 5) — `debugMode = true`, `isAdmin = true`, etc.
+- **Security TODOs** (severity 5) — Comments containing `TODO`/`FIXME`/`HACK` + security keywords (auth, bypass, vuln, etc.)
+
+### Known CVE Detection
+
+Two-layer library vulnerability detection:
+
+1. **Specific fingerprints** — high-confidence regex patterns for jQuery, Angular.js, Vue.js, Lodash, Bootstrap, and Moment.js with a hardcoded CVE database (works offline, instant).
+2. **Generic detection + OSV.dev** — a generic `/*! LibName v1.2.3 */` header pattern catches smaller libraries (DOMPurify, Flatpickr, Select2, etc.), then queries the [OSV.dev](https://osv.dev) vulnerability database for real CVE data. OSV covers the entire npm advisory database (GHSA + CVE). Results are cached per library+version.
+
+The hardcoded database provides a fast baseline. OSV supplements it with broader coverage and catches CVEs that haven't been manually added. If the network is unavailable, the hardcoded database still works.
+
+Findings include the exact version detected, CVE IDs, severity, and a fix threshold.
+
+### Response Headers
+
+Checks HTTP response headers for exploitable misconfigurations. Runs once per subdomain (first page seen):
+
+- **CORS wildcard + credentials** (severity 9) — `Access-Control-Allow-Origin: *` with `Access-Control-Allow-Credentials: true`. Exploitable for credential theft.
+
+CSP analysis uses **anomaly detection** instead of static checks — "this page has unsafe-inline" is true for most of the internet and isn't actionable. Instead, JSBot tracks CSP state per subdomain across scans and detects changes:
+
+- **`csp_removed`** (severity 7) — CSP header was present in the previous scan but is now missing.
+- **`csp_weakened`** (severity 7) — CSP gained `unsafe-inline` or `unsafe-eval` since the previous scan.
+
 ### Source Maps
 
 Automatically fetches `.map` files for every script. If `sourcesContent` is present, JSBot re-analyzes the original unminified source — better variable names, real structure, more accurate findings.
@@ -130,6 +183,11 @@ Hosts that produce findings get **crawl credits** — the scanner automatically 
 | `cross_file_taint` | AST | Tainted global written by one script, read into sink by another |
 | `dangerous_global_function` | AST | Function on window/globalThis containing sinks |
 | `anomaly` | change detection + AST | Script change, origin anomaly, or vulnerability surface (sinks, source+sink, inline) |
+| `postmessage_issue` | AST | Message handler with missing origin check or data flowing to sink |
+| `endpoint` | regex | API endpoint, WebSocket URL, or internal path extracted from JS |
+| `interesting_string` | regex | Internal IP, cloud URL, JWT, debug flag, or security TODO found in JS |
+| `known_cve` | version detection | Library with known CVE (jQuery, Angular.js, Lodash, Bootstrap, Moment.js) |
+| `header_issue` | header analysis | CORS misconfiguration or weak CSP on a subdomain |
 
 ## Examples
 
@@ -163,4 +221,19 @@ python scan.py target.com | jq 'select(.signals and (.signals | index("source_an
 
 # Filter by sink type
 python scan.py target.com | jq 'select(.sink_categories and (.sink_categories | index("DOM XSS")))'
+
+# postMessage handlers without origin checks
+python scan.py target.com | jq 'select(.finding_type == "postmessage_issue")'
+
+# Extracted API endpoints (recon)
+python scan.py target.com | jq 'select(.finding_type == "endpoint") | .endpoints[]'
+
+# Interesting strings (cloud URLs, internal IPs, JWTs)
+python scan.py target.com | jq 'select(.finding_type == "interesting_string") | .strings[]'
+
+# Known CVEs in libraries
+python scan.py target.com | jq 'select(.finding_type == "known_cve")'
+
+# Header issues (CORS, CSP)
+python scan.py target.com | jq 'select(.finding_type == "header_issue")'
 ```

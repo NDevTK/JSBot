@@ -63,15 +63,19 @@ class SubdomainProfile:
         self.script_count = 0
         self.minified_count = 0
         self.library_count = 0
+        self.header_state = {}  # CSP/CORS state for cross-scan change detection
 
     def to_dict(self):
-        return {
+        d = {
             'known_scripts': self.known_scripts,
             'known_origins': sorted(self.known_origins),
             'script_count': self.script_count,
             'minified_count': self.minified_count,
             'library_count': self.library_count,
         }
+        if self.header_state:
+            d['header_state'] = self.header_state
+        return d
 
     @classmethod
     def from_dict(cls, subdomain, data):
@@ -81,6 +85,7 @@ class SubdomainProfile:
         profile.script_count = data.get('script_count', 0)
         profile.minified_count = data.get('minified_count', 0)
         profile.library_count = data.get('library_count', 0)
+        profile.header_state = data.get('header_state', {})
         # Rebuild normalized URL index for cache-bust detection
         for url, shash in profile.known_scripts.items():
             norm = _normalize_versioned_url(url)
@@ -101,11 +106,21 @@ class AnomalyDetector:
         self.profiles = {}    # subdomain -> SubdomainProfile (from previous scan)
         self._records = []    # ScriptRecord list (current scan)
         self._lock = threading.Lock()
+        self._current_headers = {}  # subdomain -> header_state dict (current scan)
 
     def ingest(self, record):
         """Add a script record. Thread-safe (called from ThreadPoolExecutor)."""
         with self._lock:
             self._records.append(record)
+
+    def get_previous_header_state(self, subdomain):
+        """Get header security state from previous scan profile."""
+        profile = self.profiles.get(subdomain)
+        return profile.header_state if profile else {}
+
+    def ingest_header_state(self, subdomain, state):
+        """Record current scan's header state for a subdomain."""
+        self._current_headers[subdomain] = state
 
     def _build_stats(self):
         """Build current-scan stats per subdomain from ingested records."""
@@ -281,6 +296,12 @@ class AnomalyDetector:
                 new_profiles[sub].script_count = stats['script_count']
                 new_profiles[sub].minified_count = stats['minified_count']
                 new_profiles[sub].library_count = stats['library_count']
+
+        # Copy current header states
+        for sub, state in self._current_headers.items():
+            if sub not in new_profiles:
+                new_profiles[sub] = SubdomainProfile(sub)
+            new_profiles[sub].header_state = state
 
         self.profiles = new_profiles
 
