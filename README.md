@@ -163,7 +163,20 @@ Spider links feed back into the URL queue. JS paths discovered inside scripts fe
 
 ### URL Scoring
 
-URLs are scored and scanned highest-first:
+URLs are scored by **novelty + interestingness** and scanned highest-first. Novelty is the primary signal — URLs with path segments JSBot hasn't seen before get prioritized over redundant variations of the same endpoint.
+
+**Novelty** (0–20 points):
+
+| Condition | Score |
+|-----------|-------|
+| All path segments are new | 20 |
+| Some segments new, some seen | proportional (e.g., 2/4 new = 10) |
+| Root URL (no path) | 10 |
+| Exact path already seen | 0 |
+
+Path segments seen during a scan are persisted to disk, so repeat scans automatically deprioritize already-explored areas.
+
+**Interestingness** (0–∞ bonus points):
 
 | Signal | Points | Examples |
 |--------|--------|---------|
