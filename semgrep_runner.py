@@ -3,10 +3,39 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 
 from output import log_message, SEEN_FINDINGS
+
+
+def _find_semgrep():
+    """Find the semgrep executable and return (path, env).
+
+    Checks PATH first, then Python's Scripts dirs (where pip installs).
+    Returns env with Scripts dir prepended so semgrep can find pysemgrep.
+    """
+    if shutil.which('semgrep') and shutil.which('pysemgrep'):
+        return 'semgrep', None
+
+    import site
+    exe_name = 'semgrep.exe' if os.name == 'nt' else 'semgrep'
+    user_base = site.getuserbase()
+    vi = sys.version_info
+    search_dirs = [
+        os.path.join(user_base, f'Python{vi.major}{vi.minor}', 'Scripts'),
+        os.path.join(user_base, 'Scripts' if os.name == 'nt' else 'bin'),
+        os.path.join(os.path.dirname(sys.executable), 'Scripts'),
+    ]
+    for scripts_dir in search_dirs:
+        scripts_dir = os.path.normpath(scripts_dir)
+        if os.path.isfile(os.path.join(scripts_dir, exe_name)):
+            env = os.environ.copy()
+            env['PATH'] = scripts_dir + os.pathsep + env.get('PATH', '')
+            return os.path.join(scripts_dir, exe_name), env
+
+    return 'semgrep', None
 
 # Rule packs to run (security-focused only)
 DEFAULT_RULES = [
@@ -48,8 +77,9 @@ class SemgrepBatch:
             return []
 
         rules = rules or DEFAULT_RULES
+        semgrep_bin, env = _find_semgrep()
         cmd = [
-            'semgrep', 'scan',
+            semgrep_bin, 'scan',
             '--json', '--quiet',
             '--no-git-ignore',
             '--timeout', '30',
@@ -62,7 +92,7 @@ class SemgrepBatch:
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
-                timeout=300,  # 5 min total
+                timeout=300, env=env,  # 5 min total
             )
             return self._parse_output(result.stdout)
         except subprocess.TimeoutExpired:
