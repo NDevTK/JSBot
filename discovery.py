@@ -261,29 +261,42 @@ def _cc_clean_url(url):
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{clean_query}"
 
 
-def _cc_fetch_host(index_url, host, user_agent, limit):
-    """Fetch URLs for one host from one CC index."""
+def _cc_fetch_host(index_url, host, user_agent, limit, rate_lock=None):
+    """Fetch URLs for one host from one CC index (with retry + rate limiting)."""
     params = {
         'url': f'{host}/*',
         'output': 'json',
         'limit': limit,
         'filter': '=status:200',
     }
-    try:
-        resp = requests.get(index_url, params=params,
-                            headers={'User-Agent': user_agent}, timeout=60)
-        resp.raise_for_status()
-        urls = set()
-        for line in resp.text.strip().split('\n'):
-            if not line.strip():
+    for attempt in range(3):
+        if rate_lock is not None:
+            with rate_lock:
+                time.sleep(1)  # 1 req/sec across all threads
+        try:
+            resp = requests.get(index_url, params=params,
+                                headers={'User-Agent': user_agent}, timeout=60)
+            if resp.status_code == 429:
+                wait = min(30, 5 * (attempt + 1))
+                log_message("ERROR", f"CC rate limited for {host}, waiting {wait}s")
+                time.sleep(wait)
                 continue
-            record = json.loads(line)
-            if 'url' in record:
-                urls.add(_cc_clean_url(record['url']))
-        return urls
-    except Exception as e:
-        log_message("ERROR", f"Common Crawl query failed for {host}: {e}")
-        return set()
+            resp.raise_for_status()
+            urls = set()
+            for line in resp.text.strip().split('\n'):
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if 'url' in record:
+                    urls.add(_cc_clean_url(record['url']))
+            return urls
+        except requests.exceptions.ConnectionError:
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            log_message("ERROR", f"Common Crawl query failed for {host}: {e}")
+            time.sleep(2 ** attempt)
+    log_message("ERROR", f"Common Crawl gave up on {host} after 3 attempts")
+    return set()
 
 
 def fetch_commoncrawl_urls(domains, user_agent, per_host_limit=2000):
@@ -294,9 +307,12 @@ def fetch_commoncrawl_urls(domains, user_agent, per_host_limit=2000):
 
     log_message("INFO", f"Querying {len(indexes)} Common Crawl indexes for {len(domains)} hosts")
 
+    import threading
+    rate_lock = threading.Lock()
+
     all_urls = set()
-    # Query all (host, index) pairs concurrently
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    # Query (host, index) pairs with rate limiting — 2 workers, 1 req/sec each
+    with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {}
         for domain in domains:
             domain = domain.strip()
@@ -304,7 +320,7 @@ def fetch_commoncrawl_urls(domains, user_agent, per_host_limit=2000):
                 continue
             for index_url in indexes:
                 future = pool.submit(_cc_fetch_host, index_url, domain,
-                                     user_agent, per_host_limit)
+                                     user_agent, per_host_limit, rate_lock)
                 futures[future] = (domain, index_url)
 
         for future in as_completed(futures):
