@@ -1,4 +1,4 @@
-"""URL scoring and script interestingness scoring."""
+"""URL scoring, novelty scoring, and script interestingness scoring."""
 import re
 from urllib.parse import urlparse, parse_qs
 
@@ -59,6 +59,41 @@ def score_url(url):
                     break  # Only count once
 
     return score
+
+
+# --- Novelty-Based URL Scoring ---
+
+def url_path_key(url):
+    """Normalize URL to scheme://host/path — strips query/fragment, lowercases."""
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}".lower().rstrip('/')
+
+
+def path_segments(url):
+    """Return the set of non-empty path segments."""
+    return set(s for s in urlparse(url).path.strip('/').split('/') if s)
+
+
+def novelty_score(url, seen_keys, seen_segments):
+    """0.0 = redundant, 1.0 = completely new path segments."""
+    pk = url_path_key(url)
+    if pk in seen_keys:
+        return 0.0
+    segs = path_segments(url)
+    if not segs:
+        return 0.5  # Root URLs get moderate novelty
+    new_segs = segs - seen_segments
+    return len(new_segs) / len(segs)
+
+
+def combined_url_score(url, seen_keys, seen_segments):
+    """Combine novelty with URL interestingness scoring.
+
+    Novelty (0-1 scaled to 0-20) is primary, interestingness is bonus.
+    """
+    nov = novelty_score(url, seen_keys, seen_segments)
+    interest = score_url(url)
+    return nov * 20 + interest
 
 
 # --- Known Library Signatures ---

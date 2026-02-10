@@ -2,7 +2,7 @@
 
 Opinionated JavaScript security scanner. Give it a domain, it does the rest.
 
-JSBot handles target discovery, crawling, JS extraction, deduplication, and security analysis as a single pipeline. Point it at a domain — it finds subdomains via CT logs, pulls historical URLs from the Wayback Machine, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps for original code, deduplicates scripts by structural hash, analyzes with tree-sitter AST parsing, tracks taint flows across scripts on the same page, and scores every script for security research interestingness. You don't pick the tools or tune the settings — JSBot decides.
+JSBot handles target discovery, crawling, JS extraction, deduplication, and security analysis as a single pipeline. Point it at a domain — it finds subdomains via CT logs, pulls historical URLs from Common Crawl, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps for original code, deduplicates scripts by structural hash, analyzes with tree-sitter AST parsing, tracks taint flows across scripts on the same page, and scores every script for security research interestingness. You don't pick the tools or tune the settings — JSBot decides.
 
 ## Install
 
@@ -26,7 +26,7 @@ echo "https://example.com" | python scan.py > results.jsonl
 python scan.py example.com -b "session=abc123" -H "X-CSRF-Token: xyz" > results.jsonl
 ```
 
-JSBot auto-detects whether you gave it a domain, a URL, a file, or stdin. For domains, it automatically runs CT log subdomain discovery. Wayback Machine history, path discovery (robots.txt/sitemap.xml), spidering, source maps, JS beautification, and smart URL prioritization are always on.
+JSBot auto-detects whether you gave it a domain, a URL, a file, or stdin. For domains, it automatically runs CT log subdomain discovery. Common Crawl history, path discovery (robots.txt/sitemap.xml), spidering, source maps, JS beautification, and smart URL prioritization are always on.
 
 ## Options
 
@@ -140,7 +140,7 @@ JSBot figures out what you gave it:
 
 | Input | What happens |
 |-------|-------------|
-| `example.com` | CT log subdomain discovery + Wayback + full scan |
+| `example.com` | CT log subdomain discovery + Common Crawl + full scan |
 | `https://example.com/app` | Crawl that URL + discovery + spider |
 | `urls.txt` | Read file, crawl all URLs |
 | stdin | Read piped URLs, crawl all |
@@ -150,7 +150,7 @@ JSBot figures out what you gave it:
 Three stages run concurrently — discovery doesn't block crawling, crawling doesn't block analysis:
 
 ```
-CT logs / Wayback / seed URLs
+CT logs / Common Crawl / seed URLs
         ↓
    domain_queue → domain_discovery_worker (robots.txt, sitemap.xml)
         ↓

@@ -2,7 +2,7 @@ httpx[http2]
 beautifulsoup4
 lxml
 jsbeautifier
-waybackpy
+requests
 psycopg2-binary
 tree-sitter
 tree-sitter-javascript

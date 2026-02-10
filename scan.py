@@ -6,6 +6,7 @@ All three stages run concurrently via asyncio.Queue.
 import argparse
 import asyncio
 import concurrent.futures
+import json
 import os
 import re
 import sys
@@ -19,7 +20,7 @@ from bs4 import BeautifulSoup
 
 import output
 from output import log_message
-from scoring import score_url
+from scoring import score_url, url_path_key, path_segments, combined_url_score
 from patterns import JS_PATH_FINDER
 from analysis import (
     format_javascript, structural_hash, get_sha256, get_ast_analyzer,
@@ -29,7 +30,7 @@ from analysis import (
 )
 from sourcemaps import try_fetch_sourcemap, get_original_source
 from discovery import (
-    discover_paths, spider_links, fetch_wayback_urls,
+    discover_paths, spider_links, fetch_commoncrawl_urls,
     ct_load_state, ct_save_state, ct_fetch_next_month,
 )
 
@@ -37,10 +38,61 @@ from discovery import (
 CHECKED_URLS = set()
 DISCOVERED_URLS = set()
 DEAD_DOMAINS = set()  # domains that failed with connection errors — skip future requests
+SEEN_PATH_KEYS = set()  # normalized URL paths — for exact-URL novelty dedup
+SEEN_PATH_SEGMENTS = set()  # unique path segments — for novelty scoring across sessions
 
 # --- Configuration ---
 class Config:
     USER_AGENT = 'JSBot/5.0 (Autonomous Security Agent)'
+
+# --- Scan State Persistence ---
+_STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.ct_cache')
+
+
+def _get_scan_domain(args, initial_urls):
+    """Extract base domain for scan state storage."""
+    if args.ct:
+        return args.ct
+    for url in initial_urls:
+        parsed = urlparse(url)
+        if parsed.hostname:
+            parts = parsed.hostname.split('.')
+            if len(parts) >= 2:
+                return '.'.join(parts[-2:])
+    return None
+
+
+def _load_scan_state(domain):
+    """Load persisted path segments from previous scans."""
+    if not domain:
+        return
+    path = os.path.join(_STATE_DIR, domain, 'scan_state.json')
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        loaded = data.get('seen_path_segments', [])
+        SEEN_PATH_SEGMENTS.update(loaded)
+        log_message("INFO", f"Loaded {len(loaded)} seen path segments from previous scans")
+    except Exception as e:
+        log_message("ERROR", f"Failed to load scan state: {e}")
+
+
+def _save_scan_state(domain):
+    """Persist path segments for future scan novelty scoring."""
+    if not domain:
+        return
+    d = os.path.join(_STATE_DIR, domain)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, 'scan_state.json')
+    try:
+        with open(path, 'w') as f:
+            json.dump({'seen_path_segments': sorted(SEEN_PATH_SEGMENTS)}, f)
+        log_message("INFO", f"Saved {len(SEEN_PATH_SEGMENTS)} path segments to scan state")
+    except Exception as e:
+        log_message("ERROR", f"Failed to save scan state: {e}")
+
 
 # --- Pipeline Data Structures ---
 _POISON = object()
@@ -131,6 +183,10 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
             if hashed_url in CHECKED_URLS:
                 continue
             CHECKED_URLS.add(hashed_url)
+
+            # Track path segments for novelty scoring of future URLs
+            SEEN_PATH_KEYS.add(url_path_key(url))
+            SEEN_PATH_SEGMENTS.update(path_segments(url))
 
             # Skip URLs on domains we already know are dead
             parsed = urlparse(url)
@@ -383,7 +439,7 @@ def _clean_urls(urls):
 
 
 async def _seed_urls(urls, url_queue, domain_queue):
-    """Clean, sort, and push a set of URLs into the pipeline queues."""
+    """Clean, novelty-score, and push URLs into the pipeline queues."""
     cleaned = _clean_urls(urls)
 
     # Extract domains for discovery
@@ -395,13 +451,21 @@ async def _seed_urls(urls, url_queue, domain_queue):
     for domain in domains:
         await domain_queue.put(domain)
 
-    # Sort by interestingness and seed
-    url_list = sorted(cleaned, key=score_url, reverse=True)
+    # Score with novelty awareness — URLs with new path segments rank higher
+    scored = []
+    for url in cleaned:
+        s = combined_url_score(url, SEEN_PATH_KEYS, SEEN_PATH_SEGMENTS)
+        scored.append((s, url))
+    scored.sort(reverse=True)
+
     added = 0
-    for url in url_list:
+    for score, url in scored:
         url_hash = get_sha256(url)
         if url_hash not in DISCOVERED_URLS:
             DISCOVERED_URLS.add(url_hash)
+            # Track path info so later batches get accurate novelty scores
+            SEEN_PATH_KEYS.add(url_path_key(url))
+            SEEN_PATH_SEGMENTS.update(path_segments(url))
             await url_queue.put(url)
             added += 1
     return added
@@ -413,20 +477,20 @@ async def seed_urls_into_pipeline(initial_urls, url_queue, domain_queue, args, e
     log_message("INFO", f"Seeded {added} initial URLs into pipeline")
 
 
-async def wayback_producer(url_queue, domain_queue, hosts, executor):
-    """Fetch Wayback Machine URLs for a set of hostnames and feed into the pipeline."""
+async def cc_producer(url_queue, domain_queue, hosts, executor):
+    """Fetch Common Crawl URLs for a set of hostnames and feed into the pipeline."""
     if not hosts:
         return
     loop = asyncio.get_event_loop()
-    log_message("INFO", f"Fetching Wayback Machine URLs for {len(hosts)} hosts...")
-    wayback_urls = await loop.run_in_executor(
-        executor, fetch_wayback_urls, list(hosts), Config.USER_AGENT,
+    log_message("INFO", f"Fetching Common Crawl URLs for {len(hosts)} hosts...")
+    cc_urls = await loop.run_in_executor(
+        executor, fetch_commoncrawl_urls, list(hosts), Config.USER_AGENT,
     )
-    if not wayback_urls:
-        log_message("INFO", "Wayback: no new URLs found")
+    if not cc_urls:
+        log_message("INFO", "Common Crawl: no new URLs found")
         return
-    added = await _seed_urls(wayback_urls, url_queue, domain_queue)
-    log_message("INFO", f"Wayback added {added} new URLs")
+    added = await _seed_urls(cc_urls, url_queue, domain_queue)
+    log_message("INFO", f"Common Crawl added {added} new URLs")
 
 
 async def ct_producer(url_queue, domain_queue, args, executor):
@@ -476,6 +540,9 @@ async def ct_producer(url_queue, domain_queue, args, executor):
 
 async def run_pipeline(args, client, initial_urls):
     """Set up queues, workers, and producers; run until all work is done."""
+    scan_domain = _get_scan_domain(args, initial_urls)
+    _load_scan_state(scan_domain)
+
     domain_queue = asyncio.Queue(maxsize=100)
     url_queue = asyncio.Queue(maxsize=500)
     js_queue = asyncio.Queue(maxsize=200)
@@ -505,7 +572,7 @@ async def run_pipeline(args, client, initial_urls):
         for _ in range(num_js_workers)
     ]
 
-    # Start producers (seed + CT run in parallel, Wayback runs after CT)
+    # Start producers (seed + CT run in parallel, Common Crawl runs after CT)
     producers = []
     ct_subdomains = set()
 
@@ -536,16 +603,16 @@ async def run_pipeline(args, client, initial_urls):
     # Wait for seed + CT to finish
     await asyncio.gather(*producers)
 
-    # Wayback runs after CT so it can query all discovered subdomains
-    wb_hosts = set()
+    # Common Crawl runs after CT so it can query all discovered subdomains
+    cc_hosts = set()
     for url in initial_urls:
         parsed = urlparse(url)
         if parsed.hostname:
-            wb_hosts.add(parsed.hostname)
-    wb_hosts |= ct_subdomains
+            cc_hosts.add(parsed.hostname)
+    cc_hosts |= ct_subdomains
     await url_tracker.register()
     try:
-        await wayback_producer(url_queue, domain_queue, wb_hosts, executor)
+        await cc_producer(url_queue, domain_queue, cc_hosts, executor)
     finally:
         await url_tracker.unregister()
 
@@ -567,6 +634,7 @@ async def run_pipeline(args, client, initial_urls):
     await asyncio.gather(*js_tasks)
 
     executor.shutdown(wait=False)
+    _save_scan_state(scan_domain)
 
 
 # --- Main ---

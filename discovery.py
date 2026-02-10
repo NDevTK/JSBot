@@ -1,15 +1,16 @@
-"""Target discovery: CT logs, wayback, robots/sitemap, spider."""
+"""Target discovery: CT logs, Common Crawl, robots/sitemap, spider."""
 import json
 import os
 import time
 from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
 from bs4 import BeautifulSoup
 
 from output import log_message
 
-from waybackpy import WaybackMachineCDXServerAPI
 import psycopg2
 
 
@@ -204,28 +205,112 @@ def ct_fetch_next_month(domain, state):
     return set(), set(), True  # All months exhausted
 
 
-# --- Wayback Machine ---
+# --- Common Crawl URL Discovery ---
 
-def fetch_wayback_urls(domains, user_agent):
-    """Fetches historical URLs from the Wayback Machine per-host."""
+CC_CDX_BASE = 'https://index.commoncrawl.org'
+
+# Query params that don't change the page — strip before dedup
+_JUNK_PARAMS = {
+    'authuser', 'hl', 'gl', '_gl', 'gclid', 'gclsrc', 'utm_source',
+    'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'ref',
+    '__hstc', '__hssc', '__hsfp', 'hsCtaTracking', 'vid', 'dclid',
+    'fbclid', 'mc_cid', 'mc_eid', '_ga', 'sxsrf',
+}
+
+
+def _cc_get_indexes(user_agent, count=3):
+    """Get the N most recent Common Crawl index URLs."""
+    try:
+        resp = requests.get(f'{CC_CDX_BASE}/collinfo.json',
+                            headers={'User-Agent': user_agent}, timeout=15)
+        resp.raise_for_status()
+        indexes = resp.json()
+        return [idx['cdx-api'] for idx in indexes[:count]]
+    except Exception as e:
+        log_message("ERROR", f"Failed to get Common Crawl indexes: {e}")
+        return []
+
+
+def _cc_clean_url(url):
+    """Strip tracking/junk query params and normalize."""
+    parsed = urlparse(url)
+    if not parsed.query:
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    # Keep only non-junk params with actual alphanumeric keys
+    from urllib.parse import parse_qs, urlencode
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    kept = {k: v for k, v in params.items()
+            if k.lower() not in _JUNK_PARAMS and k.isalnum()}
+    if not kept:
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    clean_query = urlencode(kept, doseq=True)
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{clean_query}"
+
+
+def _cc_fetch_host(index_url, host, user_agent, limit):
+    """Fetch URLs for one host from one CC index."""
+    params = {
+        'url': f'{host}/*',
+        'output': 'json',
+        'limit': limit,
+        'filter': '=status:200',
+    }
+    try:
+        resp = requests.get(index_url, params=params,
+                            headers={'User-Agent': user_agent}, timeout=60)
+        resp.raise_for_status()
+        urls = set()
+        for line in resp.text.strip().split('\n'):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if 'url' in record:
+                urls.add(_cc_clean_url(record['url']))
+        return urls
+    except Exception as e:
+        log_message("ERROR", f"Common Crawl query failed for {host}: {e}")
+        return set()
+
+
+def fetch_commoncrawl_urls(domains, user_agent, per_host_limit=2000):
+    """Fetch historical URLs from Common Crawl CDX across multiple indexes."""
+    indexes = _cc_get_indexes(user_agent, count=3)
+    if not indexes:
+        return []
+
+    log_message("INFO", f"Querying {len(indexes)} Common Crawl indexes for {len(domains)} hosts")
+
     all_urls = set()
-    for domain in domains:
-        domain = domain.strip()
-        if not domain: continue
-        # Append /* for CDX prefix matching — all paths on this host
-        search_url = f'{domain}/*'
-        log_message("INFO", f"Fetching wayback URLs for: {domain}")
-        try:
-            cdx = WaybackMachineCDXServerAPI(
-                url=search_url, user_agent=user_agent, collapses=["urlkey"],
-                filters=["statuscode:200", "mimetype:(text/html|application/javascript)"]
-            )
-            snapshots = {s.original for s in cdx.snapshots()}
-            log_message("INFO", f"Found {len(snapshots)} URLs for {domain} from Wayback Machine.")
-            all_urls.update(snapshots)
-        except Exception as e:
-            log_message("ERROR", f"Wayback Machine request failed for {domain}: {e}")
-    return list(all_urls)
+    # Query all (host, index) pairs concurrently
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {}
+        for domain in domains:
+            domain = domain.strip()
+            if not domain:
+                continue
+            for index_url in indexes:
+                future = pool.submit(_cc_fetch_host, index_url, domain,
+                                     user_agent, per_host_limit)
+                futures[future] = (domain, index_url)
+
+        for future in as_completed(futures):
+            domain, index_url = futures[future]
+            urls = future.result()
+            if urls:
+                all_urls.update(urls)
+
+    # Dedup by path (strip remaining query params for path-level dedup)
+    seen_paths = set()
+    deduped = []
+    for url in all_urls:
+        path_key = urlparse(url)
+        key = f"{path_key.scheme}://{path_key.netloc}{path_key.path}".lower().rstrip('/')
+        if key not in seen_paths:
+            seen_paths.add(key)
+            deduped.append(url)
+
+    log_message("INFO", f"Common Crawl: {len(all_urls)} raw → {len(deduped)} unique paths")
+    return deduped
 
 
 # --- robots.txt & sitemap.xml Discovery ---
