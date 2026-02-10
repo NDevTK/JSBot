@@ -228,16 +228,21 @@ _JUNK_PARAMS = {
 
 
 def _cc_get_indexes(user_agent, count=3):
-    """Get the N most recent Common Crawl index URLs."""
-    try:
-        resp = requests.get(f'{CC_CDX_BASE}/collinfo.json',
-                            headers={'User-Agent': user_agent}, timeout=15)
-        resp.raise_for_status()
-        indexes = resp.json()
-        return [idx['cdx-api'] for idx in indexes[:count]]
-    except Exception as e:
-        log_message("ERROR", f"Failed to get Common Crawl indexes: {e}")
-        return []
+    """Get the N most recent Common Crawl index URLs (with retry)."""
+    for attempt in range(3):
+        try:
+            resp = requests.get(f'{CC_CDX_BASE}/collinfo.json',
+                                headers={'User-Agent': user_agent}, timeout=15)
+            resp.raise_for_status()
+            indexes = resp.json()
+            return [idx['cdx-api'] for idx in indexes[:count]]
+        except Exception as e:
+            if attempt < 2:
+                import time
+                time.sleep(2 ** attempt)
+                continue
+            log_message("ERROR", f"Failed to get Common Crawl indexes: {e}")
+            return []
 
 
 def _cc_clean_url(url):

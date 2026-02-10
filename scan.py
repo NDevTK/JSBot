@@ -154,6 +154,71 @@ class PageTracker:
         self.remaining = self.total
 
 
+class HostBalancedQueue:
+    """URL queue that balances across hosts at dequeue time.
+
+    put() adds URLs to per-host buckets scored by novelty.
+    get() picks from the host with the fewest crawls so far.
+    Ensures equal time across targets regardless of queue order.
+    """
+
+    def __init__(self):
+        self._buckets = {}      # host -> list of (score, url)
+        self._host_crawls = {}  # host -> count of URLs dequeued
+        self._lock = asyncio.Lock()
+        self._not_empty = asyncio.Event()
+        self._poison_count = 0
+        self._total = 0
+
+    async def put(self, url):
+        async with self._lock:
+            if url is _POISON:
+                self._poison_count += 1
+                self._not_empty.set()
+                return
+            parsed = urlparse(url)
+            host = parsed.hostname or 'unknown'
+            score = combined_url_score(url, SEEN_PATH_KEYS, SEEN_PATH_SEGMENTS)
+            if host not in self._buckets:
+                self._buckets[host] = []
+            self._buckets[host].append((score, url))
+            self._buckets[host].sort(reverse=True)
+            self._total += 1
+            self._not_empty.set()
+
+    async def get(self):
+        while True:
+            async with self._lock:
+                if self._poison_count > 0:
+                    self._poison_count -= 1
+                    return _POISON
+                # Pick host with fewest crawls that still has URLs
+                best_host = None
+                min_crawls = float('inf')
+                for host, urls in self._buckets.items():
+                    if urls:
+                        crawls = self._host_crawls.get(host, 0)
+                        if crawls < min_crawls:
+                            min_crawls = crawls
+                            best_host = host
+                if best_host is not None:
+                    _score, url = self._buckets[best_host].pop(0)
+                    self._host_crawls[best_host] = self._host_crawls.get(best_host, 0) + 1
+                    self._total -= 1
+                    if not any(b for b in self._buckets.values()) and self._poison_count == 0:
+                        self._not_empty.clear()
+                    return url
+                # Nothing available — clear and wait
+                self._not_empty.clear()
+            await self._not_empty.wait()
+
+    def task_done(self):
+        pass  # compatibility with asyncio.Queue interface
+
+    def qsize(self):
+        return self._total
+
+
 class ProducerTracker:
     """Tracks active producers for a queue. Sends poison pills when all finish."""
 
@@ -190,13 +255,15 @@ async def domain_discovery_worker(domain_queue, url_queue, client, args):
             if domain in DEAD_DOMAINS:
                 continue
             discovered = await discover_paths(domain, client)
+            added = 0
             for url in discovered:
                 url_hash = get_sha256(url)
                 if url_hash not in DISCOVERED_URLS:
                     DISCOVERED_URLS.add(url_hash)
-                    await url_queue.put(url)
-            if discovered:
-                log_message("INFO", f"Discovery for {domain}: {len(discovered)} URLs")
+                    await url_queue.put(url)  # HostBalancedQueue handles scoring
+                    added += 1
+            if added:
+                log_message("INFO", f"Found {added} paths from robots.txt/sitemap for {domain}")
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             DEAD_DOMAINS.add(domain)
             log_message("ERROR", f"Domain unreachable, skipping: {domain} ({e})")
@@ -486,7 +553,7 @@ def _clean_urls(urls):
 
 
 async def _seed_urls(urls, url_queue, domain_queue):
-    """Clean, novelty-score, and push URLs into the pipeline queues."""
+    """Clean, dedup, and push URLs into the host-balanced pipeline queue."""
     cleaned = _clean_urls(urls)
 
     # Extract domains for discovery
@@ -498,22 +565,14 @@ async def _seed_urls(urls, url_queue, domain_queue):
     for domain in domains:
         await domain_queue.put(domain)
 
-    # Score with novelty awareness — URLs with new path segments rank higher
-    scored = []
-    for url in cleaned:
-        s = combined_url_score(url, SEEN_PATH_KEYS, SEEN_PATH_SEGMENTS)
-        scored.append((s, url))
-    scored.sort(reverse=True)
-
     added = 0
-    for score, url in scored:
+    for url in cleaned:
         url_hash = get_sha256(url)
         if url_hash not in DISCOVERED_URLS:
             DISCOVERED_URLS.add(url_hash)
-            # Track path info so later batches get accurate novelty scores
             SEEN_PATH_KEYS.add(url_path_key(url))
             SEEN_PATH_SEGMENTS.update(path_segments(url))
-            await url_queue.put(url)
+            await url_queue.put(url)  # HostBalancedQueue scores + interleaves
             added += 1
     return added
 
@@ -540,49 +599,6 @@ async def cc_producer(url_queue, domain_queue, hosts, executor):
     log_message("INFO", f"Common Crawl added {added} new URLs")
 
 
-async def ct_producer(url_queue, domain_queue, args, executor):
-    """Fetches CT months in executor, streams URLs/domains into queues."""
-    domain = args.ct
-    loop = asyncio.get_event_loop()
-    state = await loop.run_in_executor(executor, ct_load_state, domain)
-
-    if state['related_domains']:
-        log_message("INFO", f"Known related domains: "
-                    f"{', '.join(state['related_domains'][:20])}"
-                    + (f" ... +{len(state['related_domains'])-20} more"
-                       if len(state['related_domains']) > 20 else ""))
-
-    while True:
-        log_message("INFO", f"CT: fetching next month for {domain}...")
-        new_subs, new_related, exhausted = await loop.run_in_executor(
-            executor, ct_fetch_next_month, domain, state,
-        )
-
-        if exhausted:
-            log_message("INFO", "CT: all months exhausted.")
-            break
-
-        if new_related:
-            log_message("INFO", f"CT: {len(new_related)} new related domains: "
-                        f"{', '.join(sorted(new_related))}")
-
-        if new_subs:
-            log_message("INFO", f"CT: {len(new_subs)} new subdomains to scan")
-            for sub in new_subs:
-                await url_queue.put(f'https://{sub}/')
-            for sub in new_subs:
-                await domain_queue.put(sub)
-            state['scanned_subdomains'] = sorted(
-                set(state['scanned_subdomains']) | new_subs
-            )
-
-        await loop.run_in_executor(executor, ct_save_state, state, domain)
-
-    await loop.run_in_executor(executor, ct_save_state, state, domain)
-    log_message("INFO", f"CT complete: {len(state['scanned_subdomains'])} subdomains total")
-    return set(state['scanned_subdomains'])
-
-
 # --- Pipeline Orchestrator ---
 
 async def run_pipeline(args, client, initial_urls):
@@ -591,8 +607,8 @@ async def run_pipeline(args, client, initial_urls):
     _load_scan_state(scan_domain)
 
     domain_queue = asyncio.Queue(maxsize=100)
-    url_queue = asyncio.Queue(maxsize=500)
-    js_queue = asyncio.Queue(maxsize=200)
+    url_queue = HostBalancedQueue()  # balances across hosts at dequeue time
+    js_queue = asyncio.Queue()  # unbounded — JS audit must not block crawl workers
 
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=max(4, args.concurrency // 2),
@@ -625,9 +641,14 @@ async def run_pipeline(args, client, initial_urls):
         for _ in range(num_js_workers)
     ]
 
-    # Start producers (seed + CT run in parallel, Common Crawl runs after CT)
-    producers = []
-    ct_subdomains = set()
+    # Shared state: CT pushes subdomains here, CC consumes them in batches
+    ct_discovered_subs = set()
+    ct_discovered_lock = asyncio.Lock()
+    ct_done = asyncio.Event()
+
+    # Domain discovery workers are also url_queue producers
+    for _ in range(num_domain_workers):
+        await url_tracker.register()
 
     # Seed URLs producer
     async def seed_producer():
@@ -636,43 +657,111 @@ async def run_pipeline(args, client, initial_urls):
             await seed_urls_into_pipeline(initial_urls, url_queue, domain_queue, args, executor)
         finally:
             await url_tracker.unregister()
-    producers.append(asyncio.create_task(seed_producer()))
 
-    # CT producer
-    if args.ct:
-        async def ct_wrapper():
-            nonlocal ct_subdomains
-            await url_tracker.register()
-            try:
-                ct_subdomains = await ct_producer(url_queue, domain_queue, args, executor)
-            finally:
-                await url_tracker.unregister()
-        producers.append(asyncio.create_task(ct_wrapper()))
-
-    # Domain discovery workers are also url_queue producers
-    for _ in range(num_domain_workers):
+    # CT producer — streams subdomains into shared set as they're found
+    async def ct_wrapper():
         await url_tracker.register()
+        try:
+            domain = args.ct
+            loop = asyncio.get_event_loop()
+            state = await loop.run_in_executor(executor, ct_load_state, domain)
 
-    # Wait for seed + CT to finish
+            if state['related_domains']:
+                log_message("INFO", f"Known related domains: "
+                            f"{', '.join(state['related_domains'][:20])}"
+                            + (f" ... +{len(state['related_domains'])-20} more"
+                               if len(state['related_domains']) > 20 else ""))
+
+            while True:
+                log_message("INFO", f"CT: fetching next month for {domain}...")
+                new_subs, new_related, exhausted = await loop.run_in_executor(
+                    executor, ct_fetch_next_month, domain, state,
+                )
+
+                if exhausted:
+                    log_message("INFO", "CT: all months exhausted.")
+                    break
+
+                if new_related:
+                    log_message("INFO", f"CT: {len(new_related)} new related domains: "
+                                f"{', '.join(sorted(new_related))}")
+
+                if new_subs:
+                    log_message("INFO", f"CT: {len(new_subs)} new subdomains to scan")
+                    for sub in new_subs:
+                        await url_queue.put(f'https://{sub}/')
+                    for sub in new_subs:
+                        await domain_queue.put(sub)
+                    async with ct_discovered_lock:
+                        ct_discovered_subs.update(new_subs)
+                    state['scanned_subdomains'] = sorted(
+                        set(state['scanned_subdomains']) | new_subs
+                    )
+
+                await loop.run_in_executor(executor, ct_save_state, state, domain)
+
+            await loop.run_in_executor(executor, ct_save_state, state, domain)
+            log_message("INFO", f"CT complete: {len(state['scanned_subdomains'])} subdomains total")
+        finally:
+            ct_done.set()
+            await url_tracker.unregister()
+
+    # CC producer — starts with seed hosts, then queries CT subdomains in batches
+    async def cc_wrapper():
+        await url_tracker.register()
+        try:
+            cc_queried = set()
+            max_cc_hosts = 20
+
+            # Round 1: seed hosts immediately
+            seed_hosts = set()
+            for url in initial_urls:
+                parsed = urlparse(url)
+                if parsed.hostname:
+                    seed_hosts.add(parsed.hostname)
+            if seed_hosts:
+                await cc_producer(url_queue, domain_queue, seed_hosts, executor)
+                cc_queried.update(seed_hosts)
+
+            # Subsequent rounds: pick up CT subdomains in batches
+            while True:
+                # Wait for CT to find more, or finish
+                try:
+                    await asyncio.wait_for(ct_done.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    pass  # Check for new subs periodically
+
+                async with ct_discovered_lock:
+                    new_hosts = ct_discovered_subs - cc_queried
+                remaining_slots = max(0, max_cc_hosts - len(cc_queried))
+                if new_hosts and remaining_slots > 0:
+                    batch = sorted(new_hosts)
+                    shuffle(batch)
+                    batch = set(batch[:remaining_slots])
+                    await cc_producer(url_queue, domain_queue, batch, executor)
+                    cc_queried.update(batch)
+
+                if ct_done.is_set():
+                    # One final check after CT is done
+                    async with ct_discovered_lock:
+                        new_hosts = ct_discovered_subs - cc_queried
+                    remaining_slots = max(0, max_cc_hosts - len(cc_queried))
+                    if new_hosts and remaining_slots > 0:
+                        batch = sorted(new_hosts)
+                        shuffle(batch)
+                        batch = set(batch[:remaining_slots])
+                        await cc_producer(url_queue, domain_queue, batch, executor)
+                        cc_queried.update(batch)
+                    break
+        finally:
+            await url_tracker.unregister()
+
+    # Launch all three concurrently
+    producers = [asyncio.create_task(seed_producer())]
+    if args.ct:
+        producers.append(asyncio.create_task(ct_wrapper()))
+    producers.append(asyncio.create_task(cc_wrapper()))
     await asyncio.gather(*producers)
-
-    # Common Crawl runs after CT so it can query discovered subdomains (capped)
-    cc_hosts = set()
-    for url in initial_urls:
-        parsed = urlparse(url)
-        if parsed.hostname:
-            cc_hosts.add(parsed.hostname)
-    # Cap CC queries — too many hosts overwhelms commoncrawl.org
-    remaining_slots = max(0, 20 - len(cc_hosts))
-    if ct_subdomains and remaining_slots > 0:
-        ct_list = sorted(ct_subdomains)
-        shuffle(ct_list)
-        cc_hosts.update(ct_list[:remaining_slots])
-    await url_tracker.register()
-    try:
-        await cc_producer(url_queue, domain_queue, cc_hosts, executor)
-    finally:
-        await url_tracker.unregister()
 
     # Shut down domain_queue
     for _ in range(num_domain_workers):
