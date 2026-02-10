@@ -139,14 +139,15 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
 
             log_message("INFO", f"Crawling: {url}")
             response = await client.get(url, timeout=timeout)
+            page_url = str(response.url)  # Final URL after redirects
             content_type = response.headers.get('content-type', '').lower()
 
             # Direct JS file
             if 'javascript' in content_type:
                 await js_queue.put(JsWorkItem(
                     js_code=response.text,
-                    page_url=url,
-                    script_url=str(response.url),
+                    page_url=page_url,
+                    script_url=page_url,
                     page_tracker=None,
                 ))
 
@@ -163,18 +164,15 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
                             script_items.append((js, None))
 
                 for script in page_parser.find_all('script', src=True):
-                    script_url = urljoin(str(response.url), script['src'])
+                    script_url = urljoin(page_url, script['src'])
                     hashed_script_url = get_sha256(script_url)
                     if hashed_script_url in CHECKED_JS_URLS:
                         continue
                     CHECKED_JS_URLS.add(hashed_script_url)
                     try:
                         resp = await client.get(script_url, timeout=timeout)
-                        if resp.status_code < 400 and 'javascript' in resp.headers.get('content-type', '').lower():
-                            script_items.append((resp.text, script_url))
-                        elif resp.status_code < 400:
-                            # No content-type check for <script src> — server might not set it
-                            script_items.append((resp.text, script_url))
+                        if resp.status_code < 400:
+                            script_items.append((resp.text, str(resp.url)))
                     except httpx.RequestError as e:
                         log_message("ERROR", f"Failed to fetch script {script_url}: {e}")
 
@@ -183,7 +181,7 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
                 if script_items:
                     cross_file = CrossFileState()
                     tracker = PageTracker(
-                        page_url=url,
+                        page_url=page_url,
                         cross_file=cross_file,
                         total=len(script_items),
                     )
@@ -192,7 +190,7 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
                 for js_code, script_url in script_items:
                     await js_queue.put(JsWorkItem(
                         js_code=js_code,
-                        page_url=url,
+                        page_url=page_url,
                         script_url=script_url,
                         page_tracker=tracker,
                     ))
@@ -200,9 +198,11 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
                 # Discover JS paths referenced in HTML
                 for match in re.finditer(JS_PATH_FINDER, response.text):
                     path = match.group(1).replace('\\/', '/')
+                    if '%{' in path or '${' in path or '{{' in path:
+                        continue
                     if path.startswith('//'):
                         path = f"https:{path}"
-                    js_url = urljoin(str(response.url), path)
+                    js_url = urljoin(page_url, path)
                     hashed = get_sha256(js_url)
                     if hashed in CHECKED_JS_URLS:
                         continue
@@ -212,7 +212,7 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
                         if js_resp.status_code < 400:
                             await js_queue.put(JsWorkItem(
                                 js_code=js_resp.text,
-                                page_url=url,
+                                page_url=page_url,
                                 script_url=js_url,
                                 page_tracker=None,
                             ))
@@ -220,7 +220,7 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
                         pass
 
                 # Spider: feed links back into url_queue
-                parsed_url = urlparse(url)
+                parsed_url = urlparse(page_url)
                 base_domain = '.'.join((parsed_url.hostname or '').split('.')[-2:])
                 new_links = spider_links(response.text, response.url, base_domain)
                 for link in new_links:
@@ -316,6 +316,8 @@ async def js_audit_worker(js_queue, client, args, executor):
                 # Discover JS paths referenced inside JS code
                 for match in re.finditer(JS_PATH_FINDER, js_code):
                     path = match.group(1).replace('\\/', '/')
+                    if '%{' in path or '${' in path or '{{' in path:
+                        continue
                     if path.startswith('//'):
                         path = f"https:{path}"
                     script_url = urljoin(item.page_url, path)
@@ -411,12 +413,14 @@ async def seed_urls_into_pipeline(initial_urls, url_queue, domain_queue, args, e
     log_message("INFO", f"Seeded {added} initial URLs into pipeline")
 
 
-async def wayback_producer(url_queue, domain_queue, initial_urls, executor):
-    """Fetch Wayback Machine URLs in background and feed them into the pipeline."""
+async def wayback_producer(url_queue, domain_queue, hosts, executor):
+    """Fetch Wayback Machine URLs for a set of hostnames and feed into the pipeline."""
+    if not hosts:
+        return
     loop = asyncio.get_event_loop()
-    log_message("INFO", "Fetching Wayback Machine URLs...")
+    log_message("INFO", f"Fetching Wayback Machine URLs for {len(hosts)} hosts...")
     wayback_urls = await loop.run_in_executor(
-        executor, fetch_wayback_urls, list(initial_urls), Config.USER_AGENT,
+        executor, fetch_wayback_urls, list(hosts), Config.USER_AGENT,
     )
     if not wayback_urls:
         log_message("INFO", "Wayback: no new URLs found")
@@ -465,6 +469,7 @@ async def ct_producer(url_queue, domain_queue, args, executor):
 
     await loop.run_in_executor(executor, ct_save_state, state, domain)
     log_message("INFO", f"CT complete: {len(state['scanned_subdomains'])} subdomains total")
+    return set(state['scanned_subdomains'])
 
 
 # --- Pipeline Orchestrator ---
@@ -500,8 +505,9 @@ async def run_pipeline(args, client, initial_urls):
         for _ in range(num_js_workers)
     ]
 
-    # Start producers
+    # Start producers (seed + CT run in parallel, Wayback runs after CT)
     producers = []
+    ct_subdomains = set()
 
     # Seed URLs producer
     async def seed_producer():
@@ -515,28 +521,33 @@ async def run_pipeline(args, client, initial_urls):
     # CT producer
     if args.ct:
         async def ct_wrapper():
+            nonlocal ct_subdomains
             await url_tracker.register()
             try:
-                await ct_producer(url_queue, domain_queue, args, executor)
+                ct_subdomains = await ct_producer(url_queue, domain_queue, args, executor)
             finally:
                 await url_tracker.unregister()
         producers.append(asyncio.create_task(ct_wrapper()))
-
-    # Wayback producer — runs in background while initial URLs are already being crawled
-    async def wb_wrapper():
-        await url_tracker.register()
-        try:
-            await wayback_producer(url_queue, domain_queue, initial_urls, executor)
-        finally:
-            await url_tracker.unregister()
-    producers.append(asyncio.create_task(wb_wrapper()))
 
     # Domain discovery workers are also url_queue producers
     for _ in range(num_domain_workers):
         await url_tracker.register()
 
-    # Wait for all producers to finish seeding
+    # Wait for seed + CT to finish
     await asyncio.gather(*producers)
+
+    # Wayback runs after CT so it can query all discovered subdomains
+    wb_hosts = set()
+    for url in initial_urls:
+        parsed = urlparse(url)
+        if parsed.hostname:
+            wb_hosts.add(parsed.hostname)
+    wb_hosts |= ct_subdomains
+    await url_tracker.register()
+    try:
+        await wayback_producer(url_queue, domain_queue, wb_hosts, executor)
+    finally:
+        await url_tracker.unregister()
 
     # Shut down domain_queue
     for _ in range(num_domain_workers):

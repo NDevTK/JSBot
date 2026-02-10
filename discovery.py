@@ -207,15 +207,17 @@ def ct_fetch_next_month(domain, state):
 # --- Wayback Machine ---
 
 def fetch_wayback_urls(domains, user_agent):
-    """Fetches historical URLs from the Wayback Machine."""
+    """Fetches historical URLs from the Wayback Machine per-host."""
     all_urls = set()
     for domain in domains:
         domain = domain.strip()
         if not domain: continue
+        # Append /* for CDX prefix matching — all paths on this host
+        search_url = f'{domain}/*'
         log_message("INFO", f"Fetching wayback URLs for: {domain}")
         try:
             cdx = WaybackMachineCDXServerAPI(
-                url=domain, user_agent=user_agent, collapses=["urlkey"],
+                url=search_url, user_agent=user_agent, collapses=["urlkey"],
                 filters=["statuscode:200", "mimetype:(text/html|application/javascript)"]
             )
             snapshots = {s.original for s in cdx.snapshots()}
