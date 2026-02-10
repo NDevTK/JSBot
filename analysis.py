@@ -1,15 +1,15 @@
-"""AST parsing, cross-file taint analysis, feature extraction."""
+"""AST parsing, cross-file taint analysis, script safety checks."""
 import re
 import asyncio
 import httpx
 from hashlib import sha256
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from patterns import SOURCES, SINKS, JS_PATH_FINDER
 from output import log_message, SEEN_FINDINGS, SCRIPT_METADATA
-from scoring import looks_minified
+from scoring import looks_minified, _is_known_library
 from sourcemaps import try_fetch_sourcemap, get_original_source
-from anomaly import extract_features
+from anomaly import ScriptRecord
 
 import jsbeautifier
 import tree_sitter_javascript as tsjs
@@ -72,140 +72,132 @@ class ASTAnalyzer:
         return None
 
     def find_sources_in_range(self, tree, source_bytes, start_line, end_line):
-        """Find taint source patterns in a line range using AST walking."""
-        sources = []
-        self._walk_sources(tree.root_node, source_bytes, start_line, end_line, sources)
-        return sources
+        """Find taint source patterns in a line range using iterative AST walking."""
+        results = []
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node.start_point[0] > end_line or node.end_point[0] < start_line:
+                continue
 
-    def _walk_sources(self, node, source_bytes, start_line, end_line, results):
-        """Walk AST to find source patterns within line range."""
-        if node.start_point[0] > end_line or node.end_point[0] < start_line:
-            return
-
-        if node.type == 'member_expression':
-            chain = self._get_member_chain(node, source_bytes)
-            if chain:
-                for source_name, source_pattern in SOURCES.items():
-                    if re.search(source_pattern, chain, re.IGNORECASE):
-                        results.append({
-                            "category": source_name,
-                            "match": chain,
-                            "line": node.start_point[0] + 1,
-                        })
-                        break
-
-        if node.type == 'new_expression':
-            # Check constructor directly, not full expression text
-            for child in node.children:
-                if child.type in ('identifier', 'member_expression'):
-                    ctor = self.get_node_text(child, source_bytes)
-                    if ctor == 'URLSearchParams':
-                        results.append({
-                            "category": "URLSearchParams",
-                            "match": "new URLSearchParams(...)",
-                            "line": node.start_point[0] + 1,
-                        })
-                    break
-
-        if node.type == 'call_expression':
-            fn = node.child_by_field_name('function')
-            if fn:
-                if fn.type == 'member_expression':
-                    chain = self._get_member_chain(fn, source_bytes)
-                elif fn.type == 'identifier':
-                    chain = self.get_node_text(fn, source_bytes)
-                else:
-                    chain = None
+            if node.type == 'member_expression':
+                chain = self._get_member_chain(node, source_bytes)
                 if chain:
-                    for source_name in ("getItem", "cookie_read"):
-                        if re.search(SOURCES[source_name], chain, re.IGNORECASE):
+                    for source_name, source_pattern in SOURCES.items():
+                        if re.search(source_pattern, chain, re.IGNORECASE):
                             results.append({
                                 "category": source_name,
-                                "match": chain + "(...)",
+                                "match": chain,
                                 "line": node.start_point[0] + 1,
                             })
                             break
 
-        for child in node.children:
-            self._walk_sources(child, source_bytes, start_line, end_line, results)
-
-    def find_sinks_in_range(self, tree, source_bytes, start_line, end_line):
-        """Find taint sink patterns in a line range using AST walking."""
-        sinks = []
-        self._walk_sinks(tree.root_node, source_bytes, start_line, end_line, sinks)
-        return sinks
-
-    def _walk_sinks(self, node, source_bytes, start_line, end_line, results):
-        """Walk AST to find sink patterns within line range."""
-        if node.start_point[0] > end_line or node.end_point[0] < start_line:
-            return
-
-        # Assignment expressions: innerHTML=, outerHTML=, location.href=, document.cookie=
-        if node.type == 'assignment_expression':
-            left = node.child_by_field_name('left')
-            if left and left.type == 'member_expression':
-                chain = self._get_member_chain(left, source_bytes)
-                left_text = chain if chain else self.get_node_text(left, source_bytes)[:200]
-                for sink_name, sink_info in SINKS.items():
-                    if re.search(sink_info["pattern"], left_text + ' =', re.IGNORECASE):
-                        # Check for literal-only RHS (false positive filter)
-                        right = node.child_by_field_name('right')
-                        if right and self._is_literal(right):
-                            continue
-                        results.append({
-                            "category": sink_name,
-                            "match": left_text + ' =',
-                            "line": node.start_point[0] + 1,
-                            "severity": sink_info["severity"],
-                        })
+            if node.type == 'new_expression':
+                for child in node.children:
+                    if child.type in ('identifier', 'member_expression'):
+                        ctor = self.get_node_text(child, source_bytes)
+                        if ctor == 'URLSearchParams':
+                            results.append({
+                                "category": "URLSearchParams",
+                                "match": "new URLSearchParams(...)",
+                                "line": node.start_point[0] + 1,
+                            })
                         break
 
-        # Call expressions: eval(), document.write(), insertAdjacentHTML(), etc.
-        if node.type == 'call_expression':
-            fn = node.child_by_field_name('function')
-            if fn:
-                if fn.type == 'identifier':
-                    fn_text = self.get_node_text(fn, source_bytes)
-                elif fn.type == 'member_expression':
-                    fn_text = self._get_member_chain(fn, source_bytes)
-                    if fn_text is None:
-                        # Complex callee like $(...).html() — check property for jQuery sinks
-                        prop = fn.child_by_field_name('property')
-                        obj = fn.child_by_field_name('object')
-                        if prop and obj:
-                            prop_text = self.get_node_text(prop, source_bytes)
-                            if (prop_text in ('html', 'append', 'prepend', 'after', 'before')
-                                    and obj.type == 'call_expression'):
-                                obj_fn = obj.child_by_field_name('function')
-                                if obj_fn:
-                                    obj_fn_text = self.get_node_text(obj_fn, source_bytes)
-                                    if obj_fn_text.strip() in ('$', 'jQuery'):
-                                        if not self._has_only_literal_args(node):
-                                            results.append({
-                                                "category": "jQuery HTML Sink",
-                                                "match": f"$(...).{prop_text}(",
-                                                "line": node.start_point[0] + 1,
-                                                "severity": 8,
-                                            })
-                else:
-                    fn_text = None
+            if node.type == 'call_expression':
+                fn = node.child_by_field_name('function')
+                if fn:
+                    if fn.type == 'member_expression':
+                        chain = self._get_member_chain(fn, source_bytes)
+                    elif fn.type == 'identifier':
+                        chain = self.get_node_text(fn, source_bytes)
+                    else:
+                        chain = None
+                    if chain:
+                        for source_name in ("getItem", "cookie_read"):
+                            if re.search(SOURCES[source_name], chain, re.IGNORECASE):
+                                results.append({
+                                    "category": source_name,
+                                    "match": chain + "(...)",
+                                    "line": node.start_point[0] + 1,
+                                })
+                                break
 
-                if fn_text:
+            stack.extend(node.children)
+        return results
+
+    def find_sinks_in_range(self, tree, source_bytes, start_line, end_line):
+        """Find taint sink patterns in a line range using iterative AST walking."""
+        results = []
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node.start_point[0] > end_line or node.end_point[0] < start_line:
+                continue
+
+            # Assignment expressions: innerHTML=, outerHTML=, location.href=, document.cookie=
+            if node.type == 'assignment_expression':
+                left = node.child_by_field_name('left')
+                if left and left.type == 'member_expression':
+                    chain = self._get_member_chain(left, source_bytes)
+                    left_text = chain if chain else self.get_node_text(left, source_bytes)[:200]
                     for sink_name, sink_info in SINKS.items():
-                        if re.search(sink_info["pattern"], fn_text + '(', re.IGNORECASE):
-                            # False positive: eval/Function with only literal args
-                            if sink_name == "Eval Injection" and self._has_only_literal_args(node):
+                        if re.search(sink_info["pattern"], left_text + ' =', re.IGNORECASE):
+                            right = node.child_by_field_name('right')
+                            if right and self._is_literal(right):
                                 continue
                             results.append({
                                 "category": sink_name,
-                                "match": fn_text + '(',
+                                "match": left_text + ' =',
                                 "line": node.start_point[0] + 1,
                                 "severity": sink_info["severity"],
                             })
                             break
 
-        for child in node.children:
-            self._walk_sinks(child, source_bytes, start_line, end_line, results)
+            # Call expressions: eval(), document.write(), insertAdjacentHTML(), etc.
+            if node.type == 'call_expression':
+                fn = node.child_by_field_name('function')
+                if fn:
+                    if fn.type == 'identifier':
+                        fn_text = self.get_node_text(fn, source_bytes)
+                    elif fn.type == 'member_expression':
+                        fn_text = self._get_member_chain(fn, source_bytes)
+                        if fn_text is None:
+                            prop = fn.child_by_field_name('property')
+                            obj = fn.child_by_field_name('object')
+                            if prop and obj:
+                                prop_text = self.get_node_text(prop, source_bytes)
+                                if (prop_text in ('html', 'append', 'prepend', 'after', 'before')
+                                        and obj.type == 'call_expression'):
+                                    obj_fn = obj.child_by_field_name('function')
+                                    if obj_fn:
+                                        obj_fn_text = self.get_node_text(obj_fn, source_bytes)
+                                        if obj_fn_text.strip() in ('$', 'jQuery'):
+                                            if not self._has_only_literal_args(node):
+                                                results.append({
+                                                    "category": "jQuery HTML Sink",
+                                                    "match": f"$(...).{prop_text}(",
+                                                    "line": node.start_point[0] + 1,
+                                                    "severity": 8,
+                                                })
+                    else:
+                        fn_text = None
+
+                    if fn_text:
+                        for sink_name, sink_info in SINKS.items():
+                            if re.search(sink_info["pattern"], fn_text + '(', re.IGNORECASE):
+                                if sink_name == "Eval Injection" and self._has_only_literal_args(node):
+                                    continue
+                                results.append({
+                                    "category": sink_name,
+                                    "match": fn_text + '(',
+                                    "line": node.start_point[0] + 1,
+                                    "severity": sink_info["severity"],
+                                })
+                                break
+
+            stack.extend(node.children)
+        return results
 
     def _is_literal(self, node):
         """Check if a node is a literal value (string, number, boolean, null)."""
@@ -224,39 +216,37 @@ class ASTAnalyzer:
         return True
 
     def find_global_assignments(self, tree, source_bytes):
-        """Find window.X = ... assignments for cross-file tracking."""
-        assignments = []
-        self._walk_global_assigns(tree.root_node, source_bytes, assignments)
-        return assignments
-
-    def _walk_global_assigns(self, node, source_bytes, results):
-        if node.type == 'assignment_expression':
-            left = node.child_by_field_name('left')
-            if left and left.type == 'member_expression':
-                obj = left.child_by_field_name('object')
-                prop = left.child_by_field_name('property')
-                if obj and prop:
-                    obj_text = self.get_node_text(obj, source_bytes)
-                    if obj_text in ('window', 'self', 'globalThis'):
-                        prop_text = self.get_node_text(prop, source_bytes)
-                        right = node.child_by_field_name('right')
-                        right_text = self.get_node_text(right, source_bytes) if right else ''
-                        # Check if RHS is tainted
-                        is_tainted = False
-                        taint_source = None
-                        for source_name, source_pattern in SOURCES.items():
-                            if re.search(source_pattern, right_text, re.IGNORECASE):
-                                is_tainted = True
-                                taint_source = source_name
-                                break
-                        results.append({
-                            "name": f"{obj_text}.{prop_text}",
-                            "line": node.start_point[0] + 1,
-                            "is_tainted": is_tainted,
-                            "taint_source": taint_source,
-                        })
-        for child in node.children:
-            self._walk_global_assigns(child, source_bytes, results)
+        """Find window.X = ... assignments using iterative AST walking."""
+        results = []
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node.type == 'assignment_expression':
+                left = node.child_by_field_name('left')
+                if left and left.type == 'member_expression':
+                    obj = left.child_by_field_name('object')
+                    prop = left.child_by_field_name('property')
+                    if obj and prop:
+                        obj_text = self.get_node_text(obj, source_bytes)
+                        if obj_text in ('window', 'self', 'globalThis'):
+                            prop_text = self.get_node_text(prop, source_bytes)
+                            right = node.child_by_field_name('right')
+                            right_text = self.get_node_text(right, source_bytes) if right else ''
+                            is_tainted = False
+                            taint_source = None
+                            for source_name, source_pattern in SOURCES.items():
+                                if re.search(source_pattern, right_text, re.IGNORECASE):
+                                    is_tainted = True
+                                    taint_source = source_name
+                                    break
+                            results.append({
+                                "name": f"{obj_text}.{prop_text}",
+                                "line": node.start_point[0] + 1,
+                                "is_tainted": is_tainted,
+                                "taint_source": taint_source,
+                            })
+            stack.extend(node.children)
+        return results
 
 
 # Singleton AST analyzer (created on first use)
@@ -286,20 +276,17 @@ class CrossFileState:
         self.scripts.append((content, script_url, script_hash))
 
     def _find_assignment_rhs(self, root_node, global_name, source_bytes):
-        """Find the RHS node of a `window.X = ...` assignment."""
-        return self._walk_for_rhs(root_node, global_name, source_bytes)
-
-    def _walk_for_rhs(self, node, target_name, source_bytes):
-        if node.type == 'assignment_expression':
-            left = node.child_by_field_name('left')
-            if left and left.type == 'member_expression':
-                left_text = source_bytes[left.start_byte:left.end_byte].decode('utf-8', errors='replace')
-                if left_text == target_name:
-                    return node.child_by_field_name('right')
-        for child in node.children:
-            result = self._walk_for_rhs(child, target_name, source_bytes)
-            if result:
-                return result
+        """Find the RHS node of a `window.X = ...` assignment. Iterative."""
+        stack = [root_node]
+        while stack:
+            node = stack.pop()
+            if node.type == 'assignment_expression':
+                left = node.child_by_field_name('left')
+                if left and left.type == 'member_expression':
+                    left_text = source_bytes[left.start_byte:left.end_byte].decode('utf-8', errors='replace')
+                    if left_text == global_name:
+                        return node.child_by_field_name('right')
+            stack.extend(node.children)
         return None
 
     def collect_globals(self, analyzer):
@@ -416,24 +403,30 @@ class CrossFileState:
 # --- Main Script Analysis Pipeline ---
 
 def check_script_safety(script_content, script_hash, url, script_url=None,
-                        anomaly_detector=None, semgrep_batch=None):
-    """Feature extraction + collection for Semgrep and anomaly detection."""
+                        struct_hash=None, anomaly_detector=None, semgrep_batch=None):
+    """Collect script for Semgrep and anomaly detection."""
+    minified = looks_minified(script_content)
     SCRIPT_METADATA[script_hash] = {
-        "minified": looks_minified(script_content),
+        "minified": minified,
         "line_count": script_content.count('\n') + 1,
     }
 
-    # AST parse for feature extraction and cross-file analysis
-    analyzer = get_ast_analyzer()
-    tree = analyzer.parse(script_content)
-
-    if tree and anomaly_detector is not None:
-        features = extract_features(
-            script_content, script_hash, script_url, url, analyzer, tree,
+    if anomaly_detector is not None and struct_hash is not None:
+        parsed_script = urlparse(script_url) if script_url else None
+        parsed_page = urlparse(url) if url else None
+        record = ScriptRecord(
+            script_hash=script_hash,
+            structural_hash=struct_hash,
+            script_url=script_url or 'inline',
+            page_url=url or '',
+            subdomain=parsed_page.hostname if parsed_page else 'unknown',
+            script_origin=parsed_script.hostname if parsed_script else '',
+            is_minified=minified,
+            is_known_library=_is_known_library(script_content),
+            line_count=script_content.count('\n') + 1,
         )
-        anomaly_detector.ingest(features)
+        anomaly_detector.ingest(record)
 
-    # Collect for Semgrep batch (post-processing)
     if semgrep_batch is not None:
         semgrep_batch.add_script(script_content, script_hash, url, script_url)
 
@@ -465,7 +458,7 @@ async def process_javascript(js_code, url, client, script_url=None, cross_file_s
     SEEN_SCRIPTS.add(raw_hash)
     SEEN_SCRIPTS.add(structural)
 
-    check_script_safety(js_code, raw_hash, url, script_url)
+    check_script_safety(js_code, raw_hash, url, script_url, structural)
 
     # Source map: try to fetch and re-analyze original source
     if ARGS and not getattr(ARGS, 'no_sourcemaps', False) and script_url and script_url != "inline":
@@ -478,7 +471,9 @@ async def process_javascript(js_code, url, client, script_url=None, cross_file_s
                     if original_hash not in SEEN_SCRIPTS:
                         SEEN_SCRIPTS.add(original_hash)
                         log_message("INFO", f"Re-analyzing original source from source map for {script_url}")
-                        check_script_safety(original, original_hash, url, script_url + " (source map)")
+                        original_struct = structural_hash(original)
+                        check_script_safety(original, original_hash, url,
+                                            script_url + " (source map)", original_struct)
         except Exception as e:
             log_message("ERROR", f"Source map processing failed for {script_url}: {e}")
 

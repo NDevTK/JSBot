@@ -32,9 +32,11 @@ def score_url(url):
     except Exception:
         return 0
 
-    # Path keyword scoring (+3 each) -- match whole path segments only
-    path_segments = set(parsed.path.lower().strip('/').split('/'))
-    score += 3 * len(path_segments & PATH_KEYWORDS)
+    # Path keyword scoring (+3 each) — substring match on segments
+    segs = [s for s in parsed.path.lower().strip('/').split('/') if s]
+    for seg in segs:
+        if any(kw in seg for kw in PATH_KEYWORDS):
+            score += 3
 
     # Parameter name scoring (+5 each)
     params = parse_qs(parsed.query)
@@ -70,8 +72,15 @@ def url_path_key(url):
 
 
 def path_segments(url):
-    """Return the set of non-empty path segments."""
-    return set(s for s in urlparse(url).path.strip('/').split('/') if s)
+    """Return cumulative path prefixes for novelty tracking.
+
+    /a/b/c → {'/a', '/a/b', '/a/b/c'}
+
+    Prefixes instead of individual segments so common segments (en, us, v1,
+    static) don't kill novelty of structurally distinct paths.
+    """
+    parts = [s for s in urlparse(url).path.strip('/').split('/') if s]
+    return {('/' + '/'.join(parts[:i + 1])) for i in range(len(parts))}
 
 
 def novelty_score(url, seen_keys, seen_segments):

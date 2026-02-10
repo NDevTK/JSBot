@@ -43,9 +43,6 @@ DEAD_DOMAINS = set()  # domains that failed with connection errors — skip futu
 SEEN_PATH_KEYS = set()  # normalized URL paths — for exact-URL novelty dedup
 SEEN_PATH_SEGMENTS = set()  # unique path segments — for novelty scoring across sessions
 
-# Hostnames/path prefixes that are auth/consent/tracking redirects — never interesting JS
-_SKIP_HOST_PREFIXES = ('accounts.', 'consent.', 'login.', 'signin.', 'auth.', 'sso.')
-_SKIP_PATH_PREFIXES = ('/accounts/', '/signin/', '/ServiceLogin', '/lifecycle/flows/')
 
 # --- Configuration ---
 class Config:
@@ -157,13 +154,15 @@ class PageTracker:
 class HostBalancedQueue:
     """URL queue that balances across hosts at dequeue time.
 
-    put() adds URLs to per-host buckets scored by novelty.
-    get() picks from the host with the fewest crawls so far.
-    Ensures equal time across targets regardless of queue order.
+    put() adds URLs to per-host buckets (no scoring yet).
+    get() picks the host with fewest crawls, then scores all its URLs
+    against the *current* SEEN_PATH_KEYS/SEEN_PATH_SEGMENTS and returns
+    the most novel one. This means novelty reflects what's actually been
+    crawled, not what the queue looked like when the URL was added.
     """
 
     def __init__(self):
-        self._buckets = {}      # host -> list of (score, url)
+        self._buckets = {}      # host -> list of urls
         self._host_crawls = {}  # host -> count of URLs dequeued
         self._lock = asyncio.Lock()
         self._not_empty = asyncio.Event()
@@ -178,11 +177,9 @@ class HostBalancedQueue:
                 return
             parsed = urlparse(url)
             host = parsed.hostname or 'unknown'
-            score = combined_url_score(url, SEEN_PATH_KEYS, SEEN_PATH_SEGMENTS)
             if host not in self._buckets:
                 self._buckets[host] = []
-            self._buckets[host].append((score, url))
-            self._buckets[host].sort(reverse=True)
+            self._buckets[host].append(url)
             self._total += 1
             self._not_empty.set()
 
@@ -202,7 +199,16 @@ class HostBalancedQueue:
                             min_crawls = crawls
                             best_host = host
                 if best_host is not None:
-                    _score, url = self._buckets[best_host].pop(0)
+                    # Score against current seen state — most novel URL first
+                    bucket = self._buckets[best_host]
+                    best_idx = 0
+                    best_score = combined_url_score(bucket[0], SEEN_PATH_KEYS, SEEN_PATH_SEGMENTS)
+                    for i in range(1, len(bucket)):
+                        s = combined_url_score(bucket[i], SEEN_PATH_KEYS, SEEN_PATH_SEGMENTS)
+                        if s > best_score:
+                            best_score = s
+                            best_idx = i
+                    url = bucket.pop(best_idx)
                     self._host_crawls[best_host] = self._host_crawls.get(best_host, 0) + 1
                     self._total -= 1
                     if not any(b for b in self._buckets.values()) and self._poison_count == 0:
@@ -386,11 +392,6 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
                 base_domain = '.'.join((parsed_url.hostname or '').split('.')[-2:])
                 new_links = spider_links(response.text, response.url, base_domain)
                 for link in new_links:
-                    lp = urlparse(link)
-                    if lp.hostname and any(lp.hostname.startswith(p) for p in _SKIP_HOST_PREFIXES):
-                        continue
-                    if any(lp.path.startswith(p) for p in _SKIP_PATH_PREFIXES):
-                        continue
                     link_hash = get_sha256(link)
                     if link_hash not in DISCOVERED_URLS and link_hash not in CHECKED_URLS:
                         DISCOVERED_URLS.add(link_hash)
@@ -451,7 +452,7 @@ async def js_audit_worker(js_queue, client, args, executor,
                 await loop.run_in_executor(
                     executor,
                     check_script_safety, js_code, raw_hash, item.page_url, item.script_url,
-                    anomaly_detector, semgrep_batch,
+                    struct_hash, anomaly_detector, semgrep_batch,
                 )
 
                 # Source map (async fetch, sync re-analysis)
@@ -465,11 +466,12 @@ async def js_audit_worker(js_queue, client, args, executor,
                                 if original_hash not in SEEN_SCRIPTS:
                                     SEEN_SCRIPTS.add(original_hash)
                                     log_message("INFO", f"Re-analyzing source map for {item.script_url}")
+                                    original_struct = structural_hash(original)
                                     await loop.run_in_executor(
                                         executor,
                                         check_script_safety, original, original_hash,
                                         item.page_url, item.script_url + " (source map)",
-                                        anomaly_detector, semgrep_batch,
+                                        original_struct, anomaly_detector, semgrep_batch,
                                     )
                     except Exception as e:
                         log_message("ERROR", f"Source map failed for {item.script_url}: {e}")
@@ -672,6 +674,17 @@ async def run_pipeline(args, client, initial_urls):
                             + (f" ... +{len(state['related_domains'])-20} more"
                                if len(state['related_domains']) > 20 else ""))
 
+            # Re-seed previously discovered subdomains — cached != crawled
+            prev_subs = set(state['scanned_subdomains'])
+            if prev_subs:
+                log_message("INFO", f"CT: re-seeding {len(prev_subs)} previously discovered subdomains")
+                for sub in prev_subs:
+                    await url_queue.put(f'https://{sub}/')
+                for sub in prev_subs:
+                    await domain_queue.put(sub)
+                async with ct_discovered_lock:
+                    ct_discovered_subs.update(prev_subs)
+
             while True:
                 log_message("INFO", f"CT: fetching next month for {domain}...")
                 new_subs, new_related, exhausted = await loop.run_in_executor(
@@ -794,8 +807,7 @@ async def run_pipeline(args, client, initial_urls):
     anomaly_findings = anomaly_detector.score_all()
     for finding in anomaly_findings:
         log_message("FINDING", finding)
-    log_message("INFO", f"Anomaly detection: {len(anomaly_findings)} anomalous scripts "
-                f"across {len(anomaly_detector.profiles)} subdomains")
+    log_message("INFO", f"Anomaly detection: {len(anomaly_findings)} findings")
 
     executor.shutdown(wait=False)
     _save_scan_state(scan_domain)

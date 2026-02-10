@@ -2,7 +2,7 @@
 
 Opinionated JavaScript security scanner. Give it a domain, it does the rest.
 
-JSBot handles target discovery, crawling, JS extraction, deduplication, and security analysis as a single pipeline. Point it at a domain — it finds subdomains via CT logs, pulls historical URLs from Common Crawl, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps for original code, and deduplicates scripts by structural hash. Analysis is two-pronged: Semgrep runs battle-tested rules for real vulnerabilities (XSS, secrets, SSRF), while a custom anomaly detection system builds per-subdomain profiles and flags scripts that are unusual for their context. You don't pick the tools or tune the settings — JSBot decides.
+JSBot handles target discovery, crawling, JS extraction, deduplication, and security analysis as a single pipeline. Point it at a domain — it finds subdomains via CT logs, pulls historical URLs from Common Crawl, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps for original code, and deduplicates scripts by structural hash. Analysis is two-pronged: Semgrep runs battle-tested rules for real vulnerabilities (XSS, secrets, SSRF), while a change detection system tracks scripts across scans and flags new, modified, or contextually unusual code. You don't pick the tools or tune the settings — JSBot decides.
 
 ## Install
 
@@ -67,21 +67,18 @@ Tracks `window.X = taintedValue` assignments across all scripts on the same page
 
 ### Anomaly Detection
 
-JSBot builds a statistical profile for each subdomain during a scan. For every script, it extracts a feature vector:
+JSBot tracks scripts across scans to detect changes and contextual anomalies. Profiles are persisted in `.ct_cache/{domain}/anomaly_profiles.json` — the first scan builds a baseline, subsequent scans detect deviations.
 
-- **Size**: byte count, line count, average line length
-- **Structure**: minified or not, known library or custom code, source map available
-- **Functionality**: eval/Function usage, DOM sinks, fetch calls, postMessage, redirects, cookie access, crypto operations, storage access
-- **AST-derived**: taint source count, taint sink count, global write count
+**Change signals** (require previous scan data):
 
-After all scripts are collected, each script is scored against its subdomain's profile. Scripts that deviate significantly from the norm get flagged:
+- **`new_script`** (severity 7) — script URL not seen in previous scan of this subdomain. Primary signal for compromise or supply chain injection.
+- **`modified_script`** (severity 8) — same script URL but structural hash changed since last scan. Indicates tampered or updated code.
+- **`origin_anomaly`** (severity 8) — script served from a hostname not previously seen for this subdomain. Everything loads from `cdn.example.com` but one script loads from `sketchy-cdn.net`.
 
-- A non-minified script on a subdomain where 80%+ is minified (no hardened build process = more bugs = faster to review)
-- Unusual functionality (eval on a content page, crypto on a marketing page)
-- Size outliers (one massive script among small ones)
-- Custom code on a library-heavy subdomain
+**Context signals** (current scan only, no history needed):
 
-Profiles are persisted across scans. On repeat scans, JSBot scores against the historical baseline — new scripts that don't match established patterns get surfaced automatically.
+- **`not_minified`** (severity 5) — non-minified custom code on a mostly-minified subdomain (>70%). No hardened build process = more bugs = faster to review.
+- **`custom_code`** (severity 4) — custom code on a library-heavy subdomain (>70% libraries). The target's own code is what you want to audit.
 
 ### Source Maps
 
@@ -120,7 +117,7 @@ URLs are scored by **novelty + interestingness** and scanned highest-first. Nove
 | `semgrep` | Semgrep | Static vulnerability (XSS, secrets, SSRF, etc.) with CWE/OWASP metadata |
 | `cross_file_taint` | AST | Tainted global written by one script, read into sink by another |
 | `dangerous_global_function` | AST | Function on window/globalThis containing sinks |
-| `anomaly` | statistical | Script deviates from subdomain's behavioral profile |
+| `anomaly` | change detection | Script change, origin anomaly, or unusual build context |
 
 ## Examples
 
@@ -146,6 +143,6 @@ python scan.py target.com | jq 'select(.finding_type == "semgrep")'
 python scan.py target.com | jq 'select(.finding_type == "anomaly")'
 python scan.py target.com | jq 'select(.finding_type == "cross_file_taint")'
 
-# See anomalous non-minified scripts
-python scan.py target.com | jq 'select(.finding_type == "anomaly" and .is_minified == false)'
+# See modified or new scripts (change detection)
+python scan.py target.com | jq 'select(.finding_type == "anomaly" and (.signals | index("modified_script", "new_script")))'
 ```
