@@ -199,7 +199,7 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
 
                 # Discover JS paths referenced in HTML
                 for match in re.finditer(JS_PATH_FINDER, response.text):
-                    path = match.group(1)
+                    path = match.group(1).replace('\\/', '/')
                     if path.startswith('//'):
                         path = f"https:{path}"
                     js_url = urljoin(str(response.url), path)
@@ -315,7 +315,7 @@ async def js_audit_worker(js_queue, client, args, executor):
 
                 # Discover JS paths referenced inside JS code
                 for match in re.finditer(JS_PATH_FINDER, js_code):
-                    path = match.group(1)
+                    path = match.group(1).replace('\\/', '/')
                     if path.startswith('//'):
                         path = f"https:{path}"
                     script_url = urljoin(item.page_url, path)

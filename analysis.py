@@ -79,6 +79,25 @@ class ASTAnalyzer:
         """Get the text content of a node."""
         return source_bytes[node.start_byte:node.end_byte].decode('utf-8', errors='replace')
 
+    def _get_member_chain(self, node, source_bytes):
+        """Build clean property chain like 'location.search' from a member_expression.
+
+        Returns None for complex base expressions (IIFEs, calls, etc.) so the
+        caller can skip them — child nodes will be visited separately.
+        """
+        if node.type in ('identifier', 'this', 'property_identifier'):
+            return self.get_node_text(node, source_bytes)
+        if node.type == 'member_expression':
+            obj = node.child_by_field_name('object')
+            prop = node.child_by_field_name('property')
+            if obj and prop:
+                obj_text = self._get_member_chain(obj, source_bytes)
+                if obj_text is None:
+                    return None
+                prop_text = self.get_node_text(prop, source_bytes)
+                return f"{obj_text}.{prop_text}"
+        return None
+
     def find_sources_in_range(self, tree, source_bytes, start_line, end_line):
         """Find taint source patterns in a line range using AST walking."""
         sources = []
@@ -91,35 +110,48 @@ class ASTAnalyzer:
             return
 
         if node.type == 'member_expression':
-            text = self.get_node_text(node, source_bytes)
-            for source_name, source_pattern in SOURCES.items():
-                if re.search(source_pattern, text, re.IGNORECASE):
-                    results.append({
-                        "category": source_name,
-                        "match": text,
-                        "line": node.start_point[0] + 1,
-                    })
-                    break
+            chain = self._get_member_chain(node, source_bytes)
+            if chain:
+                for source_name, source_pattern in SOURCES.items():
+                    if re.search(source_pattern, chain, re.IGNORECASE):
+                        results.append({
+                            "category": source_name,
+                            "match": chain,
+                            "line": node.start_point[0] + 1,
+                        })
+                        break
 
         if node.type == 'new_expression':
-            text = self.get_node_text(node, source_bytes)
-            if re.search(r'\bURLSearchParams\b', text):
-                results.append({
-                    "category": "URLSearchParams",
-                    "match": text[:60],
-                    "line": node.start_point[0] + 1,
-                })
+            # Check constructor directly, not full expression text
+            for child in node.children:
+                if child.type in ('identifier', 'member_expression'):
+                    ctor = self.get_node_text(child, source_bytes)
+                    if ctor == 'URLSearchParams':
+                        results.append({
+                            "category": "URLSearchParams",
+                            "match": "new URLSearchParams(...)",
+                            "line": node.start_point[0] + 1,
+                        })
+                    break
 
         if node.type == 'call_expression':
-            text = self.get_node_text(node, source_bytes)
-            for source_name in ("getItem", "cookie_read"):
-                if re.search(SOURCES[source_name], text, re.IGNORECASE):
-                    results.append({
-                        "category": source_name,
-                        "match": text[:60],
-                        "line": node.start_point[0] + 1,
-                    })
-                    break
+            fn = node.child_by_field_name('function')
+            if fn:
+                if fn.type == 'member_expression':
+                    chain = self._get_member_chain(fn, source_bytes)
+                elif fn.type == 'identifier':
+                    chain = self.get_node_text(fn, source_bytes)
+                else:
+                    chain = None
+                if chain:
+                    for source_name in ("getItem", "cookie_read"):
+                        if re.search(SOURCES[source_name], chain, re.IGNORECASE):
+                            results.append({
+                                "category": source_name,
+                                "match": chain + "(...)",
+                                "line": node.start_point[0] + 1,
+                            })
+                            break
 
         for child in node.children:
             self._walk_sources(child, source_bytes, start_line, end_line, results)
@@ -139,7 +171,8 @@ class ASTAnalyzer:
         if node.type == 'assignment_expression':
             left = node.child_by_field_name('left')
             if left and left.type == 'member_expression':
-                left_text = self.get_node_text(left, source_bytes)
+                chain = self._get_member_chain(left, source_bytes)
+                left_text = chain if chain else self.get_node_text(left, source_bytes)[:200]
                 for sink_name, sink_info in SINKS.items():
                     if re.search(sink_info["pattern"], left_text + ' =', re.IGNORECASE):
                         # Check for literal-only RHS (false positive filter)
@@ -158,19 +191,45 @@ class ASTAnalyzer:
         if node.type == 'call_expression':
             fn = node.child_by_field_name('function')
             if fn:
-                fn_text = self.get_node_text(fn, source_bytes)
-                for sink_name, sink_info in SINKS.items():
-                    if re.search(sink_info["pattern"], fn_text + '(', re.IGNORECASE):
-                        # False positive: eval/Function with only literal args
-                        if sink_name == "Eval Injection" and self._has_only_literal_args(node):
-                            continue
-                        results.append({
-                            "category": sink_name,
-                            "match": fn_text + '(',
-                            "line": node.start_point[0] + 1,
-                            "severity": sink_info["severity"],
-                        })
-                        break
+                if fn.type == 'identifier':
+                    fn_text = self.get_node_text(fn, source_bytes)
+                elif fn.type == 'member_expression':
+                    fn_text = self._get_member_chain(fn, source_bytes)
+                    if fn_text is None:
+                        # Complex callee like $(...).html() — check property for jQuery sinks
+                        prop = fn.child_by_field_name('property')
+                        obj = fn.child_by_field_name('object')
+                        if prop and obj:
+                            prop_text = self.get_node_text(prop, source_bytes)
+                            if (prop_text in ('html', 'append', 'prepend', 'after', 'before')
+                                    and obj.type == 'call_expression'):
+                                obj_fn = obj.child_by_field_name('function')
+                                if obj_fn:
+                                    obj_fn_text = self.get_node_text(obj_fn, source_bytes)
+                                    if obj_fn_text.strip() in ('$', 'jQuery'):
+                                        if not self._has_only_literal_args(node):
+                                            results.append({
+                                                "category": "jQuery HTML Sink",
+                                                "match": f"$(...).{prop_text}(",
+                                                "line": node.start_point[0] + 1,
+                                                "severity": 8,
+                                            })
+                else:
+                    fn_text = None
+
+                if fn_text:
+                    for sink_name, sink_info in SINKS.items():
+                        if re.search(sink_info["pattern"], fn_text + '(', re.IGNORECASE):
+                            # False positive: eval/Function with only literal args
+                            if sink_name == "Eval Injection" and self._has_only_literal_args(node):
+                                continue
+                            results.append({
+                                "category": sink_name,
+                                "match": fn_text + '(',
+                                "line": node.start_point[0] + 1,
+                                "severity": sink_info["severity"],
+                            })
+                            break
 
         for child in node.children:
             self._walk_sinks(child, source_bytes, start_line, end_line, results)
@@ -199,17 +258,36 @@ class ASTAnalyzer:
 
     def _walk_postmessage(self, node, source_bytes, results):
         if node.type == 'call_expression':
-            text = self.get_node_text(node, source_bytes)
-            if re.search(POSTMESSAGE_HANDLER_PATTERN, text):
-                # Check if the handler body contains an origin check
-                if not re.search(POSTMESSAGE_ORIGIN_CHECK, text):
-                    results.append({
-                        "category": "postMessage no origin check",
-                        "match": text[:100],
-                        "line": node.start_point[0] + 1,
-                        "severity": 7,
-                        "confidence": "medium",
-                    })
+            fn = node.child_by_field_name('function')
+            if fn:
+                if fn.type == 'identifier':
+                    fn_name = self.get_node_text(fn, source_bytes)
+                elif fn.type == 'member_expression':
+                    fn_name = self._get_member_chain(fn, source_bytes)
+                else:
+                    fn_name = None
+
+                if fn_name and fn_name.endswith('addEventListener'):
+                    # Check if first string argument is 'message'
+                    args = node.child_by_field_name('arguments')
+                    if args:
+                        is_message = False
+                        for child in args.children:
+                            if child.type == 'string':
+                                arg_text = self.get_node_text(child, source_bytes)
+                                is_message = 'message' in arg_text
+                                break
+                        if is_message:
+                            # Check handler body for origin check
+                            handler_text = self.get_node_text(node, source_bytes)
+                            if not re.search(POSTMESSAGE_ORIGIN_CHECK, handler_text):
+                                results.append({
+                                    "category": "postMessage no origin check",
+                                    "match": f"{fn_name}('message', ...)",
+                                    "line": node.start_point[0] + 1,
+                                    "severity": 7,
+                                    "confidence": "medium",
+                                })
         for child in node.children:
             self._walk_postmessage(child, source_bytes, results)
 
@@ -275,9 +353,18 @@ def _emit_grouped_findings(findings, script_content, script_hash, url, script_ur
     """Emit taint findings, grouping when a single source reaches multiple sinks."""
     context_size = CONTEXT_LINES
 
+    # Dedup findings from overlapping scopes (nested functions)
+    seen_pairs = set()
+    deduped = []
+    for f in findings:
+        key = (f["sink_category"], f["sink_line"], f["source_category"], f["source_line"])
+        if key not in seen_pairs:
+            seen_pairs.add(key)
+            deduped.append(f)
+
     # Group by (source_category, source_line)
     grouped = {}
-    for f in findings:
+    for f in deduped:
         key = (f["source_category"], f["source_line"])
         grouped.setdefault(key, []).append(f)
 
@@ -294,10 +381,10 @@ def _emit_grouped_findings(findings, script_content, script_hash, url, script_ur
                 "script_hash": script_hash,
                 "finding_type": "taint_flow",
                 "sink_category": f["sink_category"],
-                "sink_match": f["sink_match"],
+                "sink_match": f["sink_match"][:200],
                 "sink_line": f["sink_line"],
                 "source_category": src_cat,
-                "source_match": f["source_match"],
+                "source_match": f["source_match"][:200],
                 "source_line": src_line,
                 "severity": f["severity"],
                 "confidence": "high",
@@ -316,11 +403,11 @@ def _emit_grouped_findings(findings, script_content, script_hash, url, script_ur
                 "script_hash": script_hash,
                 "finding_type": "taint_flow_grouped",
                 "source_category": src_cat,
-                "source_match": sinks[0]["source_match"],
+                "source_match": sinks[0]["source_match"][:200],
                 "source_line": src_line,
                 "sink_count": len(sinks),
                 "sinks": [
-                    {"category": f["sink_category"], "match": f["sink_match"], "line": f["sink_line"]}
+                    {"category": f["sink_category"], "match": f["sink_match"][:200], "line": f["sink_line"]}
                     for f in sinks
                 ],
                 "severity": max_severity,
@@ -337,13 +424,26 @@ def analyze_taint_flow_ast(script_content, script_hash, url, analyzer, tree, scr
 
     # Get real function scopes from AST
     functions = analyzer.find_functions(tree)
-
-    # Build scope ranges: each function + global scope (everything outside functions)
-    scope_ranges = [(f[0], f[1]) for f in functions]
     total_lines = script_content.count('\n')
 
-    # Add global scope
-    scope_ranges.append((0, total_lines))
+    # Function scopes
+    scope_ranges = [(f[0], f[1]) for f in functions]
+
+    # Global scope = gaps between merged function ranges (avoids double-counting)
+    func_sorted = sorted(scope_ranges)
+    merged = []
+    for start, end in func_sorted:
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append([start, end])
+    pos = 0
+    for start, end in merged:
+        if start > pos:
+            scope_ranges.append((pos, start - 1))
+        pos = max(pos, end + 1)
+    if pos <= total_lines:
+        scope_ranges.append((pos, total_lines))
 
     for start_line, end_line in scope_ranges:
         sources = analyzer.find_sources_in_range(tree, source_bytes, start_line, end_line)

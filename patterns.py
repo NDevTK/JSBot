@@ -120,19 +120,9 @@ SECRET_PATTERNS = {
 
 # --- Prototype Pollution Patterns (regex) ---
 PROTO_POLLUTION_PATTERNS = {
-    "__proto__ access": {
-        "pattern": r"""__proto__""",
+    "__proto__ in bracket access": {
+        "pattern": r"""\[['"]__proto__['"]\]""",
         "severity": 8,
-        "confidence": "medium",
-    },
-    "Object merge/assign": {
-        "pattern": r"""\b(?:Object\.(?:assign|create)|_\.(?:merge|extend|defaults|defaultsDeep)|\.extend\s*\()\b""",
-        "severity": 6,
-        "confidence": "low",
-    },
-    "Dynamic bracket assignment": {
-        "pattern": r"""\w+\s*\[[^\]]*\]\s*\[[^\]]*\]\s*=""",
-        "severity": 7,
         "confidence": "medium",
     },
 }

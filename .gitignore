@@ -1,2 +1,5 @@
 .ct_cache/
 __pycache__/
+nul
+*.log
+*.jsonl
