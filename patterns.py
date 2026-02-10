@@ -1,6 +1,6 @@
-"""All detection patterns: regex sources/sinks, tree-sitter queries, secrets."""
+"""Taint source/sink patterns for AST analysis, URL/JS path discovery."""
 
-# --- Taint Analysis: Sources & Sinks (regex) ---
+# --- Taint Analysis: Sources & Sinks (used by ASTAnalyzer) ---
 SOURCES = {
     "location.hash":        r"""\blocation\.hash\b""",
     "location.search":      r"""\blocation\.search\b""",
@@ -60,108 +60,10 @@ SINKS = {
     },
 }
 
+# --- Discovery Patterns ---
 LINK_FINDER_PATTERN = r"""https?:\/\/[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_\+.~#?&//=]*"""
 
 JS_PATH_FINDER = r"""['"](/[^"']+\.js|[^"']+\.js)['"]"""
-
-# --- Secret Detection Patterns ---
-SECRET_PATTERNS = {
-    "AWS Access Key": {
-        "pattern": r"""(?:AKIA|A3T|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}""",
-        "severity": 10,
-        "confidence": "high",
-    },
-    "AWS Secret Key": {
-        "pattern": r"""(?i)(?:aws_secret_access_key|aws_secret_key)\s*[=:]\s*['"]?([A-Za-z0-9/+=]{40})""",
-        "severity": 10,
-        "confidence": "high",
-    },
-    "Google API Key": {
-        "pattern": r"""AIza[0-9A-Za-z_-]{35}""",
-        "severity": 7,
-        "confidence": "high",
-    },
-    "GitHub Token": {
-        "pattern": r"""(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,255}""",
-        "severity": 9,
-        "confidence": "high",
-    },
-    "Slack Token": {
-        "pattern": r"""xox[bpoa]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24,34}""",
-        "severity": 8,
-        "confidence": "high",
-    },
-    "Stripe Secret Key": {
-        "pattern": r"""(?:sk_live|rk_live)_[A-Za-z0-9]{20,}""",
-        "severity": 10,
-        "confidence": "high",
-    },
-    "Private Key Block": {
-        "pattern": r"""-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----""",
-        "severity": 10,
-        "confidence": "high",
-    },
-    "JWT Token": {
-        "pattern": r"""eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}""",
-        "severity": 6,
-        "confidence": "medium",
-    },
-    "Generic API Key Assignment": {
-        "pattern": r"""(?i)(?:api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?token|secret[_-]?key)\s*[=:]\s*['"][A-Za-z0-9_\-/+=]{16,}['"]""",
-        "severity": 7,
-        "confidence": "medium",
-    },
-    "Hardcoded Password": {
-        "pattern": r"""(?i)(?:password|passwd|pwd)\s*[=:]\s*['"][^'"]{8,}['"]""",
-        "severity": 7,
-        "confidence": "low",
-    },
-}
-
-# --- Prototype Pollution Patterns (regex) ---
-PROTO_POLLUTION_PATTERNS = {
-    "__proto__ in bracket access": {
-        "pattern": r"""\[['"]__proto__['"]\]""",
-        "severity": 8,
-        "confidence": "medium",
-    },
-}
-
-# --- SSRF Patterns ---
-SSRF_PATTERNS = {
-    "fetch with dynamic URL": {
-        "pattern": r"""\bfetch\s*\(\s*(?:[a-zA-Z_$][\w$]*(?:\.[a-zA-Z_$][\w$]*)*|`[^`]*\$\{)""",
-        "severity": 7,
-        "confidence": "medium",
-    },
-    "XMLHttpRequest open": {
-        "pattern": r"""\.open\s*\(\s*['"][A-Z]+['"]\s*,\s*(?:[a-zA-Z_$][\w$]*(?:\.[a-zA-Z_$][\w$]*)*|`[^`]*\$\{)""",
-        "severity": 7,
-        "confidence": "medium",
-    },
-}
-
-# --- Insecure Randomness Patterns ---
-INSECURE_RANDOMNESS_PATTERNS = {
-    "Math.random in security context": {
-        "pattern": r"""\bMath\.random\s*\(\s*\)""",
-        "severity": 5,
-        "confidence": "low",
-    },
-}
-
-# --- Dynamic Script Creation ---
-DYNAMIC_SCRIPT_PATTERNS = {
-    "createElement script": {
-        "pattern": r"""createElement\s*\(\s*['"]script['"]\s*\)""",
-        "severity": 6,
-        "confidence": "medium",
-    },
-}
-
-# --- postMessage Origin Check Pattern ---
-POSTMESSAGE_HANDLER_PATTERN = r"""addEventListener\s*\(\s*['"]message['"]"""
-POSTMESSAGE_ORIGIN_CHECK = r"""(?:event|e|evt|msg)\.origin\s*[!=]==?\s*['"]"""
 
 # --- Source Map URL Pattern ---
 SOURCE_MAP_URL_PATTERN = r"""//[#@]\s*sourceMappingURL\s*=\s*(\S+)"""

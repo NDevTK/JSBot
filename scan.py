@@ -33,6 +33,8 @@ from discovery import (
     discover_paths, spider_links, fetch_commoncrawl_urls,
     ct_load_state, ct_save_state, ct_fetch_next_month,
 )
+from anomaly import AnomalyDetector
+from semgrep_runner import SemgrepBatch
 
 # --- Global State ---
 CHECKED_URLS = set()
@@ -40,6 +42,10 @@ DISCOVERED_URLS = set()
 DEAD_DOMAINS = set()  # domains that failed with connection errors — skip future requests
 SEEN_PATH_KEYS = set()  # normalized URL paths — for exact-URL novelty dedup
 SEEN_PATH_SEGMENTS = set()  # unique path segments — for novelty scoring across sessions
+
+# Hostnames/path prefixes that are auth/consent/tracking redirects — never interesting JS
+_SKIP_HOST_PREFIXES = ('accounts.', 'consent.', 'login.', 'signin.', 'auth.', 'sso.')
+_SKIP_PATH_PREFIXES = ('/accounts/', '/signin/', '/ServiceLogin', '/lifecycle/flows/')
 
 # --- Configuration ---
 class Config:
@@ -92,6 +98,39 @@ def _save_scan_state(domain):
         log_message("INFO", f"Saved {len(SEEN_PATH_SEGMENTS)} path segments to scan state")
     except Exception as e:
         log_message("ERROR", f"Failed to save scan state: {e}")
+
+
+def _load_anomaly_profiles(domain):
+    """Load anomaly profiles from previous scans."""
+    if not domain:
+        return AnomalyDetector()
+    path = os.path.join(_STATE_DIR, domain, 'anomaly_profiles.json')
+    if not os.path.exists(path):
+        return AnomalyDetector()
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        detector = AnomalyDetector.from_dict(data)
+        log_message("INFO", f"Loaded anomaly profiles for {len(detector.profiles)} subdomains")
+        return detector
+    except Exception as e:
+        log_message("ERROR", f"Failed to load anomaly profiles: {e}")
+        return AnomalyDetector()
+
+
+def _save_anomaly_profiles(domain, anomaly_detector):
+    """Persist anomaly profiles for cross-scan learning."""
+    if not domain:
+        return
+    d = os.path.join(_STATE_DIR, domain)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, 'anomaly_profiles.json')
+    try:
+        with open(path, 'w') as f:
+            json.dump(anomaly_detector.to_dict(), f)
+        log_message("INFO", f"Saved anomaly profiles for {len(anomaly_detector.profiles)} subdomains")
+    except Exception as e:
+        log_message("ERROR", f"Failed to save anomaly profiles: {e}")
 
 
 # --- Pipeline Data Structures ---
@@ -280,6 +319,11 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
                 base_domain = '.'.join((parsed_url.hostname or '').split('.')[-2:])
                 new_links = spider_links(response.text, response.url, base_domain)
                 for link in new_links:
+                    lp = urlparse(link)
+                    if lp.hostname and any(lp.hostname.startswith(p) for p in _SKIP_HOST_PREFIXES):
+                        continue
+                    if any(lp.path.startswith(p) for p in _SKIP_PATH_PREFIXES):
+                        continue
                     link_hash = get_sha256(link)
                     if link_hash not in DISCOVERED_URLS and link_hash not in CHECKED_URLS:
                         DISCOVERED_URLS.add(link_hash)
@@ -302,8 +346,9 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
             url_queue.task_done()
 
 
-async def js_audit_worker(js_queue, client, args, executor):
-    """Pulls JS from js_queue, runs analysis (heavy work in ThreadPoolExecutor)."""
+async def js_audit_worker(js_queue, client, args, executor,
+                          semgrep_batch, anomaly_detector):
+    """Pulls JS from js_queue, runs taint analysis + feature extraction."""
     loop = asyncio.get_event_loop()
     fetch_timeout = httpx.Timeout(10.0, connect=5.0)
 
@@ -335,10 +380,11 @@ async def js_audit_worker(js_queue, client, args, executor):
                 SEEN_SCRIPTS.add(struct_hash)
 
             if not skip_analysis:
-                # Heavy sync work → thread pool
+                # Heavy sync work → thread pool (taint flow + feature extraction)
                 await loop.run_in_executor(
                     executor,
                     check_script_safety, js_code, raw_hash, item.page_url, item.script_url,
+                    anomaly_detector, semgrep_batch,
                 )
 
                 # Source map (async fetch, sync re-analysis)
@@ -356,6 +402,7 @@ async def js_audit_worker(js_queue, client, args, executor):
                                         executor,
                                         check_script_safety, original, original_hash,
                                         item.page_url, item.script_url + " (source map)",
+                                        anomaly_detector, semgrep_batch,
                                     )
                     except Exception as e:
                         log_message("ERROR", f"Source map failed for {item.script_url}: {e}")
@@ -551,6 +598,10 @@ async def run_pipeline(args, client, initial_urls):
         max_workers=max(4, args.concurrency // 2),
     )
 
+    # Analysis systems
+    semgrep_batch = SemgrepBatch()
+    anomaly_detector = _load_anomaly_profiles(scan_domain)
+
     num_domain_workers = 5
     num_crawl_workers = args.concurrency
     num_js_workers = max(4, args.concurrency // 2)
@@ -568,7 +619,9 @@ async def run_pipeline(args, client, initial_urls):
         for _ in range(num_crawl_workers)
     ]
     js_tasks = [
-        asyncio.create_task(js_audit_worker(js_queue, client, args, executor))
+        asyncio.create_task(js_audit_worker(
+            js_queue, client, args, executor, semgrep_batch, anomaly_detector,
+        ))
         for _ in range(num_js_workers)
     ]
 
@@ -603,13 +656,18 @@ async def run_pipeline(args, client, initial_urls):
     # Wait for seed + CT to finish
     await asyncio.gather(*producers)
 
-    # Common Crawl runs after CT so it can query all discovered subdomains
+    # Common Crawl runs after CT so it can query discovered subdomains (capped)
     cc_hosts = set()
     for url in initial_urls:
         parsed = urlparse(url)
         if parsed.hostname:
             cc_hosts.add(parsed.hostname)
-    cc_hosts |= ct_subdomains
+    # Cap CC queries — too many hosts overwhelms commoncrawl.org
+    remaining_slots = max(0, 20 - len(cc_hosts))
+    if ct_subdomains and remaining_slots > 0:
+        ct_list = sorted(ct_subdomains)
+        shuffle(ct_list)
+        cc_hosts.update(ct_list[:remaining_slots])
     await url_tracker.register()
     try:
         await cc_producer(url_queue, domain_queue, cc_hosts, executor)
@@ -633,8 +691,26 @@ async def run_pipeline(args, client, initial_urls):
         await js_queue.put(_POISON)
     await asyncio.gather(*js_tasks)
 
+    # === Post-processing: Semgrep batch + anomaly scoring ===
+    loop = asyncio.get_event_loop()
+
+    if semgrep_batch.script_count > 0:
+        log_message("INFO", f"Running Semgrep on {semgrep_batch.script_count} unique scripts...")
+        semgrep_findings = await loop.run_in_executor(executor, semgrep_batch.run)
+        for finding in semgrep_findings:
+            log_message("FINDING", finding)
+        log_message("INFO", f"Semgrep: {len(semgrep_findings)} findings")
+        semgrep_batch.cleanup()
+
+    anomaly_findings = anomaly_detector.score_all()
+    for finding in anomaly_findings:
+        log_message("FINDING", finding)
+    log_message("INFO", f"Anomaly detection: {len(anomaly_findings)} anomalous scripts "
+                f"across {len(anomaly_detector.profiles)} subdomains")
+
     executor.shutdown(wait=False)
     _save_scan_state(scan_domain)
+    _save_anomaly_profiles(scan_domain, anomaly_detector)
 
 
 # --- Main ---

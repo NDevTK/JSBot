@@ -148,6 +148,7 @@ def ct_fetch_next_month(domain, state):
     known_subs = set(state['scanned_subdomains'])
 
     # Try unfailed, unfetched months first; then retry failed ones
+    consecutive_failures = 0
     for month_key, start_date, end_date in ct_month_sequence():
         if month_key in fetched or month_key in failed:
             continue
@@ -168,8 +169,15 @@ def ct_fetch_next_month(domain, state):
             log_message("ERROR", f"CT query failed for {domain} {month_key}, will retry later")
             failed.add(month_key)
             state['failed_months'] = sorted(failed)
+            consecutive_failures += 1
+            # Give up after 5 consecutive failures — crt.sh is overloaded or domain is too big
+            if consecutive_failures >= 5:
+                log_message("INFO", f"CT: {consecutive_failures} consecutive failures, stopping early")
+                state.pop('failed_months', None)
+                return set(), set(), True
             continue
 
+        consecutive_failures = 0
         subs, related = ct_extract_domains(rows, domain)
         ct_save_cache(domain, month_key, subs, related)
         state['fetched_months'].append(month_key)
@@ -178,11 +186,12 @@ def ct_fetch_next_month(domain, state):
         state['related_domains'] = sorted(set(state['related_domains']) | related)
         return new_subs, new_related, False
 
-    # All non-failed months done. Retry failed months once.
-    if failed:
-        log_message("INFO", f"CT: retrying {len(failed)} previously failed months...")
+    # All non-failed months done. Retry failed months once (cap at 5).
+    retry_list = sorted(failed)[:5]
+    if retry_list:
+        log_message("INFO", f"CT: retrying {len(retry_list)} of {len(failed)} failed months...")
         for month_key, start_date, end_date in ct_month_sequence():
-            if month_key not in failed or month_key in fetched:
+            if month_key not in retry_list or month_key in fetched:
                 continue
 
             rows = ct_query_month(domain, start_date, end_date)
@@ -282,7 +291,7 @@ def fetch_commoncrawl_urls(domains, user_agent, per_host_limit=2000):
 
     all_urls = set()
     # Query all (host, index) pairs concurrently
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {}
         for domain in domains:
             domain = domain.strip()
