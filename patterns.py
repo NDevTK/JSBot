@@ -109,4 +109,23 @@ INTERESTING_STRING_PATTERNS = [
     # Security-related TODOs/comments
     (r"""(?://|/\*)\s*((?:TODO|FIXME|HACK|XXX|BUG)\s*:?\s*[^\n*]{0,40}(?:auth|secur|cred|passw|secret|token|xss|csrf|inject|bypass|vuln)[^\n*]{0,40})""",
      "security_todo", 5),
+
+    # --- Secret / Credential Patterns ---
+    # AWS access keys (always start with AKIA)
+    (r"""(?:['"`\s;=(]|^)(AKIA[0-9A-Z]{16})\b""", "aws_access_key", 9),
+    # GitHub tokens (ghp_ personal, ghs_ app install, gho_ OAuth, ghr_ refresh)
+    (r"""(?:['"`\s;=(]|^)(gh[psro]_[A-Za-z0-9_]{36,255})""", "github_token", 9),
+    # Slack tokens
+    (r"""(?:['"`\s;=(]|^)(xox[bpas]-[0-9a-zA-Z-]{10,})""", "slack_token", 9),
+    # Stripe secret keys
+    (r"""(?:['"`\s;=(]|^)(sk_live_[0-9a-zA-Z]{20,})""", "stripe_secret_key", 9),
+    # Stripe publishable keys (public but indicates live environment)
+    (r"""(?:['"`\s;=(]|^)(pk_live_[0-9a-zA-Z]{20,})""", "stripe_publishable_key", 5),
+    # Google API keys
+    (r"""(?:['"`\s;=(]|^)(AIza[0-9A-Za-z_-]{35})""", "google_api_key", 5),
+    # Private key blocks
+    (r"""(-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----)""", "private_key", 9),
+    # Generic API key/secret assignments
+    (r"""(?:api[_-]?key|apikey|api[_-]?secret|secret[_-]?key|access[_-]?token|auth[_-]?token)\s*[:=]\s*['"`]([A-Za-z0-9_/+=.-]{20,})['"`]""",
+     "api_key_generic", 5),
 ]

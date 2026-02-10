@@ -34,7 +34,6 @@ from discovery import (
     ct_load_state, ct_save_state, ct_fetch_next_month,
 )
 from anomaly import AnomalyDetector
-from semgrep_runner import SemgrepBatch
 
 # --- Global State ---
 CHECKED_URLS = set()
@@ -502,7 +501,7 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker, anom
 
 
 async def js_audit_worker(js_queue, client, args, executor,
-                          semgrep_batch, anomaly_detector, url_queue=None):
+                          anomaly_detector, url_queue=None):
     """Pulls JS from js_queue, runs taint analysis + feature extraction."""
     loop = asyncio.get_event_loop()
     fetch_timeout = httpx.Timeout(10.0, connect=5.0)
@@ -539,7 +538,7 @@ async def js_audit_worker(js_queue, client, args, executor,
                 await loop.run_in_executor(
                     executor,
                     check_script_safety, js_code, raw_hash, item.page_url, item.script_url,
-                    struct_hash, anomaly_detector, semgrep_batch,
+                    struct_hash, anomaly_detector,
                 )
 
                 # Source map (async fetch, sync re-analysis)
@@ -558,7 +557,7 @@ async def js_audit_worker(js_queue, client, args, executor,
                                         executor,
                                         check_script_safety, original, original_hash,
                                         item.page_url, item.script_url + " (source map)",
-                                        original_struct, anomaly_detector, semgrep_batch,
+                                        original_struct, anomaly_detector,
                                     )
                     except Exception as e:
                         log_message("ERROR", f"Source map failed for {item.script_url}: {e}")
@@ -709,7 +708,6 @@ async def run_pipeline(args, client, initial_urls):
     )
 
     # Analysis systems
-    semgrep_batch = SemgrepBatch()
     anomaly_detector = _load_anomaly_profiles(scan_domain)
 
     num_domain_workers = 5
@@ -732,8 +730,7 @@ async def run_pipeline(args, client, initial_urls):
     ]
     js_tasks = [
         asyncio.create_task(js_audit_worker(
-            js_queue, client, args, executor, semgrep_batch, anomaly_detector,
-            url_queue,
+            js_queue, client, args, executor, anomaly_detector, url_queue,
         ))
         for _ in range(num_js_workers)
     ]
@@ -876,17 +873,9 @@ async def run_pipeline(args, client, initial_urls):
                 url_queue.record_finding(host)
 
     async def findings_flusher():
-        """Periodically flush Semgrep batch and anomaly findings."""
-        loop = asyncio.get_event_loop()
+        """Periodically flush anomaly findings."""
         while True:
             await asyncio.sleep(60)
-            if semgrep_batch.script_count > 0:
-                log_message("INFO", f"Running Semgrep on {semgrep_batch.script_count} scripts...")
-                findings = await loop.run_in_executor(executor, semgrep_batch.run_and_reset)
-                for f in findings:
-                    log_message("FINDING", f)
-                    _boost_finding_host(f)
-                log_message("INFO", f"Semgrep: {len(findings)} findings")
             anomaly_findings = anomaly_detector.score(anomaly_emitted)
             for f in anomaly_findings:
                 log_message("FINDING", f)
@@ -922,14 +911,6 @@ async def run_pipeline(args, client, initial_urls):
 
     # Cancel periodic flusher and do one final flush
     flusher_task.cancel()
-    loop = asyncio.get_event_loop()
-
-    if semgrep_batch.script_count > 0:
-        log_message("INFO", f"Final Semgrep on {semgrep_batch.script_count} scripts...")
-        semgrep_findings = await loop.run_in_executor(executor, semgrep_batch.run_and_reset)
-        for finding in semgrep_findings:
-            log_message("FINDING", finding)
-        log_message("INFO", f"Semgrep: {len(semgrep_findings)} findings")
 
     anomaly_findings = anomaly_detector.score(anomaly_emitted)
     for finding in anomaly_findings:

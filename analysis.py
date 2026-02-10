@@ -215,6 +215,87 @@ class ASTAnalyzer:
                 return False
         return True
 
+    def _check_tainted(self, text, tainted_vars):
+        """Check if text contains a source or references a tainted variable.
+
+        Returns the source name if tainted, None otherwise.
+        """
+        for source_name, source_pattern in SOURCES.items():
+            if re.search(source_pattern, text):
+                return source_name
+        for var_name, source_name in tainted_vars.items():
+            if re.search(r'\b' + re.escape(var_name) + r'\b', text):
+                return source_name
+        return None
+
+    def find_taint_flows(self, tree, source_bytes):
+        """Find intra-file dataflows from user-controlled sources to dangerous sinks.
+
+        Walks all assignments — if the RHS contains a taint source or references
+        a previously tainted variable, the LHS variable becomes tainted.  Then
+        checks whether any tainted variable name appears on a line that contains
+        a sink.  This catches the two most common vulnerability patterns:
+
+            var x = location.hash;  el.innerHTML = x;          // via variable
+            el.innerHTML = location.hash;                       // direct
+
+        The taint map is per-file (slightly over-approximate across scopes),
+        which is acceptable for a security scanner.
+        """
+        tainted_vars = {}  # var_name -> source_name
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+
+            if node.type == 'variable_declarator':
+                name_node = node.child_by_field_name('name')
+                value_node = node.child_by_field_name('value')
+                if name_node and value_node and name_node.type == 'identifier':
+                    var_name = self.get_node_text(name_node, source_bytes)
+                    value_text = self.get_node_text(value_node, source_bytes)
+                    source = self._check_tainted(value_text, tainted_vars)
+                    if source:
+                        tainted_vars[var_name] = source
+
+            elif node.type == 'assignment_expression':
+                left = node.child_by_field_name('left')
+                right = node.child_by_field_name('right')
+                if left and right and left.type == 'identifier':
+                    var_name = self.get_node_text(left, source_bytes)
+                    value_text = self.get_node_text(right, source_bytes)
+                    source = self._check_tainted(value_text, tainted_vars)
+                    if source:
+                        tainted_vars[var_name] = source
+
+            stack.extend(node.children)
+
+        if not tainted_vars:
+            return []
+
+        # Find sinks that reference tainted variables
+        flows = []
+        sinks = self.find_sinks_in_range(
+            tree, source_bytes, 0, tree.root_node.end_point[0],
+        )
+        lines = source_bytes.decode('utf-8', errors='replace').split('\n')
+
+        for sink in sinks:
+            sink_line = sink['line'] - 1  # 0-indexed
+            if 0 <= sink_line < len(lines):
+                sink_text = lines[sink_line]
+                for var_name, source_name in tainted_vars.items():
+                    if re.search(r'\b' + re.escape(var_name) + r'\b', sink_text):
+                        flows.append({
+                            'source': source_name,
+                            'sink': sink['category'],
+                            'tainted_var': var_name,
+                            'sink_line': sink['line'],
+                            'severity': sink['severity'],
+                        })
+                        break
+
+        return flows
+
     def find_global_assignments(self, tree, source_bytes):
         """Find window.X = ... assignments using iterative AST walking."""
         results = []
@@ -628,11 +709,34 @@ def _check_library_cves(script_content, script_hash, url, script_url):
         })
 
 
+def _check_taint_flows(analyzer, tree, source_bytes, script_hash, url, script_url):
+    """Check for intra-file taint flows from user input to dangerous sinks. Emits findings."""
+    flows = analyzer.find_taint_flows(tree, source_bytes)
+    for flow in flows:
+        finding_key = f"taint:{script_hash}:{flow['sink']}:{flow['sink_line']}"
+        if finding_key in SEEN_FINDINGS:
+            continue
+        SEEN_FINDINGS.add(finding_key)
+        log_message("FINDING", {
+            'finding_type': 'taint_flow',
+            'source_url': url,
+            'script_url': script_url or 'inline',
+            'script_hash': script_hash,
+            'taint_source': flow['source'],
+            'sink_category': flow['sink'],
+            'tainted_var': flow['tainted_var'],
+            'sink_line': flow['sink_line'],
+            'severity': flow['severity'],
+            'confidence': 'medium',
+            'analysis_method': 'ast',
+        })
+
+
 # --- Main Script Analysis Pipeline ---
 
 def check_script_safety(script_content, script_hash, url, script_url=None,
-                        struct_hash=None, anomaly_detector=None, semgrep_batch=None):
-    """Analyze script: anomaly detection, Semgrep, endpoints, strings, postMessage, CVEs."""
+                        struct_hash=None, anomaly_detector=None):
+    """Analyze script: taint flow, anomaly detection, endpoints, strings, postMessage, CVEs."""
     minified = looks_minified(script_content)
     line_count = script_content.count('\n') + 1
     SCRIPT_METADATA[script_hash] = {
@@ -640,7 +744,7 @@ def check_script_safety(script_content, script_hash, url, script_url=None,
         "line_count": line_count,
     }
 
-    # Parse AST once — shared across anomaly, postMessage, and cross-file analysis
+    # Parse AST once — shared across all analysis passes
     analyzer = get_ast_analyzer()
     tree = analyzer.parse(script_content)
     source_bytes = script_content.encode('utf-8') if tree else None
@@ -675,14 +779,11 @@ def check_script_safety(script_content, script_hash, url, script_url=None,
         )
         anomaly_detector.ingest(record)
 
-    # --- Semgrep ---
-    if semgrep_batch is not None:
-        semgrep_batch.add_script(script_content, script_hash, url, script_url)
-
     # --- Inline findings (always run) ---
     _extract_endpoints(script_content, script_hash, url, script_url)
     _extract_interesting_strings(script_content, script_hash, url, script_url)
     if tree:
+        _check_taint_flows(analyzer, tree, source_bytes, script_hash, url, script_url)
         _check_postmessage_handlers(analyzer, tree, source_bytes, script_hash, url, script_url)
     _check_library_cves(script_content, script_hash, url, script_url)
 

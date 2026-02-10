@@ -2,7 +2,7 @@
 
 Opinionated JavaScript security scanner. Give it a domain, it does the rest.
 
-JSBot handles target discovery, crawling, JS extraction, deduplication, and security analysis as a single pipeline. Point it at a domain — it finds subdomains via CT logs, pulls historical URLs from Common Crawl, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps for original code, and deduplicates scripts by structural hash. Analysis covers static vulnerabilities (Semgrep), cross-file taint flow (AST), anomaly detection (change + context signals), postMessage origin bypass, endpoint/string extraction for recon, library CVE detection, and response header analysis. You don't pick the tools or tune the settings — JSBot decides.
+JSBot handles target discovery, crawling, JS extraction, deduplication, and security analysis as a single pipeline. Point it at a domain — it finds subdomains via CT logs, pulls historical URLs from Common Crawl, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps for original code, and deduplicates scripts by structural hash. Analysis covers intra-file taint flow (AST), cross-file taint flow (AST), anomaly detection (change + context signals), postMessage origin bypass, secret/credential detection, endpoint/string extraction for recon, library CVE detection, and response header analysis. Zero external analysis tools — everything runs inline via tree-sitter AST. You don't pick the tools or tune the settings — JSBot decides.
 
 ## Install
 
@@ -10,7 +10,7 @@ JSBot handles target discovery, crawling, JS extraction, deduplication, and secu
 pip install -r requirements.txt
 ```
 
-Requires Semgrep for static vulnerability detection.
+No external analysis tools required — all security analysis runs inline via tree-sitter AST.
 
 ## Usage
 
@@ -48,18 +48,35 @@ That's it. Everything else is automatic.
 
 ## Analysis
 
-### Semgrep (Static Vulnerabilities)
+### Taint Flow (Intra-File)
 
-Semgrep runs periodically during the scan (every 60s) on accumulated scripts. This catches real vulnerabilities using thousands of community-maintained rules:
+Tree-sitter AST analysis tracks user-controlled data from sources to sinks within each script. JSBot walks all variable assignments — if the right-hand side reads from a taint source (`location.hash`, `document.cookie`, `URLSearchParams`, `event.data`, etc.) or references a previously tainted variable, the left-hand side variable becomes tainted. Then checks whether any tainted variable appears in a sink expression (`innerHTML`, `eval`, `document.write`, etc.).
 
-- **XSS**: DOM injection, `eval()` with user input, unsafe jQuery methods
-- **Secrets**: AWS keys, GitHub tokens, Stripe keys, private key blocks, JWTs, hardcoded passwords
-- **SSRF**: `fetch()`/`XMLHttpRequest` with dynamic URLs
-- **Prototype pollution**: `__proto__` manipulation
-- **postMessage**: Missing origin checks on message handlers
-- **And more**: The `p/secrets` and `p/security-audit` rule packs cover OWASP top 10 for JavaScript
+This catches the two most common vulnerability patterns:
 
-Findings include CWE and OWASP classifications from Semgrep's rule metadata.
+```javascript
+// Direct: source flows straight into sink
+el.innerHTML = location.hash;
+
+// Via variable: source stored, then used in sink
+var input = new URLSearchParams(location.search).get('q');
+document.getElementById('results').innerHTML = input;
+```
+
+Findings include the taint source, sink category, tainted variable name, and line number.
+
+### Secret Detection
+
+Regex patterns detect hardcoded credentials and API keys in JavaScript source:
+
+- **AWS access keys** (severity 9) — `AKIA...` patterns
+- **GitHub tokens** (severity 9) — `ghp_`, `ghs_`, `gho_`, `ghr_` prefixed tokens
+- **Slack tokens** (severity 9) — `xoxb-`, `xoxp-`, `xoxa-`, `xoxs-` tokens
+- **Stripe secret keys** (severity 9) — `sk_live_...` patterns
+- **Google API keys** (severity 5) — `AIza...` patterns
+- **Private key blocks** (severity 9) — `-----BEGIN PRIVATE KEY-----` and variants
+- **Generic API keys** (severity 5) — `apiKey = "..."`, `secret_key = "..."` assignment patterns
+- **JWTs** (severity 8) — Hardcoded `eyJ...` tokens in string literals
 
 ### Cross-File Taint
 
@@ -179,14 +196,14 @@ Hosts that produce findings get **crawl credits** — the scanner automatically 
 
 | Type | Method | Description |
 |------|--------|-------------|
-| `semgrep` | Semgrep | Static vulnerability (XSS, secrets, SSRF, etc.) with CWE/OWASP metadata |
+| `taint_flow` | AST | User input flows to dangerous sink via variable tracking within a script |
 | `cross_file_taint` | AST | Tainted global written by one script, read into sink by another |
 | `dangerous_global_function` | AST | Function on window/globalThis containing sinks |
 | `anomaly` | change detection + AST | Script change, origin anomaly, or vulnerability surface (sinks, source+sink, inline) |
 | `postmessage_issue` | AST | Message handler with missing origin check or data flowing to sink |
 | `endpoint` | regex | API endpoint, WebSocket URL, or internal path extracted from JS |
-| `interesting_string` | regex | Internal IP, cloud URL, JWT, debug flag, or security TODO found in JS |
-| `known_cve` | version detection | Library with known CVE (jQuery, Angular.js, Lodash, Bootstrap, Moment.js) |
+| `interesting_string` | regex | Internal IP, cloud URL, JWT, secret, debug flag, or security TODO found in JS |
+| `known_cve` | version detection | Library with known CVE (jQuery, Angular.js, Lodash, Bootstrap, Moment.js, + OSV.dev) |
 | `header_issue` | header analysis | CORS misconfiguration or weak CSP on a subdomain |
 
 ## Examples
@@ -209,7 +226,7 @@ python scan.py target.com --ignore-hashes known_libs.txt > findings.jsonl
 
 # Filter results with jq
 python scan.py target.com | jq 'select(.severity >= 8)'
-python scan.py target.com | jq 'select(.finding_type == "semgrep")'
+python scan.py target.com | jq 'select(.finding_type == "taint_flow")'
 python scan.py target.com | jq 'select(.finding_type == "anomaly")'
 python scan.py target.com | jq 'select(.finding_type == "cross_file_taint")'
 
