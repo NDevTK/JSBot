@@ -2,7 +2,7 @@
 
 Opinionated JavaScript security scanner. Give it a domain, it does the rest.
 
-JSBot handles target discovery, crawling, JS extraction, deduplication, and security analysis as a single pipeline. Point it at a domain — it finds subdomains via CT logs, pulls historical URLs from Common Crawl, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps for original code, and deduplicates scripts by structural hash. Analysis is two-pronged: Semgrep runs battle-tested rules for real vulnerabilities (XSS, secrets, SSRF), while a change detection system tracks scripts across scans and flags new, modified, or contextually unusual code. You don't pick the tools or tune the settings — JSBot decides.
+JSBot handles target discovery, crawling, JS extraction, deduplication, and security analysis as a single pipeline. Point it at a domain — it finds subdomains via CT logs, pulls historical URLs from Common Crawl, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps for original code, and deduplicates scripts by structural hash. Analysis is three-pronged: Semgrep runs battle-tested rules for real vulnerabilities (XSS, secrets, SSRF), AST analysis tracks taint flow across scripts on the same page, and an anomaly system detects script changes across scans and flags vulnerability surface using source/sink detection. You don't pick the tools or tune the settings — JSBot decides.
 
 ## Install
 
@@ -50,7 +50,7 @@ That's it. Everything else is automatic.
 
 ### Semgrep (Static Vulnerabilities)
 
-If Semgrep is installed, JSBot runs it as a batch after collecting all unique scripts. This catches real vulnerabilities using thousands of community-maintained rules:
+Semgrep runs periodically during the scan (every 60s) on accumulated scripts. This catches real vulnerabilities using thousands of community-maintained rules:
 
 - **XSS**: DOM injection, `eval()` with user input, unsafe jQuery methods
 - **Secrets**: AWS keys, GitHub tokens, Stripe keys, private key blocks, JWTs, hardcoded passwords
@@ -71,14 +71,24 @@ JSBot tracks scripts across scans to detect changes and contextual anomalies. Pr
 
 **Change signals** (require previous scan data):
 
-- **`new_script`** (severity 7) — script URL not seen in previous scan of this subdomain. Primary signal for compromise or supply chain injection.
-- **`modified_script`** (severity 8) — same script URL but structural hash changed since last scan. Indicates tampered or updated code.
+- **`new_script`** (severity 7) — script URL not seen in previous scan of this subdomain. Primary signal for compromise or supply chain injection. Cache-busted filenames (`app.abc123.js` → `app.def456.js`) are normalized so deploys don't trigger false positives.
+- **`modified_script`** (severity 8) — same script URL (or same URL after cache-bust normalization) but structural hash changed since last scan. Indicates tampered or updated code.
 - **`origin_anomaly`** (severity 8) — script served from a hostname not previously seen for this subdomain. Everything loads from `cdn.example.com` but one script loads from `sketchy-cdn.net`.
 
-**Context signals** (current scan only, no history needed):
+**Vulnerability surface signals** (current scan only, no history needed):
 
-- **`not_minified`** (severity 5) — non-minified custom code on a mostly-minified subdomain (>70%). No hardened build process = more bugs = faster to review.
-- **`custom_code`** (severity 4) — custom code on a library-heavy subdomain (>70% libraries). The target's own code is what you want to audit.
+- **`has_sinks`** (severity 5) — script contains dangerous sink patterns (innerHTML, eval, document.write, etc.). Indicates attack surface worth reviewing.
+- **`source_and_sink`** (severity 6) — script reads user input (location.hash, postMessage, URLSearchParams, etc.) AND writes to dangerous sinks. The ingredients for a vulnerability are in the same file.
+- **`inline_with_sinks`** (severity 7) — inline `<script>` block containing sinks. High priority because inline scripts are often server-rendered with user data.
+
+**Overlooked code signals** (code that likely got less scrutiny):
+
+- **`not_minified`** (severity 5) — unminified custom code on a subdomain where 85%+ of scripts are minified. Skipped the build pipeline, likely got less review.
+- **`small_non_library`** (severity 5) — custom script under 100 lines on a library-heavy subdomain (>50% libraries). Small custom scripts among polished libraries often mean quick fixes, debug helpers, or glue code that got less review.
+
+Overlooked signals compound with vulnerability surface: overlooked + sinks → severity 6, overlooked + source-and-sink → severity 7. This surfaces "under-reviewed code with attack surface" as a high-priority finding.
+
+Findings include `sink_categories` (e.g. `["DOM XSS", "Eval Injection"]`) so you can see the attack surface type without opening the script.
 
 ### Source Maps
 
@@ -108,7 +118,9 @@ Standard path discovery: robots.txt disallowed paths (often the most interesting
 
 ### URL Scoring
 
-URLs are scored by **novelty + interestingness** and scanned highest-first. Novelty is the primary signal — URLs with path segments JSBot hasn't seen before get prioritized. Path segments are persisted across scans.
+URLs are scored by **novelty + interestingness** and scanned highest-first. Novelty is the primary signal — URLs with path prefixes JSBot hasn't seen before get prioritized. Path prefixes are host-scoped (crawling `/api` on one subdomain doesn't reduce novelty of `/api` on another). Keyword bonuses boost paths containing `admin`, `api`, `debug`, `oauth`, `upload`, etc.
+
+Hosts that produce findings get **crawl credits** — the scanner automatically digs deeper into subdomains where it's finding results, while still maintaining broad coverage of unexplored hosts.
 
 ## Finding Types
 
@@ -117,7 +129,7 @@ URLs are scored by **novelty + interestingness** and scanned highest-first. Nove
 | `semgrep` | Semgrep | Static vulnerability (XSS, secrets, SSRF, etc.) with CWE/OWASP metadata |
 | `cross_file_taint` | AST | Tainted global written by one script, read into sink by another |
 | `dangerous_global_function` | AST | Function on window/globalThis containing sinks |
-| `anomaly` | change detection | Script change, origin anomaly, or unusual build context |
+| `anomaly` | change detection + AST | Script change, origin anomaly, or vulnerability surface (sinks, source+sink, inline) |
 
 ## Examples
 
@@ -145,4 +157,10 @@ python scan.py target.com | jq 'select(.finding_type == "cross_file_taint")'
 
 # See modified or new scripts (change detection)
 python scan.py target.com | jq 'select(.finding_type == "anomaly" and (.signals | index("modified_script", "new_script")))'
+
+# Find scripts with both user input sources and dangerous sinks
+python scan.py target.com | jq 'select(.signals and (.signals | index("source_and_sink")))'
+
+# Filter by sink type
+python scan.py target.com | jq 'select(.sink_categories and (.sink_categories | index("DOM XSS")))'
 ```

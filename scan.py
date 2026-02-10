@@ -151,19 +151,23 @@ class PageTracker:
         self.remaining = self.total
 
 
+_FINDING_BOOST = 3  # each finding = N "free" crawl credits for host selection
+
+
 class HostBalancedQueue:
     """URL queue that balances across hosts at dequeue time.
 
     put() adds URLs to per-host buckets (no scoring yet).
-    get() picks the host with fewest crawls, then scores all its URLs
-    against the *current* SEEN_PATH_KEYS/SEEN_PATH_SEGMENTS and returns
-    the most novel one. This means novelty reflects what's actually been
-    crawled, not what the queue looked like when the URL was added.
+    get() picks the host with fewest effective crawls, then scores all its
+    URLs against the *current* SEEN_PATH_KEYS/SEEN_PATH_SEGMENTS and returns
+    the most novel one. Finding-rich hosts get crawl credits so the scanner
+    digs deeper where it's finding results.
     """
 
     def __init__(self):
         self._buckets = {}      # host -> list of urls
         self._host_crawls = {}  # host -> count of URLs dequeued
+        self._host_findings = {}  # host -> count of findings (heat)
         self._lock = asyncio.Lock()
         self._not_empty = asyncio.Event()
         self._poison_count = 0
@@ -189,14 +193,16 @@ class HostBalancedQueue:
                 if self._poison_count > 0:
                     self._poison_count -= 1
                     return _POISON
-                # Pick host with fewest crawls that still has URLs
+                # Pick host with fewest effective crawls (findings = free credits)
                 best_host = None
-                min_crawls = float('inf')
+                min_effective = float('inf')
                 for host, urls in self._buckets.items():
                     if urls:
                         crawls = self._host_crawls.get(host, 0)
-                        if crawls < min_crawls:
-                            min_crawls = crawls
+                        heat = self._host_findings.get(host, 0)
+                        effective = crawls - heat * _FINDING_BOOST
+                        if effective < min_effective:
+                            min_effective = effective
                             best_host = host
                 if best_host is not None:
                     # Score against current seen state — most novel URL first
@@ -220,6 +226,10 @@ class HostBalancedQueue:
 
     def task_done(self):
         pass  # compatibility with asyncio.Queue interface
+
+    def record_finding(self, host):
+        """Boost a host's priority — each finding earns free crawl credits."""
+        self._host_findings[host] = self._host_findings.get(host, 0) + 1
 
     def qsize(self):
         return self._total
@@ -415,7 +425,7 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker):
 
 
 async def js_audit_worker(js_queue, client, args, executor,
-                          semgrep_batch, anomaly_detector):
+                          semgrep_batch, anomaly_detector, url_queue=None):
     """Pulls JS from js_queue, runs taint analysis + feature extraction."""
     loop = asyncio.get_event_loop()
     fetch_timeout = httpx.Timeout(10.0, connect=5.0)
@@ -430,7 +440,7 @@ async def js_audit_worker(js_queue, client, args, executor,
             js_code = item.js_code
             if not js_code or not js_code.strip():
                 # Still need to decrement PageTracker for empty scripts
-                await _decrement_page_tracker(item.page_tracker, executor, loop)
+                await _decrement_page_tracker(item.page_tracker, executor, loop, url_queue)
                 continue
 
             js_code = format_javascript(js_code)
@@ -514,7 +524,7 @@ async def js_audit_worker(js_queue, client, args, executor,
             if item.page_tracker is not None:
                 pt = item.page_tracker
                 pt.cross_file.add_script(js_code, item.script_url or "inline", raw_hash)
-                await _decrement_page_tracker(pt, executor, loop)
+                await _decrement_page_tracker(pt, executor, loop, url_queue)
 
         except Exception as e:
             log_message("ERROR", f"JS audit error: {e}")
@@ -522,7 +532,7 @@ async def js_audit_worker(js_queue, client, args, executor,
             js_queue.task_done()
 
 
-async def _decrement_page_tracker(page_tracker, executor, loop):
+async def _decrement_page_tracker(page_tracker, executor, loop, url_queue=None):
     """Decrement a PageTracker and run cross-file analysis when all scripts are done."""
     if page_tracker is None:
         return
@@ -535,7 +545,12 @@ async def _decrement_page_tracker(page_tracker, executor, loop):
                     executor,
                     page_tracker.cross_file.collect_globals, analyzer,
                 )
-                page_tracker.cross_file.emit_cross_file_findings(page_tracker.page_url)
+                count = page_tracker.cross_file.emit_cross_file_findings(page_tracker.page_url)
+                if count and url_queue is not None:
+                    host = urlparse(page_tracker.page_url).hostname
+                    if host:
+                        for _ in range(count):
+                            url_queue.record_finding(host)
             except Exception as e:
                 log_message("ERROR", f"Cross-file analysis failed for {page_tracker.page_url}: {e}")
 
@@ -639,6 +654,7 @@ async def run_pipeline(args, client, initial_urls):
     js_tasks = [
         asyncio.create_task(js_audit_worker(
             js_queue, client, args, executor, semgrep_batch, anomaly_detector,
+            url_queue,
         ))
         for _ in range(num_js_workers)
     ]
@@ -772,6 +788,14 @@ async def run_pipeline(args, client, initial_urls):
     # --- Periodic findings flusher ---
     anomaly_emitted = set()  # shared dedup set for anomaly findings
 
+    def _boost_finding_host(finding):
+        """Extract host from finding and boost its queue priority."""
+        src = finding.get('source_url', '')
+        if src:
+            host = urlparse(src).hostname
+            if host:
+                url_queue.record_finding(host)
+
     async def findings_flusher():
         """Periodically flush Semgrep batch and anomaly findings."""
         loop = asyncio.get_event_loop()
@@ -782,10 +806,12 @@ async def run_pipeline(args, client, initial_urls):
                 findings = await loop.run_in_executor(executor, semgrep_batch.run_and_reset)
                 for f in findings:
                     log_message("FINDING", f)
+                    _boost_finding_host(f)
                 log_message("INFO", f"Semgrep: {len(findings)} findings")
             anomaly_findings = anomaly_detector.score(anomaly_emitted)
             for f in anomaly_findings:
                 log_message("FINDING", f)
+                _boost_finding_host(f)
             if anomaly_findings:
                 log_message("INFO", f"Anomaly: {len(anomaly_findings)} findings")
 

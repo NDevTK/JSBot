@@ -341,10 +341,14 @@ class CrossFileState:
                         })
 
     def emit_cross_file_findings(self, page_url):
-        """Emit findings where tainted globals flow into sinks across scripts."""
+        """Emit findings where tainted globals flow into sinks across scripts.
+
+        Returns the number of findings emitted.
+        """
+        count = 0
         tainted_globals = {w["name"] for w in self.global_writes if w["is_tainted"]}
         if not tainted_globals:
-            return
+            return count
 
         for read in self.global_reads_into_sinks:
             if read["global_name"] not in tainted_globals:
@@ -380,6 +384,7 @@ class CrossFileState:
                 "confidence": "medium",
                 "analysis_method": "ast",
             })
+            count += 1
 
         # Emit dangerous function findings
         for df in self.dangerous_functions:
@@ -398,6 +403,9 @@ class CrossFileState:
                 "confidence": "medium",
                 "analysis_method": "ast",
             })
+            count += 1
+
+        return count
 
 
 # --- Main Script Analysis Pipeline ---
@@ -406,12 +414,27 @@ def check_script_safety(script_content, script_hash, url, script_url=None,
                         struct_hash=None, anomaly_detector=None, semgrep_batch=None):
     """Collect script for Semgrep and anomaly detection."""
     minified = looks_minified(script_content)
+    line_count = script_content.count('\n') + 1
     SCRIPT_METADATA[script_hash] = {
         "minified": minified,
-        "line_count": script_content.count('\n') + 1,
+        "line_count": line_count,
     }
 
     if anomaly_detector is not None and struct_hash is not None:
+        # Per-script source/sink detection for anomaly signals
+        has_sources = False
+        has_sinks = False
+        sink_cats = ()
+        analyzer = get_ast_analyzer()
+        tree = analyzer.parse(script_content)
+        if tree:
+            source_bytes = script_content.encode('utf-8')
+            sources = analyzer.find_sources_in_range(tree, source_bytes, 0, line_count)
+            sinks = analyzer.find_sinks_in_range(tree, source_bytes, 0, line_count)
+            has_sources = len(sources) > 0
+            has_sinks = len(sinks) > 0
+            sink_cats = tuple({s['category'] for s in sinks})
+
         parsed_script = urlparse(script_url) if script_url else None
         parsed_page = urlparse(url) if url else None
         record = ScriptRecord(
@@ -423,7 +446,10 @@ def check_script_safety(script_content, script_hash, url, script_url=None,
             script_origin=parsed_script.hostname if parsed_script else '',
             is_minified=minified,
             is_known_library=_is_known_library(script_content),
-            line_count=script_content.count('\n') + 1,
+            line_count=line_count,
+            has_sources=has_sources,
+            has_sinks=has_sinks,
+            sink_categories=sink_cats,
         )
         anomaly_detector.ingest(record)
 
