@@ -3,3 +3,4 @@ __pycache__/
 nul
 *.log
 *.jsonl
+*.txt

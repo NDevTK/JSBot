@@ -247,6 +247,77 @@ class ASTAnalyzer:
                 return source_name
         return None
 
+    _SCOPE_TYPES = frozenset({
+        'function_declaration', 'function_expression', 'arrow_function',
+        'generator_function_declaration', 'generator_function',
+        'method_definition',
+    })
+
+    def _collect_taint_per_scope(self, node, source_bytes, parent_tainted):
+        """Walk a scope, track taint with proper function boundaries.
+
+        Returns list of (tainted_vars_dict, start_line, end_line) for this scope
+        and all nested scopes. Each scope inherits from parent but local
+        declarations shadow inherited vars.
+
+        Two-phase: first build this scope's complete taint map (skipping child
+        functions), then recurse into child functions with the finished map.
+        """
+        scopes = []
+        tainted = dict(parent_tainted)
+        start_line = node.start_point[0]
+        end_line = node.end_point[0]
+        child_functions = []  # deferred — recurse after this scope is complete
+
+        # Phase 1: walk this scope, collect taint, defer child functions
+        stack = [node]
+        while stack:
+            n = stack.pop()
+
+            if n != node and n.type in self._SCOPE_TYPES:
+                child_functions.append(n)
+                continue
+
+            if n.type == 'variable_declarator':
+                name_node = n.child_by_field_name('name')
+                value_node = n.child_by_field_name('value')
+                if name_node and value_node and name_node.type == 'identifier':
+                    var_name = self.get_node_text(name_node, source_bytes)
+                    value_text = self.get_node_text(value_node, source_bytes)
+                    source = self._check_tainted(value_text, tainted)
+                    if source:
+                        tainted[var_name] = source
+                    elif var_name in tainted:
+                        del tainted[var_name]
+
+            elif n.type == 'assignment_expression':
+                left = n.child_by_field_name('left')
+                right = n.child_by_field_name('right')
+                if left and right and left.type == 'identifier':
+                    var_name = self.get_node_text(left, source_bytes)
+                    value_text = self.get_node_text(right, source_bytes)
+                    source = self._check_tainted(value_text, tainted)
+                    if source:
+                        tainted[var_name] = source
+
+            elif n.type == 'formal_parameters':
+                for child in n.children:
+                    if child.type == 'identifier':
+                        param_name = self.get_node_text(child, source_bytes)
+                        if param_name in tainted:
+                            del tainted[param_name]
+                continue
+
+            stack.extend(reversed(n.children))
+
+        scopes.append((tainted, start_line, end_line))
+
+        # Phase 2: recurse into child functions with completed taint map
+        for child_fn in child_functions:
+            scopes.extend(self._collect_taint_per_scope(child_fn, source_bytes, tainted))
+
+        return scopes
+
     def find_taint_flows(self, tree, source_bytes):
         """Find intra-file dataflows from user-controlled sources to dangerous sinks.
 
@@ -254,35 +325,14 @@ class ASTAnalyzer:
         1. Via variable: var x = location.hash; el.innerHTML = x;
         2. Direct: el.innerHTML = location.hash;  (source directly on sink line)
 
+        Taint tracking is scoped to function boundaries — variable `r` tainted
+        in function A does not contaminate a different `r` in function B.
+
         Also checks TAINT_SINKS (setTimeout, window.open, .src/.href assignment)
         which are too broad for anomaly detection but valid for taint analysis.
         """
-        tainted_vars = {}  # var_name -> source_name
-        stack = [tree.root_node]
-        while stack:
-            node = stack.pop()
-
-            if node.type == 'variable_declarator':
-                name_node = node.child_by_field_name('name')
-                value_node = node.child_by_field_name('value')
-                if name_node and value_node and name_node.type == 'identifier':
-                    var_name = self.get_node_text(name_node, source_bytes)
-                    value_text = self.get_node_text(value_node, source_bytes)
-                    source = self._check_tainted(value_text, tainted_vars)
-                    if source:
-                        tainted_vars[var_name] = source
-
-            elif node.type == 'assignment_expression':
-                left = node.child_by_field_name('left')
-                right = node.child_by_field_name('right')
-                if left and right and left.type == 'identifier':
-                    var_name = self.get_node_text(left, source_bytes)
-                    value_text = self.get_node_text(right, source_bytes)
-                    source = self._check_tainted(value_text, tainted_vars)
-                    if source:
-                        tainted_vars[var_name] = source
-
-            stack.extend(node.children)
+        # Build per-scope taint maps
+        scopes = self._collect_taint_per_scope(tree.root_node, source_bytes, {})
 
         # Collect all sinks: core SINKS (AST-based) + TAINT_SINKS (line regex)
         sinks = self.find_sinks_in_range(
@@ -310,10 +360,22 @@ class ASTAnalyzer:
         # Check each sink line for tainted variables or direct source patterns
         flows = []
         for sink in sinks:
-            sink_line = sink['line'] - 1  # 0-indexed
-            if not (0 <= sink_line < len(lines)):
+            sink_line_num = sink['line']
+            sink_line_idx = sink_line_num - 1  # 0-indexed
+            if not (0 <= sink_line_idx < len(lines)):
                 continue
-            sink_text = lines[sink_line]
+            sink_text = lines[sink_line_idx]
+
+            # Find the innermost scope containing this sink line.
+            # Children are appended after parents, so last match = deepest.
+            tainted_vars = {}
+            best_span = float('inf')
+            for scope_tainted, scope_start, scope_end in scopes:
+                if scope_start <= sink_line_idx <= scope_end:
+                    span = scope_end - scope_start
+                    if span <= best_span:
+                        best_span = span
+                        tainted_vars = scope_tainted
 
             # Mode 1: tainted variable on sink line
             found = False
@@ -323,26 +385,98 @@ class ASTAnalyzer:
                         'source': source_name,
                         'sink': sink['category'],
                         'tainted_var': var_name,
-                        'sink_line': sink['line'],
+                        'sink_line': sink_line_num,
                         'severity': sink['severity'],
                     })
                     found = True
                     break
 
-            # Mode 2: source pattern directly on sink line (no intermediate variable)
+            # Mode 2: source pattern directly in sink value (no intermediate variable)
+            # Uses AST to extract only the data portion (RHS of assignment, call args)
+            # so `location.href = location.href` (self-assignment) doesn't false-positive.
             if not found:
-                for source_name, source_pattern in SOURCES.items():
-                    if re.search(source_pattern, sink_text):
-                        flows.append({
-                            'source': source_name,
-                            'sink': sink['category'],
-                            'tainted_var': 'direct',
-                            'sink_line': sink['line'],
-                            'severity': sink['severity'],
-                        })
-                        break
+                value_text = self._extract_sink_value(
+                    tree, source_bytes, sink_line_idx, sink['category'],
+                )
+                if value_text:
+                    for source_name, source_pattern in SOURCES.items():
+                        if re.search(source_pattern, value_text):
+                            flows.append({
+                                'source': source_name,
+                                'sink': sink['category'],
+                                'tainted_var': 'direct',
+                                'sink_line': sink_line_num,
+                                'severity': sink['severity'],
+                            })
+                            break
 
         return flows
+
+    def _extract_sink_value(self, tree, source_bytes, line_idx, sink_category):
+        """Extract the data-flow value from the specific sink expression at a line.
+
+        Finds the AST node that matches the sink category, then returns just
+        the value flowing into it (RHS for assignments, arguments for calls).
+
+        For assignments, self-assignment (LHS == RHS) returns None — no new
+        data flows in a no-op like `location.href = location.href`.
+        """
+        # Determine if this sink is assignment-style or call-style
+        sink_pattern = None
+        for cat, info in TAINT_SINKS.items():
+            if cat == sink_category:
+                sink_pattern = info['pattern']
+                break
+
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node.start_point[0] == line_idx:
+                if node.type == 'assignment_expression':
+                    left = node.child_by_field_name('left')
+                    right = node.child_by_field_name('right')
+                    if left and right:
+                        lhs = self.get_node_text(left, source_bytes)
+                        rhs = self.get_node_text(right, source_bytes)
+                        # Check this assignment matches the sink
+                        node_text = self.get_node_text(node, source_bytes)
+                        is_match = False
+                        if sink_pattern and re.search(sink_pattern, node_text):
+                            is_match = True
+                        elif not sink_pattern:
+                            for sname, sinfo in SINKS.items():
+                                if sname == sink_category and re.search(sinfo['pattern'], node_text):
+                                    is_match = True
+                                    break
+                        if is_match and lhs != rhs:
+                            return rhs
+
+                elif node.type in ('call_expression', 'new_expression'):
+                    fn = node.child_by_field_name('function')
+                    if not fn:
+                        # new_expression: constructor is the first identifier child
+                        for child in node.children:
+                            if child.type == 'identifier':
+                                fn = child
+                                break
+                    args = node.child_by_field_name('arguments')
+                    if fn and args:
+                        fn_text = self.get_node_text(fn, source_bytes)
+                        # Check this call matches the sink
+                        is_match = False
+                        if sink_pattern and re.search(sink_pattern, fn_text + '('):
+                            is_match = True
+                        elif not sink_pattern:
+                            for sname, sinfo in SINKS.items():
+                                if sname == sink_category and re.search(sinfo['pattern'], fn_text + '('):
+                                    is_match = True
+                                    break
+                        if is_match:
+                            return self.get_node_text(args, source_bytes)
+
+            if node.start_point[0] <= line_idx <= node.end_point[0]:
+                stack.extend(node.children)
+        return None
 
     def find_global_assignments(self, tree, source_bytes):
         """Find window.X = ... assignments using iterative AST walking."""

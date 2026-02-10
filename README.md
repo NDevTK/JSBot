@@ -50,18 +50,21 @@ That's it. Everything else is automatic.
 
 ### Taint Flow (Intra-File)
 
-Tree-sitter AST analysis tracks user-controlled data from sources to sinks within each script. JSBot walks all variable assignments — if the right-hand side reads from a taint source (`location.hash`, `document.cookie`, `URLSearchParams`, `event.data`, etc.) or references a previously tainted variable, the left-hand side variable becomes tainted. Then checks whether any tainted variable appears in a sink expression (`innerHTML`, `eval`, `document.write`, etc.).
+Tree-sitter AST analysis tracks user-controlled data from sources to sinks within each script. Taint tracking is scoped to function boundaries — each function gets its own taint map, child functions inherit from parents, and local declarations/parameters shadow inherited taint. This prevents minified variable name collisions across functions from producing false positives.
 
-This catches the two most common vulnerability patterns:
+Two detection modes:
 
 ```javascript
-// Direct: source flows straight into sink
+// Direct: source flows straight into sink (AST extracts the value
+// portion of the sink expression, not the whole line)
 el.innerHTML = location.hash;
 
 // Via variable: source stored, then used in sink
 var input = new URLSearchParams(location.search).get('q');
 document.getElementById('results').innerHTML = input;
 ```
+
+Direct mode uses AST to extract only the value flowing into the sink (RHS for assignments, arguments for calls). Self-assignments like `location.href = location.href` produce no finding — no new data flows.
 
 Findings include the taint source, sink category, tainted variable name, and line number.
 
