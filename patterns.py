@@ -22,6 +22,9 @@ SOURCES = {
     "input.value":          r"""\b(?:target|currentTarget|srcElement)\.value\b""",
     "queryParams":          r"""\.queryParams\b""",
     "queryParamMap":        r"""\.queryParamMap\b""",
+    "history.state":        r"""\bhistory\.state\b""",
+    "searchParams":         r"""\.searchParams\b""",
+    "clipboardData":        r"""\b(?:clipboardData|dataTransfer)\.getData\b""",
 }
 
 # Context-dependent sources: only matched inside message event handler scopes.
@@ -72,6 +75,10 @@ SINKS = {
         "pattern": r"""\.(?:Y8G|ɵɵproperty)\s*\(\s*["'](?:innerHtml|innerHTML)["']""",
         "severity": 8,
     },
+    "iframe srcdoc Injection": {
+        "pattern": r"""\bsrcdoc\s*=""",
+        "severity": 9,
+    },
     "Cookie Write": {
         "pattern": r"""\bdocument\.cookie\s*=""",
         "severity": 5,
@@ -110,6 +117,46 @@ TAINT_SINKS = {
         "pattern": r"""\b(?:fetch|\.open)\s*\(""",
         "severity": 5,
     },
+    "Dynamic Import": {
+        "pattern": r"""\bimport\s*\(""",
+        "severity": 9,
+    },
+    "ServiceWorker Registration": {
+        "pattern": r"""\.register\s*\(""",
+        "severity": 9,
+    },
+    "Worker Constructor": {
+        "pattern": r"""\bnew\s+(?:Worker|SharedWorker)\s*\(""",
+        "severity": 8,
+    },
+    "jQuery Script Exec": {
+        "pattern": r"""\$\s*\.\s*(?:getScript|globalEval)\s*\(""",
+        "severity": 8,
+    },
+    "Template Compilation": {
+        "pattern": r"""\b(?:Handlebars\.compile|_\.template|doT\.template|ejs\.render)\s*\(""",
+        "severity": 8,
+    },
+    "Blob URL": {
+        "pattern": r"""\bURL\.createObjectURL\s*\(""",
+        "severity": 7,
+    },
+    "Trusted Types Bypass": {
+        "pattern": r"""\bcreatePolicy\s*\(""",
+        "severity": 7,
+    },
+    "execCommand insertHTML": {
+        "pattern": r"""\bexecCommand\s*\(\s*['"]insertHTML['"]""",
+        "severity": 7,
+    },
+    "document.domain": {
+        "pattern": r"""\bdocument\.domain\s*=""",
+        "severity": 7,
+    },
+    "jQuery Selector Injection": {
+        "pattern": r"""\b(?:\$|jQuery)\s*\(""",
+        "severity": 7,
+    },
 }
 
 # --- Discovery Patterns ---
@@ -133,6 +180,8 @@ ENDPOINT_PATTERNS = [
     (r"""['"`](wss?://[^'"`\s\n]+)['"`]""", "websocket"),
     # Server-side redirect endpoints with controllable target parameter
     (r"""['"`]([^'"`\s]*(?:redirect|redir)[^'"`\s]*\?[^'"`\s]*(?:to|url|next|return|goto|dest|destination|redirect_uri)=[^'"`\s]*)['"`]""", "redirect_endpoint"),
+    # JSONP endpoints — callback parameter enables data exfil / XSS
+    (r"""['"`]([^'"`\s\n]*\?[^'"`\s\n]*(?:callback|jsonp|cb|jsonpcallback)=[^'"`\s\n]*)['"`]""", "jsonp_endpoint"),
 ]
 
 # --- Interesting String Patterns ---
@@ -163,6 +212,9 @@ INTERESTING_STRING_PATTERNS = [
     # Security-related TODOs/comments
     (r"""(?://|/\*)\s*((?:TODO|FIXME|HACK|XXX|BUG)\s*:?\s*[^\n*]{0,40}(?:auth|secur|cred|passw|secret|token|xss|csrf|inject|bypass|vuln)[^\n*]{0,40})""",
      "security_todo", 5),
+    # Math.random() used for security tokens/nonces — not cryptographically secure
+    (r"""(?:token|nonce|secret|csrf|key|salt|random_?id)\s*[:=]\s*[^;\n]*?(Math\.random\s*\(\s*\))""",
+     "insecure_random", 6),
 
     # --- Secret / Credential Patterns ---
     # AWS access keys (always start with AKIA)
@@ -182,4 +234,29 @@ INTERESTING_STRING_PATTERNS = [
     # Generic API key/secret assignments
     (r"""(?:api[_-]?key|apikey|api[_-]?secret|secret[_-]?key|access[_-]?token|auth[_-]?token)\s*[:=]\s*['"`]([A-Za-z0-9_/+=.-]{20,})['"`]""",
      "api_key_generic", 5),
+]
+
+# --- Prototype Pollution Sink Patterns ---
+# Functions known to perform deep merge/extend with attacker-controlled input.
+# If these are called with user-controlled data, prototype pollution is possible.
+PROTOTYPE_POLLUTION_SINKS = [
+    # lodash/underscore deep merge/set
+    r"""\b(?:_|lodash)\.(?:merge|defaultsDeep|set|setWith|mergeWith)\s*\(""",
+    # jQuery deep extend: $.extend(true, target, source)
+    r"""\$\.extend\s*\(\s*true\b""",
+    # angular.merge (CVE-2019-10768)
+    r"""\bangular\.merge\s*\(""",
+    # hoek.merge / hoek.applyToDefaults
+    r"""\b(?:Hoek|hoek)\.(?:merge|applyToDefaults)\s*\(""",
+    # Generic recursive merge/deepMerge/deepExtend/deepAssign function names
+    r"""\b(?:deepMerge|deepExtend|deepAssign|recursiveMerge|deepCopy)\s*\(""",
+]
+
+# Prototype pollution source patterns — URL param parsers that create nested objects
+PROTOTYPE_POLLUTION_SOURCES = [
+    # qs.parse, deparam — create nested objects from bracket notation
+    r"""\b(?:qs|querystring)\.parse\s*\(""",
+    r"""\$\.deparam\s*\(""",
+    # JSON.parse of user-controlled data (combined with merge = pollution)
+    r"""\bJSON\.parse\s*\(""",
 ]

@@ -7,7 +7,9 @@ import threading
 from hashlib import sha256
 from urllib.parse import urljoin, urlparse
 
-from patterns import SOURCES, CONTEXT_SOURCES, SINKS, TAINT_SINKS, JS_PATH_FINDER, ENDPOINT_PATTERNS, INTERESTING_STRING_PATTERNS
+from patterns import (SOURCES, CONTEXT_SOURCES, SINKS, TAINT_SINKS, JS_PATH_FINDER,
+                      ENDPOINT_PATTERNS, INTERESTING_STRING_PATTERNS,
+                      PROTOTYPE_POLLUTION_SINKS)
 from output import log_message, SEEN_FINDINGS, SCRIPT_METADATA
 from scoring import looks_minified, _is_known_library, check_known_cves
 from sourcemaps import try_fetch_sourcemap, get_original_source
@@ -21,6 +23,9 @@ from tree_sitter import Language, Parser
 SEEN_SCRIPTS = set()
 CHECKED_JS_URLS = set()
 ARGS = None  # Set by scan.py at startup
+
+# Pre-compiled regex: matches any backslash-escaped character (\. \/ etc.)
+_RE_ESCAPED = re.compile(r'\\.')
 
 
 def get_sha256(data):
@@ -224,8 +229,8 @@ class ASTAnalyzer:
             stack.extend(node.children)
         return results
 
-    _URL_SINK_PROPERTIES = frozenset({'src', 'href', 'action', 'formAction', 'data'})
-    _ATTR_URL_SINKS = frozenset({'href', 'src', 'action', 'formaction', 'data'})
+    _URL_SINK_PROPERTIES = frozenset({'src', 'href', 'action', 'formAction', 'data', 'srcdoc'})
+    _ATTR_URL_SINKS = frozenset({'href', 'src', 'action', 'formaction', 'data', 'srcdoc'})
 
     def find_taint_sinks_in_range(self, tree, source_bytes, start_line, end_line):
         """Find taint-only sinks via AST. Too broad for anomaly, valid for taint.
@@ -241,13 +246,37 @@ class ASTAnalyzer:
             if node.start_point[0] > end_line or node.end_point[0] < start_line:
                 continue
 
-            # Property assignment: el.src = x, el.href = x, el.data = x
+            # Property assignment: el.src = x, el.href = x, el.data = x, document.domain = x
             if node.type == 'assignment_expression':
                 left = node.child_by_field_name('left')
                 if left and left.type == 'member_expression':
                     prop = left.child_by_field_name('property')
                     if prop:
                         prop_name = self.get_node_text(prop, source_bytes)
+                        # document.domain = x (SOP relaxation)
+                        if prop_name == 'domain':
+                            obj = left.child_by_field_name('object')
+                            if obj:
+                                obj_text = self.get_node_text(obj, source_bytes)
+                                if obj_text == 'document':
+                                    right = node.child_by_field_name('right')
+                                    if right and not self._is_literal(right):
+                                        results.append({
+                                            'category': 'document.domain',
+                                            'match': 'document.domain =',
+                                            'line': node.start_point[0] + 1,
+                                            'severity': 7,
+                                        })
+                        # el.style.cssText = x (CSS injection)
+                        elif prop_name == 'cssText':
+                            right = node.child_by_field_name('right')
+                            if right and not self._is_literal(right):
+                                results.append({
+                                    'category': 'CSS Injection',
+                                    'match': '.cssText =',
+                                    'line': node.start_point[0] + 1,
+                                    'severity': 5,
+                                })
                         if prop_name in self._URL_SINK_PROPERTIES:
                             # Skip location.href — already Open Redirect in core SINKS
                             obj = left.child_by_field_name('object')
@@ -258,11 +287,16 @@ class ASTAnalyzer:
                                     continue
                             right = node.child_by_field_name('right')
                             if right and not self._is_literal(right):
+                                # srcdoc is HTML injection (high sev), others are URL sinks
+                                if prop_name == 'srcdoc':
+                                    cat, sev = 'iframe srcdoc Injection', 9
+                                else:
+                                    cat, sev = 'Script/Link Source', 6
                                 results.append({
-                                    'category': 'Script/Link Source',
+                                    'category': cat,
                                     'match': f'.{prop_name} =',
                                     'line': node.start_point[0] + 1,
-                                    'severity': 6,
+                                    'severity': sev,
                                 })
 
             # Call expressions
@@ -286,6 +320,25 @@ class ASTAnalyzer:
                                 'line': node.start_point[0] + 1,
                                 'severity': 5,
                             })
+                        elif fn_name in ('$', 'jQuery'):
+                            # $(tainted) — HTML injection if arg contains tags
+                            if not self._has_only_literal_args(node):
+                                results.append({
+                                    'category': 'jQuery Selector Injection',
+                                    'match': fn_name + '(',
+                                    'line': node.start_point[0] + 1,
+                                    'severity': 7,
+                                })
+
+                    # import(x) — dynamic import, tree-sitter parses as
+                    # call_expression with fn type 'import'
+                    elif fn.type == 'import':
+                        results.append({
+                            'category': 'Dynamic Import',
+                            'match': 'import(',
+                            'line': node.start_point[0] + 1,
+                            'severity': 9,
+                        })
 
                     elif fn.type == 'member_expression':
                         mem_prop = fn.child_by_field_name('property')
@@ -330,6 +383,49 @@ class ASTAnalyzer:
                                     'line': node.start_point[0] + 1,
                                     'severity': 9,
                                 })
+                            elif pname == 'register':
+                                # navigator.serviceWorker.register(url)
+                                chain = self._get_member_chain(fn, source_bytes)
+                                if chain and 'serviceWorker' in chain:
+                                    results.append({
+                                        'category': 'ServiceWorker Registration',
+                                        'match': '.register(',
+                                        'line': node.start_point[0] + 1,
+                                        'severity': 9,
+                                    })
+                            elif pname in ('getScript', 'globalEval'):
+                                # $.getScript(url), $.globalEval(code)
+                                obj_text = self.get_node_text(mem_obj, source_bytes)
+                                if obj_text in ('$', 'jQuery'):
+                                    results.append({
+                                        'category': 'jQuery Script Exec',
+                                        'match': f'{obj_text}.{pname}(',
+                                        'line': node.start_point[0] + 1,
+                                        'severity': 8,
+                                    })
+                            elif pname == 'createObjectURL':
+                                results.append({
+                                    'category': 'Blob URL',
+                                    'match': '.createObjectURL(',
+                                    'line': node.start_point[0] + 1,
+                                    'severity': 7,
+                                })
+                            elif pname == 'execCommand':
+                                # document.execCommand("insertHTML", ...)
+                                if args_node:
+                                    arg_nodes = [c for c in args_node.children
+                                                 if c.type not in ('(', ')', ',')]
+                                    if arg_nodes and arg_nodes[0].type == 'string':
+                                        cmd = self.get_node_text(
+                                            arg_nodes[0], source_bytes
+                                        ).strip('\'"` ')
+                                        if cmd == 'insertHTML':
+                                            results.append({
+                                                'category': 'execCommand insertHTML',
+                                                'match': '.execCommand("insertHTML")',
+                                                'line': node.start_point[0] + 1,
+                                                'severity': 7,
+                                            })
                             elif pname in ('setAttribute', 'setAttributeNS'):
                                 if args_node:
                                     arg_nodes = [c for c in args_node.children
@@ -352,6 +448,13 @@ class ASTAnalyzer:
                                                     'line': node.start_point[0] + 1,
                                                     'severity': 6,
                                                 })
+                                            elif bare.lower() == 'srcdoc':
+                                                results.append({
+                                                    'category': 'iframe srcdoc Injection',
+                                                    'match': f'.{pname}("{attr_val}", ...)',
+                                                    'line': node.start_point[0] + 1,
+                                                    'severity': 9,
+                                                })
                                             elif bare.lower().startswith('on'):
                                                 results.append({
                                                     'category': 'setAttribute Event Handler',
@@ -359,6 +462,29 @@ class ASTAnalyzer:
                                                     'line': node.start_point[0] + 1,
                                                     'severity': 8,
                                                 })
+                                            elif bare.lower() == 'style':
+                                                results.append({
+                                                    'category': 'CSS Injection',
+                                                    'match': f'.{pname}("{attr_val}", ...)',
+                                                    'line': node.start_point[0] + 1,
+                                                    'severity': 5,
+                                                })
+
+            # new Worker(url), new SharedWorker(url)
+            if node.type == 'new_expression':
+                constructor = None
+                for child in node.children:
+                    if child.type == 'identifier':
+                        constructor = self.get_node_text(child, source_bytes)
+                        break
+                if constructor in ('Worker', 'SharedWorker'):
+                    if not self._has_only_literal_args(node):
+                        results.append({
+                            'category': 'Worker Constructor',
+                            'match': f'new {constructor}(',
+                            'line': node.start_point[0] + 1,
+                            'severity': 8,
+                        })
 
             stack.extend(node.children)
         return results
@@ -378,6 +504,25 @@ class ASTAnalyzer:
             if not self._is_literal(child):
                 return False
         return True
+
+    def _extract_pattern_identifiers(self, pattern_node, source_bytes):
+        """Extract all identifier names from a destructuring pattern.
+
+        Handles object_pattern ({a, b: c}) and array_pattern ([x, , y]).
+        Returns a list of bound variable names.
+        """
+        names = []
+        stack = [pattern_node]
+        while stack:
+            n = stack.pop()
+            if n.type == 'identifier' and n.parent != pattern_node.parent:
+                names.append(self.get_node_text(n, source_bytes))
+            elif n.type == 'shorthand_property_identifier_pattern':
+                names.append(self.get_node_text(n, source_bytes))
+            elif n.type in ('object_pattern', 'array_pattern', 'pair_pattern',
+                            'assignment_pattern', 'rest_pattern'):
+                stack.extend(n.children)
+        return names
 
     def _get_shallow_text(self, node, source_bytes):
         """Get the text of a node, excluding nested function/scope bodies.
@@ -576,6 +721,24 @@ class ASTAnalyzer:
                             tainted[var_name] = source
                         elif var_name in tainted:
                             del tainted[var_name]
+                elif (name_node
+                      and name_node.type in ('object_pattern', 'array_pattern')
+                      and value_node
+                      and value_node.type not in self._SCOPE_TYPES):
+                    value_text = self._get_shallow_text(value_node, source_bytes)
+                    source = self._check_tainted(value_text, tainted)
+                    if not source and name_node.type == 'object_pattern':
+                        base = value_text.strip()
+                        for ident in self._extract_pattern_identifiers(
+                                name_node, source_bytes):
+                            prop_source = self._check_tainted(
+                                f'{base}.{ident}', tainted)
+                            if prop_source:
+                                tainted[ident] = prop_source
+                    elif source:
+                        for ident in self._extract_pattern_identifiers(
+                                name_node, source_bytes):
+                            tainted[ident] = source
 
             elif n.type == 'assignment_expression':
                 left = n.child_by_field_name('left')
@@ -727,6 +890,41 @@ class ASTAnalyzer:
                             del tainted[var_name]
                             taint_history.append((
                                 value_node.start_point[0], var_name, None,
+                            ))
+                # Destructuring: var {hash} = location, var [x, y] = arr
+                elif (name_node
+                      and name_node.type in ('object_pattern', 'array_pattern')
+                      and value_node
+                      and value_node.type not in self._SCOPE_TYPES):
+                    value_text = self._get_shallow_text(
+                        value_node, source_bytes,
+                    )
+                    source = self._check_tainted(
+                        value_text, tainted, is_msg_handler,
+                    )
+                    # For object destructuring from a known base, check
+                    # each property: {hash} = location → location.hash
+                    if (not source
+                            and name_node.type == 'object_pattern'):
+                        base = value_text.strip()
+                        for ident in self._extract_pattern_identifiers(
+                                name_node, source_bytes):
+                            synth = f'{base}.{ident}'
+                            prop_source = self._check_tainted(
+                                synth, tainted, is_msg_handler,
+                            )
+                            if prop_source:
+                                tainted[ident] = prop_source
+                                taint_history.append((
+                                    value_node.start_point[0], ident,
+                                    prop_source,
+                                ))
+                    elif source:
+                        for ident in self._extract_pattern_identifiers(
+                                name_node, source_bytes):
+                            tainted[ident] = source
+                            taint_history.append((
+                                value_node.start_point[0], ident, source,
                             ))
 
             elif n.type == 'assignment_expression':
@@ -881,17 +1079,15 @@ class ASTAnalyzer:
                                             handler.end_byte,
                                         ))
 
-            # window.onmessage = handler
+            # window.onmessage = handler  OR  bc.onmessage = handler
+            # (BroadcastChannel, MessagePort, Worker all use onmessage)
             if node.type == 'assignment_expression':
                 left = node.child_by_field_name('left')
                 if left and left.type == 'member_expression':
                     prop = left.child_by_field_name('property')
-                    obj = left.child_by_field_name('object')
-                    if (prop and obj
+                    if (prop
                             and self.get_node_text(prop, source_bytes)
-                            == 'onmessage'
-                            and self.get_node_text(obj, source_bytes)
-                            in ('window', 'self', 'globalThis', 'this')):
+                            == 'onmessage'):
                         right = node.child_by_field_name('right')
                         if right and right.type in _HANDLER_TYPES:
                             handler_ranges.add((
@@ -1154,6 +1350,24 @@ class ASTAnalyzer:
                 stack.extend(node.children)
         return None
 
+    def find_prototype_pollution_sinks(self, tree, source_bytes):
+        """Find calls to known deep-merge/extend functions (prototype pollution risk).
+
+        Returns list of {category, match, line, severity} for each vulnerable call.
+        """
+        results = []
+        text = source_bytes.decode('utf-8', errors='replace')
+        for pattern in PROTOTYPE_POLLUTION_SINKS:
+            for m in re.finditer(pattern, text):
+                line = text[:m.start()].count('\n') + 1
+                results.append({
+                    'category': 'Prototype Pollution Sink',
+                    'match': m.group(0).rstrip('('),
+                    'line': line,
+                    'severity': 7,
+                })
+        return results
+
     def find_global_assignments(self, tree, source_bytes):
         """Find window.X = ... assignments using iterative AST walking."""
         results = []
@@ -1312,16 +1526,28 @@ class ASTAnalyzer:
 
                     if origin_side and other_side:
                         found_origin_ref = True
-                        # Check if comparing to 'null' string
                         other_text = self.get_node_text(other_side, source_bytes).strip()
+                        # Check if comparing to 'null' string
                         if other_text in ("'null'", '"null"', '`null`'):
                             result = 'unsafe_null'
+                        # e.origin === window.origin — both can be 'null'
+                        # from sandboxed iframes (bypass via srcdoc)
+                        elif other_text in ('window.origin', 'self.origin',
+                                            'globalThis.origin'):
+                            if result not in ('unsafe_null',):
+                                result = 'unsafe_null'
                         elif result != 'unsafe_null':
                             # Real comparison against a string/variable
                             result = 'valid'
 
             # Check method calls: allowedOrigins.includes(e.origin)
             # or e.origin.startsWith(...)
+            #
+            # Classification:
+            #   indexOf/includes — substring match, bypassable (attacker-trusted.com)
+            #   match without ^ and $ anchors — partial regex, bypassable
+            #   startsWith/endsWith — may be valid if checking full origin
+            #   === / == — strict comparison, valid
             if node.type == 'call_expression':
                 fn = node.child_by_field_name('function')
                 if fn and fn.type == 'member_expression':
@@ -1330,24 +1556,76 @@ class ASTAnalyzer:
                     if obj and prop:
                         prop_name = self.get_node_text(prop, source_bytes)
                         if prop_name in ('includes', 'indexOf', 'match',
+                                         'search', 'test',
                                          'startsWith', 'endsWith'):
-                            # Check if .origin is the object or an argument
+                            has_origin = False
                             if self._is_origin_access(obj, source_bytes):
-                                found_origin_ref = True
-                                # e.origin.match(...) — check arguments
-                                # This is a comparison, treat as valid unless
-                                # comparing to 'null'
-                                if result != 'unsafe_null':
-                                    result = 'valid'
+                                has_origin = True
                             else:
-                                # Check arguments for .origin
                                 args = node.child_by_field_name('arguments')
                                 if args:
                                     for arg in args.children:
                                         if self._is_origin_access(arg, source_bytes):
-                                            found_origin_ref = True
-                                            if result != 'unsafe_null':
-                                                result = 'valid'
+                                            has_origin = True
+                                            break
+                            if has_origin:
+                                found_origin_ref = True
+                                # indexOf/includes are always bypassable
+                                if prop_name in ('indexOf', 'includes'):
+                                    if result not in ('unsafe_null',):
+                                        result = 'unsafe_partial_match'
+                                elif prop_name in ('match', 'search', 'test'):
+                                    # Get regex text — for test() the regex
+                                    # is the object, for match/search it's
+                                    # the first argument
+                                    regex_text = ''
+                                    args = node.child_by_field_name('arguments')
+                                    if prop_name == 'test':
+                                        regex_text = self.get_node_text(
+                                            obj, source_bytes)
+                                    elif args:
+                                        arg_nodes = [
+                                            c for c in args.children
+                                            if c.type not in ('(', ')', ',')]
+                                        if arg_nodes:
+                                            regex_text = self.get_node_text(
+                                                arg_nodes[0], source_bytes)
+
+                                    anchored = False
+                                    has_unescaped_dot = False
+
+                                    if regex_text:
+                                        if '^' in regex_text and '$' in regex_text:
+                                            anchored = True
+                                        # Extract inner pattern from /regex/
+                                        # or "string" delimiters
+                                        inner = regex_text
+                                        if inner.startswith('/'):
+                                            inner = inner[1:]
+                                            ls = inner.rfind('/')
+                                            if ls > 0:
+                                                inner = inner[:ls]
+                                        elif inner[0:1] in ('"', "'", '`'):
+                                            inner = inner[1:]
+                                            if inner and inner[-1] in ('"', "'", '`'):
+                                                inner = inner[:-1]
+                                        # Strip escaped chars, then check
+                                        # for remaining raw dots
+                                        cleaned = _RE_ESCAPED.sub('', inner)
+                                        if '.' in cleaned:
+                                            has_unescaped_dot = True
+
+                                    if not anchored or has_unescaped_dot:
+                                        if result not in ('unsafe_null',):
+                                            result = 'unsafe_partial_match'
+                                    elif result not in ('unsafe_null',
+                                                        'unsafe_partial_match'):
+                                        result = 'valid'
+                                else:
+                                    # startsWith/endsWith — treat as valid
+                                    if result not in ('unsafe_null',
+                                                      'unsafe_partial_match'):
+                                        result = 'valid'
 
             # Check if/switch on .origin (even without comparison)
             if node.type in ('if_statement', 'switch_statement'):
@@ -1890,6 +2168,9 @@ def _check_postmessage_handlers(analyzer, tree, source_bytes, script_hash, url, 
         elif origin_check == 'unsafe_source_origin':
             severity = 9 if has_sinks else 7
             issue = 'unsafe_source_origin_check'
+        elif origin_check == 'unsafe_partial_match':
+            severity = 8 if has_sinks else 6
+            issue = 'unsafe_partial_origin_check'
         elif origin_check == 'valid' and has_sinks:
             severity = 6
             issue = 'data_to_sink'
@@ -1960,6 +2241,28 @@ def _check_taint_flows(analyzer, tree, source_bytes, script_hash, url, script_ur
         })
 
 
+def _check_prototype_pollution(analyzer, tree, source_bytes, script_hash, url, script_url):
+    """Check for prototype pollution sinks (deep merge/extend calls). Emits findings."""
+    sinks = analyzer.find_prototype_pollution_sinks(tree, source_bytes)
+    for sink in sinks:
+        finding_key = f"protopoll:{script_hash}:{sink['match']}:{sink['line']}"
+        if finding_key in SEEN_FINDINGS:
+            continue
+        SEEN_FINDINGS.add(finding_key)
+        log_message("FINDING", {
+            'finding_type': 'prototype_pollution',
+            'source_url': url,
+            'script_url': script_url or 'inline',
+            'script_hash': script_hash,
+            'sink_category': sink['category'],
+            'match': sink['match'],
+            'sink_line': sink['line'],
+            'severity': sink['severity'],
+            'confidence': 'low',
+            'analysis_method': 'pattern',
+        })
+
+
 # --- Main Script Analysis Pipeline ---
 
 def check_script_safety(script_content, script_hash, url, script_url=None,
@@ -2013,6 +2316,7 @@ def check_script_safety(script_content, script_hash, url, script_url=None,
     if tree:
         _check_taint_flows(analyzer, tree, source_bytes, script_hash, url, script_url)
         _check_postmessage_handlers(analyzer, tree, source_bytes, script_hash, url, script_url)
+        _check_prototype_pollution(analyzer, tree, source_bytes, script_hash, url, script_url)
     _check_library_cves(script_content, script_hash, url, script_url)
 
 

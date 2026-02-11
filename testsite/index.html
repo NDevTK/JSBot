@@ -178,6 +178,78 @@ class Widget23 {
 new Widget23().process();
 </script>
 
+<!-- T24: Destructuring assignment taint — object pattern -->
+<script>
+var {hash, search} = location;
+document.getElementById("t24").innerHTML = hash;
+</script>
+
+<!-- T25: Destructuring assignment taint — array pattern -->
+<script>
+var parts = location.search.split("=");
+var [key, val] = parts;
+document.getElementById("t25").innerHTML = val;
+</script>
+
+<!-- T26: history.state as source -->
+<script>
+var stateData = history.state;
+document.getElementById("t26").innerHTML = stateData;
+</script>
+
+<!-- T27: .searchParams as source -->
+<script>
+var url = new URL(window.location.href);
+var q = url.searchParams.get("q");
+document.getElementById("t27").innerHTML = q;
+</script>
+
+<!-- T28: iframe srcdoc injection -->
+<script>
+var payload = location.hash.slice(1);
+document.getElementById("t28frame").srcdoc = payload;
+</script>
+
+<!-- T29: dynamic import() -->
+<script>
+var mod = location.hash.slice(1);
+import(mod);
+</script>
+
+<!-- T30: jQuery selector injection -->
+<script>
+var sel = location.hash.slice(1);
+$(sel);
+</script>
+
+<!-- T31: document.domain assignment -->
+<script>
+var d = location.hash.slice(1);
+document.domain = d;
+</script>
+
+<!-- T32: BroadcastChannel message handler -->
+<script>
+var bc = new BroadcastChannel("updates");
+bc.onmessage = function(e) {
+    document.getElementById("t32").innerHTML = e.data;
+};
+</script>
+
+<!-- T33: new Worker with tainted URL -->
+<script>
+var workerUrl = location.hash.slice(1);
+new Worker(workerUrl);
+</script>
+
+<!-- T34: clipboardData.getData source -->
+<script>
+document.addEventListener("paste", function(e) {
+    var html = e.clipboardData.getData("text/html");
+    document.getElementById("t34").innerHTML = html;
+});
+</script>
+
 <!-- ================================================================
      CROSS-FILE TAINT — globals-writer.js sets window.X from source,
      globals-reader.js reads window.X into sink
@@ -206,6 +278,10 @@ new Widget23().process();
 <img id="t12img"><div id="t13"></div><div id="t14"></div>
 <div id="t17"></div><div id="t20"></div>
 <div id="t21"></div><div id="t22"></div>
+<div id="t24"></div><div id="t25"></div>
+<div id="t26"></div><div id="t27"></div>
+<iframe id="t28frame"></iframe>
+<div id="t32"></div><div id="t34"></div>
 <div id="output"></div>
 </body>
 </html>
