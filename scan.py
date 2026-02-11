@@ -31,7 +31,7 @@ from analysis import (
 from sourcemaps import try_fetch_sourcemap, get_original_source
 from discovery import (
     discover_paths, spider_links, fetch_commoncrawl_urls,
-    ct_load_state, ct_save_state, ct_fetch_next_month,
+    ct_fetch_next_month,
 )
 from anomaly import AnomalyDetector
 
@@ -43,14 +43,13 @@ SEEN_PATH_KEYS = set()  # normalized URL paths — for exact-URL novelty dedup
 SEEN_PATH_SEGMENTS = set()  # unique path segments — for novelty scoring across sessions
 _CHECKED_HEADER_HOSTS = set()  # subdomains already checked for header issues
 _SCAN_DOMAIN = None  # set during pipeline init, used by interrupt handler
+_SCAN_STORE = None   # set during main(), used by interrupt handler
 
 
 # --- Configuration ---
 class Config:
     USER_AGENT = 'JSBot/5.0 (Autonomous Security Agent)'
 
-# --- Scan State Persistence ---
-_STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.ct_cache')
 
 
 def _get_scan_domain(args, initial_urls):
@@ -66,57 +65,42 @@ def _get_scan_domain(args, initial_urls):
     return None
 
 
-def _load_scan_state(domain, rescan=False):
-    """Load persisted path segments and analyzed script hashes from previous scans."""
-    if not domain:
-        return
-    path = os.path.join(_STATE_DIR, domain, 'scan_state.json')
-    if not os.path.exists(path):
+def _load_scan_state(store, rescan=False):
+    """Load persisted path segments and analyzed script hashes from the database."""
+    if not store:
         return
     try:
-        with open(path) as f:
-            data = json.load(f)
-        loaded = data.get('seen_path_segments', [])
-        SEEN_PATH_SEGMENTS.update(loaded)
-        log_message("INFO", f"Loaded {len(loaded)} seen path segments from previous scans")
+        segments, scripts = store.load_scan_state()
+        SEEN_PATH_SEGMENTS.update(segments)
+        log_message("INFO", f"Loaded {len(segments)} seen path segments from previous scans")
         if not rescan:
-            hashes = data.get('seen_scripts', [])
-            SEEN_SCRIPTS.update(hashes)
-            log_message("INFO", f"Loaded {len(hashes)} analyzed script hashes (use --rescan to re-analyze)")
+            SEEN_SCRIPTS.update(scripts)
+            log_message("INFO", f"Loaded {len(scripts)} analyzed script hashes (use --rescan to re-analyze)")
         else:
             log_message("INFO", "Rescan mode: ignoring previously analyzed script hashes")
     except Exception as e:
         log_message("ERROR", f"Failed to load scan state: {e}")
 
 
-def _save_scan_state(domain):
-    """Persist path segments and analyzed script hashes for future scans."""
-    if not domain:
+def _save_scan_state(store):
+    """Persist path segments and analyzed script hashes to the database."""
+    if not store:
         return
-    d = os.path.join(_STATE_DIR, domain)
-    os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, 'scan_state.json')
     try:
-        with open(path, 'w') as f:
-            json.dump({
-                'seen_path_segments': sorted(SEEN_PATH_SEGMENTS),
-                'seen_scripts': sorted(SEEN_SCRIPTS),
-            }, f)
+        store.save_scan_state(SEEN_PATH_SEGMENTS, SEEN_SCRIPTS)
         log_message("INFO", f"Saved {len(SEEN_PATH_SEGMENTS)} path segments, {len(SEEN_SCRIPTS)} script hashes")
     except Exception as e:
         log_message("ERROR", f"Failed to save scan state: {e}")
 
 
-def _load_anomaly_profiles(domain):
-    """Load anomaly profiles from previous scans."""
-    if not domain:
-        return AnomalyDetector()
-    path = os.path.join(_STATE_DIR, domain, 'anomaly_profiles.json')
-    if not os.path.exists(path):
+def _load_anomaly_profiles(store):
+    """Load anomaly profiles from the database."""
+    if not store:
         return AnomalyDetector()
     try:
-        with open(path) as f:
-            data = json.load(f)
+        data = store.load_anomaly_profiles()
+        if not data:
+            return AnomalyDetector()
         detector = AnomalyDetector.from_dict(data)
         log_message("INFO", f"Loaded anomaly profiles for {len(detector.profiles)} subdomains")
         return detector
@@ -125,16 +109,12 @@ def _load_anomaly_profiles(domain):
         return AnomalyDetector()
 
 
-def _save_anomaly_profiles(domain, anomaly_detector):
-    """Persist anomaly profiles for cross-scan learning."""
-    if not domain:
+def _save_anomaly_profiles(store, anomaly_detector):
+    """Persist anomaly profiles to the database."""
+    if not store:
         return
-    d = os.path.join(_STATE_DIR, domain)
-    os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, 'anomaly_profiles.json')
     try:
-        with open(path, 'w') as f:
-            json.dump(anomaly_detector.to_dict(), f)
+        store.save_anomaly_profiles(anomaly_detector.to_dict())
         log_message("INFO", f"Saved anomaly profiles for {len(anomaly_detector.profiles)} subdomains")
     except Exception as e:
         log_message("ERROR", f"Failed to save anomaly profiles: {e}")
@@ -702,12 +682,12 @@ async def cc_producer(url_queue, domain_queue, hosts, executor):
 
 # --- Pipeline Orchestrator ---
 
-async def run_pipeline(args, client, initial_urls):
+async def run_pipeline(args, client, initial_urls, store=None):
     """Set up queues, workers, and producers; run until all work is done."""
     global _SCAN_DOMAIN
     scan_domain = _get_scan_domain(args, initial_urls)
     _SCAN_DOMAIN = scan_domain
-    _load_scan_state(scan_domain, rescan=getattr(args, 'rescan', False))
+    _load_scan_state(store, rescan=getattr(args, 'rescan', False))
 
     domain_queue = asyncio.Queue(maxsize=100)
     url_queue = HostBalancedQueue()  # balances across hosts at dequeue time
@@ -718,7 +698,7 @@ async def run_pipeline(args, client, initial_urls):
     )
 
     # Analysis systems
-    anomaly_detector = _load_anomaly_profiles(scan_domain)
+    anomaly_detector = _load_anomaly_profiles(store)
 
     num_domain_workers = 5
     num_crawl_workers = args.concurrency
@@ -768,7 +748,7 @@ async def run_pipeline(args, client, initial_urls):
         try:
             domain = args.ct
             loop = asyncio.get_event_loop()
-            state = await loop.run_in_executor(executor, ct_load_state, domain)
+            state = store.load_ct_state() if store else {'scanned_subdomains': [], 'fetched_months': [], 'related_domains': []}
 
             if state['related_domains']:
                 log_message("INFO", f"Known related domains: "
@@ -790,7 +770,7 @@ async def run_pipeline(args, client, initial_urls):
             while True:
                 log_message("INFO", f"CT: fetching next month for {domain}...")
                 new_subs, new_related, exhausted = await loop.run_in_executor(
-                    executor, ct_fetch_next_month, domain, state,
+                    executor, ct_fetch_next_month, domain, state, store,
                 )
 
                 if exhausted:
@@ -813,9 +793,11 @@ async def run_pipeline(args, client, initial_urls):
                         set(state['scanned_subdomains']) | new_subs
                     )
 
-                await loop.run_in_executor(executor, ct_save_state, state, domain)
+                if store:
+                    store.save_ct_state(state)
 
-            await loop.run_in_executor(executor, ct_save_state, state, domain)
+            if store:
+                store.save_ct_state(state)
             log_message("INFO", f"CT complete: {len(state['scanned_subdomains'])} subdomains total")
         finally:
             ct_done.set()
@@ -893,7 +875,7 @@ async def run_pipeline(args, client, initial_urls):
             if anomaly_findings:
                 log_message("INFO", f"Anomaly: {len(anomaly_findings)} findings")
             # Periodic save — interrupted scans don't lose path segment data
-            _save_scan_state(scan_domain)
+            _save_scan_state(store)
 
     flusher_task = asyncio.create_task(findings_flusher())
 
@@ -932,15 +914,20 @@ async def run_pipeline(args, client, initial_urls):
 
     anomaly_detector.update_profiles()
     executor.shutdown(wait=False)
-    _save_scan_state(scan_domain)
-    _save_anomaly_profiles(scan_domain, anomaly_detector)
-
+    _save_scan_state(store)
+    _save_anomaly_profiles(store, anomaly_detector)
 
 # --- Main ---
 
 async def main(args):
-    """Main execution function — sets up and runs the async pipeline."""
+    """Run a single scan cycle.
+
+    Always initializes a FindingsStore for the target domain. Findings are
+    persisted to SQLite. No stdout output.
+    """
     import analysis
+    from store import FindingsStore
+
     output.ARGS = args
     analysis.ARGS = args
 
@@ -960,6 +947,16 @@ async def main(args):
     elif args._input_type == 'domain':
         initial_urls = [f'https://{args.input}/']
 
+    # Initialize findings store — always active
+    global _SCAN_STORE
+    scan_domain = _get_scan_domain(args, initial_urls)
+    store = None
+    if scan_domain:
+        store = FindingsStore(scan_domain)
+        _SCAN_STORE = store
+        output.set_store(store)
+        session_id = store.start_session()
+
     # Client configuration
     headers = {'User-Agent': Config.USER_AGENT}
     if args.header:
@@ -975,18 +972,53 @@ async def main(args):
         max_keepalive_connections=args.concurrency,
     )
 
-    async with httpx.AsyncClient(
-        http2=True, limits=limits,
-        follow_redirects=True, verify=True, headers=headers,
-    ) as client:
-        await run_pipeline(args, client, initial_urls)
+    try:
+        async with httpx.AsyncClient(
+            http2=True, limits=limits,
+            follow_redirects=True, verify=True, headers=headers,
+        ) as client:
+            await run_pipeline(args, client, initial_urls, store=store)
+    finally:
+        # Close store and end session
+        if store:
+            total = store.get_total_count()
+            store.end_session(session_id, total)
+            store.close()
 
-    log_message("INFO", "Scan finished.")
+    log_message("INFO", "Scan cycle finished.")
+
+
+async def _scan_loop(args):
+    """Continuous scanning loop.
+
+    Runs the scan pipeline, sleeps, then re-scans with fresh state.
+    Each cycle picks up new subdomains, new URLs, and detects changes.
+    """
+    interval = 3600  # 1 hour between scan cycles
+
+    cycle = 0
+    while True:
+        cycle += 1
+        print(f"[*] Scan cycle {cycle} starting", file=sys.stderr, flush=True)
+
+        # Reset per-scan in-memory state for fresh crawl
+        CHECKED_URLS.clear()
+        DISCOVERED_URLS.clear()
+        DEAD_DOMAINS.clear()
+        SEEN_PATH_KEYS.clear()
+        _CHECKED_HEADER_HOSTS.clear()
+        # Keep SEEN_SCRIPTS and SEEN_PATH_SEGMENTS — they persist across cycles
+
+        await main(args)
+
+        print(f"[*] Scan cycle {cycle} done. Sleeping {interval}s...",
+              file=sys.stderr, flush=True)
+        await asyncio.sleep(interval)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description="JSBot — Opinionated JavaScript security scanner. Give it a domain, it does the rest.",
+        description="JSBot — Continuous JavaScript security scanner.",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument('input', nargs='?', default=None,
@@ -1002,7 +1034,7 @@ if __name__ == '__main__':
     parser.add_argument('-s', '--save', action='store_true',
                         help="Save unique JS files to disk (SHA256-named).")
     parser.add_argument('--rescan', action='store_true',
-                        help="Re-analyze all scripts (ignore previously analyzed hashes). Use after changing detection logic.")
+                        help="Re-analyze all scripts (ignore previously analyzed hashes).")
 
     if len(sys.argv) == 1 and sys.stdin.isatty():
         parser.print_help(sys.stderr)
@@ -1031,10 +1063,19 @@ if __name__ == '__main__':
     # CT discovery: automatic for domain input
     args.ct = args.input if args._input_type == 'domain' else None
 
+    # Register PID in database
+    scan_domain = args.input if args._input_type == 'domain' else None
+    if scan_domain:
+        from store import FindingsStore
+        _pid_store = FindingsStore(scan_domain)
+        _pid_store.save_daemon(os.getpid())
+        _pid_store.close()
+
     try:
-        asyncio.run(main(args))
+        asyncio.run(_scan_loop(args))
     except KeyboardInterrupt:
         # Save accumulated path segments so next run benefits from this session's work
-        _save_scan_state(_SCAN_DOMAIN)
+        _save_scan_state(_SCAN_STORE)
         print("\n[*] Scan interrupted. State saved.", file=sys.stderr)
         sys.exit(0)
+

@@ -16,54 +16,6 @@ import psycopg2
 
 # --- Certificate Transparency Discovery ---
 CT_CONN_PARAMS = dict(host='crt.sh', port=5432, user='guest', dbname='certwatch', connect_timeout=15)
-CT_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.ct_cache')
-
-
-def ct_cache_path(domain, month_key):
-    """Return cache file path for a domain + month (YYYY-MM)."""
-    d = os.path.join(CT_CACHE_DIR, domain)
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, f'{month_key}.json')
-
-
-def ct_state_path(domain):
-    """Return state file path for a domain."""
-    d = os.path.join(CT_CACHE_DIR, domain)
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, 'state.json')
-
-
-def ct_load_state(domain):
-    """Load CT scan state: which subdomains have been scanned, which months fetched."""
-    path = ct_state_path(domain)
-    if not os.path.exists(path):
-        return {'scanned_subdomains': [], 'fetched_months': [], 'related_domains': []}
-    with open(path) as f:
-        return json.load(f)
-
-
-def ct_save_state(state, domain):
-    """Save CT scan state."""
-    path = ct_state_path(domain)
-    with open(path, 'w') as f:
-        json.dump(state, f)
-
-
-def ct_load_cache(domain, month_key):
-    """Load cached CT results for a month. Returns (subdomains, related) or None."""
-    path = ct_cache_path(domain, month_key)
-    if not os.path.exists(path):
-        return None
-    with open(path) as f:
-        data = json.load(f)
-    return set(data['subdomains']), set(data['related'])
-
-
-def ct_save_cache(domain, month_key, subdomains, related):
-    """Save CT results to cache."""
-    path = ct_cache_path(domain, month_key)
-    with open(path, 'w') as f:
-        json.dump({'subdomains': sorted(subdomains), 'related': sorted(related)}, f)
 
 
 def ct_query_month(domain, yr_start, yr_end, limit=5000, retries=2):
@@ -136,12 +88,17 @@ def ct_month_sequence():
             y -= 1
 
 
-def ct_fetch_next_month(domain, state):
+def ct_fetch_next_month(domain, state, store=None):
     """Fetch the next unfetched month from CT logs.
 
     Returns (new_subdomains set, new_related set, exhausted bool).
     On failure, skips to other months first. Failed months are retried
     at the end of the run, not persisted as fetched.
+
+    Args:
+        domain: Domain to query.
+        state: Mutable state dict (fetched_months, scanned_subdomains, etc.).
+        store: FindingsStore instance for CT cache persistence.
     """
     fetched = set(state['fetched_months'])
     failed = set(state.get('failed_months', []))
@@ -153,8 +110,8 @@ def ct_fetch_next_month(domain, state):
         if month_key in fetched or month_key in failed:
             continue
 
-        # Check cache first (from previous ct_test.py runs)
-        cached = ct_load_cache(domain, month_key)
+        # Check cache first (from previous runs)
+        cached = store.load_ct_cache(month_key) if store else None
         if cached:
             subs, related = cached
             state['fetched_months'].append(month_key)
@@ -179,7 +136,8 @@ def ct_fetch_next_month(domain, state):
 
         consecutive_failures = 0
         subs, related = ct_extract_domains(rows, domain)
-        ct_save_cache(domain, month_key, subs, related)
+        if store:
+            store.save_ct_cache(month_key, subs, related)
         state['fetched_months'].append(month_key)
         new_subs = subs - known_subs
         new_related = set(related) - set(state['related_domains'])
@@ -202,7 +160,8 @@ def ct_fetch_next_month(domain, state):
             failed.discard(month_key)
             state['failed_months'] = sorted(failed)
             subs, related = ct_extract_domains(rows, domain)
-            ct_save_cache(domain, month_key, subs, related)
+            if store:
+                store.save_ct_cache(month_key, subs, related)
             state['fetched_months'].append(month_key)
             new_subs = subs - known_subs
             new_related = set(related) - set(state['related_domains'])

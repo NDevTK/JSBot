@@ -4,3 +4,5 @@ nul
 *.log
 *.jsonl
 *.txt
+*.db
+*.pid

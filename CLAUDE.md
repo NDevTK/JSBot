@@ -2,20 +2,36 @@
 
 ## What this is
 
-JSBot is a continuous JavaScript security scanner. It finds client-side vulnerabilities (DOM XSS, open redirects, eval injection, postMessage issues) by tracking data flow from user-controlled sources to dangerous sinks using tree-sitter AST analysis. It runs against live targets, persists state across sessions, and prioritizes unexplored content.
+JSBot is a continuous JavaScript security scanner. It runs in the background, finds client-side vulnerabilities (DOM XSS, open redirects, eval injection, postMessage issues) by tracking data flow from user-controlled sources to dangerous sinks using tree-sitter AST analysis. Findings persist to a SQLite database. Review them with CLI commands when you're ready.
 
 ## Architecture
 
 ```
-scan.py          Pipeline orchestrator — crawling, queuing, URL scoring, state persistence
+cli.py           Unified CLI — start/stop/status/findings/domains/clear
+scan.py          Pipeline orchestrator — crawling, queuing, URL scoring, continuous loop
 analysis.py      Core security analysis — taint flow, postMessage, cross-file taint, endpoints
 patterns.py      Source/sink/secret pattern definitions (SOURCES, SINKS, TAINT_SINKS)
 anomaly.py       Per-subdomain change detection across scans
 scoring.py       URL novelty scoring, library detection, CVE lookup (hardcoded + OSV.dev)
 discovery.py     CT logs, Common Crawl, robots.txt, sitemaps, spidering
+store.py         SQLite findings database — always active, handles dedup and queries
+daemon.py        Background process management — PID tracking, start/stop/status
 sourcemaps.py    Source map fetching and extraction
-output.py        JSONL output formatting
+output.py        Finding persistence (→ store only, no stdout)
 ```
+
+## CLI Commands
+
+```bash
+python cli.py start <domain>          # Start background scan — runs continuously
+python cli.py stop [domain]           # Stop scanner (no domain = stop all)
+python cli.py status                  # Running scans + finding counts
+python cli.py findings [domain]       # Review findings (--severity, --type, --json)
+python cli.py domains                 # List all scanned domains
+python cli.py clear <domain>          # Delete all state for a domain
+```
+
+Run as `python cli.py <command>`.
 
 ## Core principle: AST over regex
 
@@ -25,13 +41,11 @@ This is a high-signal security tool. Every detection must be grounded in actual 
 
 **Avoid line-level regex** for security analysis. Regex can't scope variables to functions, can't distinguish LHS from RHS in assignments, can't tell if a source is flowing into a sink or just happens to be on the same line. Every time regex was used for detection, it produced false positives that had to be fixed with AST.
 
-**No hardcoded exclusion rules.** Don't skip analysis based on filenames, library names, or URL patterns. If the analysis produces false positives on jQuery or Angular, the analysis logic is wrong — fix the logic so it's correct for ALL code, not just non-library code. The taint tracker should be structurally sound enough that it produces correct results on any JavaScript, regardless of whether it's a library, minified, or hand-written.
+**No hardcoded exclusion rules.** Don't skip analysis based on filenames, library names, or URL patterns. If the analysis produces false positives on jQuery or Angular, the analysis logic is wrong — fix the logic so it's correct for ALL code, not just non-library code.
 
-Examples of what went wrong with non-AST approaches and how they were fixed:
-- **Line-level direct mode** checked if a source pattern appeared anywhere on a sink line. `console.log(location.href); el.src = "/safe.png"` false-positived. Fixed by using AST to extract only the value flowing into the specific sink expression.
-- **Flat-scope taint tracking** walked the entire file as one scope. In minified jQuery, `var c = location.hash` in function A tainted every other `c` in function B/C/D. Fixed by scoping taint to function boundaries via AST.
-- **Self-assignment** `location.href = location.href` was flagged as an open redirect. Fixed by comparing AST LHS and RHS — if they're identical, no data flows.
-- **Library skipping** was proposed as a fix for jQuery false positives. Rejected — the real fix was function-scoped taint tracking, which is correct for all code.
+## State storage
+
+All state lives in a single `jsbot.db` (SQLite, WAL mode) in the project root. All tables are domain-scoped. Tables: findings, scan_sessions, scan_state (path segments + script hashes), anomaly_profiles (per-subdomain baselines), ct_state (fetched months), ct_cache (per-month subdomain results), daemons (running PIDs), daemon_logs (recent log entries). No filesystem state files. The store initializes automatically when a scan starts. Deduplication happens at the store level by finding key.
 
 ## Taint tracking design
 
@@ -44,6 +58,7 @@ Taint flows through `_collect_taint_per_scope` in analysis.py:
 5. Processing is source-order (reversed children on stack) so taint chains work (`a = source; b = a; sink(b)`)
 
 Direct mode (source directly in sink expression, no intermediate variable) uses `_extract_sink_value`:
+
 - Finds the specific AST node matching the sink at that line
 - Extracts only the value portion (RHS for assignments, arguments for calls)
 - Self-assignment (LHS == RHS) returns no value — structural no-op detection
@@ -55,19 +70,26 @@ Direct mode (source directly in sink expression, no intermediate variable) uses 
 - **TAINT_SINKS** — patterns too broad for anomaly detection but valid when tainted data reaches them (setTimeout, window.open, .src/.href assignment, fetch). Only checked during taint analysis, not anomaly scoring.
 - **INTERESTING_STRING_PATTERNS** — recon extraction (internal IPs, cloud URLs, JWTs, debug flags)
 
-When adding new sources or sinks: add to the appropriate dict in patterns.py. Prefer SINKS for patterns specific enough to indicate attack surface on their own. Use TAINT_SINKS for patterns that are common in benign code but dangerous when receiving tainted input.
+## Background scanning
 
-## State persistence
+`python cli.py start` launches scan.py as a detached background process:
 
-All state lives in `.ct_cache/{domain}/`. The scanner is designed to run repeatedly — each run builds on previous state. `--rescan` forces re-analysis when detection logic changes. State saves on exit, on Ctrl+C, and periodically during scans.
+- PID tracked in `daemons` table of `jsbot.db`
+- Log entries stored in `daemon_logs` table
+- Scan runs in a continuous loop — after each full cycle, sleeps 1 hour, then re-scans
+- In-memory crawl state resets between cycles; SEEN_SCRIPTS and path segments persist
+- Clean shutdown via `python cli.py stop` (sends SIGTERM/taskkill)
+
+There is no foreground mode. The scanner always runs in the background.
 
 ## Testing changes
 
-Run against Google's Firing Range to validate detection accuracy:
+Start a scan and review findings:
+
 ```
-python scan.py "https://public-firing-range.appspot.com" --rescan > results.jsonl
+python cli.py start public-firing-range.appspot.com
+python cli.py findings public-firing-range.appspot.com
 ```
-Check for false positives by examining findings on known-safe patterns. Check for false negatives by comparing against Firing Range's known test cases. The scanner runs continuously — don't wait for it to finish, interrupt and analyze what you have.
 
 ## What not to do
 
@@ -76,3 +98,5 @@ Check for false positives by examining findings on known-safe patterns. Check fo
 - Don't hardcode URL or filename exclusions. The scoring system handles prioritization.
 - Don't add severity based on guesses about what a pattern "usually means." Severity should reflect actual exploitability based on the source-to-sink flow.
 - Don't create per-API-name special cases. Write general rules that handle all APIs correctly through structural analysis.
+- Don't make the database optional. It is always on.
+- Don't add foreground or one-shot modes. The scanner runs in the background only.
