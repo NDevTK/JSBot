@@ -560,11 +560,15 @@ class ASTAnalyzer:
         return results
 
     def _analyze_msg_handler(self, handler_node, context_node, tree, source_bytes):
-        """Analyze a message handler for origin checks and sink usage."""
-        handler_text = self.get_node_text(handler_node, source_bytes)
-        has_origin_check = bool(re.search(
-            r'\b(?:event|e|evt|msg|ev)\.origin\b', handler_text
-        ))
+        """Analyze a message handler for origin checks and sink usage.
+
+        Origin check classification (AST-based, no regex):
+          'valid'                 — .origin compared against a real string/variable
+          'unsafe_null'           — .origin compared against the string 'null'
+          'unsafe_source_origin'  — uses .source.origin (spoofable, not the real origin)
+          'none'                  — no .origin reference found at all
+        """
+        origin_check = self._classify_origin_check(handler_node, source_bytes)
         sinks = []
         if handler_node.type in ('arrow_function', 'function_expression', 'function'):
             sinks = self.find_sinks_in_range(
@@ -573,9 +577,157 @@ class ASTAnalyzer:
             )
         return {
             'line': context_node.start_point[0] + 1,
-            'has_origin_check': has_origin_check,
+            'origin_check': origin_check,
             'sinks': sinks,
         }
+
+    def _classify_origin_check(self, handler_node, source_bytes):
+        """Walk handler AST to classify origin validation.
+
+        Looks for binary expressions (===, ==, !==, !=) or method calls
+        (.includes, .match, .startsWith, .indexOf) involving '.origin'.
+        Then checks if the comparison target is 'null' string or uses
+        .source.origin (both unsafe).
+        """
+        # Resolve the handler body — follow identifier references if needed
+        body = handler_node
+        if handler_node.type == 'identifier':
+            # Handler is a named function reference — scan entire tree
+            body = handler_node  # fall through, we'll find nothing but that's OK
+            # Try to find the function declaration/expression
+            name = self.get_node_text(handler_node, source_bytes)
+            root = handler_node
+            while root.parent:
+                root = root.parent
+            resolved = self._find_function_by_name(root, name, source_bytes)
+            if resolved:
+                body = resolved
+
+        found_origin_ref = False
+        result = 'none'
+
+        stack = [body]
+        while stack:
+            node = stack.pop()
+
+            # Check for .source.origin pattern (unsafe)
+            if node.type == 'member_expression':
+                chain = self._get_member_chain(node, source_bytes)
+                if chain and chain.endswith('.source.origin'):
+                    return 'unsafe_source_origin'
+
+            # Check binary comparisons: x.origin === 'something'
+            if node.type == 'binary_expression':
+                op = node.child_by_field_name('operator')
+                if op and self.get_node_text(op, source_bytes) in ('===', '==', '!==', '!='):
+                    left = node.child_by_field_name('left')
+                    right = node.child_by_field_name('right')
+                    origin_side, other_side = None, None
+
+                    if left and self._is_origin_access(left, source_bytes):
+                        origin_side, other_side = left, right
+                    elif right and self._is_origin_access(right, source_bytes):
+                        origin_side, other_side = right, left
+
+                    if origin_side and other_side:
+                        found_origin_ref = True
+                        # Check if comparing to 'null' string
+                        other_text = self.get_node_text(other_side, source_bytes).strip()
+                        if other_text in ("'null'", '"null"', '`null`'):
+                            result = 'unsafe_null'
+                        elif result != 'unsafe_null':
+                            # Real comparison against a string/variable
+                            result = 'valid'
+
+            # Check method calls: allowedOrigins.includes(e.origin)
+            # or e.origin.startsWith(...)
+            if node.type == 'call_expression':
+                fn = node.child_by_field_name('function')
+                if fn and fn.type == 'member_expression':
+                    obj = fn.child_by_field_name('object')
+                    prop = fn.child_by_field_name('property')
+                    if obj and prop:
+                        prop_name = self.get_node_text(prop, source_bytes)
+                        if prop_name in ('includes', 'indexOf', 'match',
+                                         'startsWith', 'endsWith'):
+                            # Check if .origin is the object or an argument
+                            if self._is_origin_access(obj, source_bytes):
+                                found_origin_ref = True
+                                # e.origin.match(...) — check arguments
+                                # This is a comparison, treat as valid unless
+                                # comparing to 'null'
+                                if result != 'unsafe_null':
+                                    result = 'valid'
+                            else:
+                                # Check arguments for .origin
+                                args = node.child_by_field_name('arguments')
+                                if args:
+                                    for arg in args.children:
+                                        if self._is_origin_access(arg, source_bytes):
+                                            found_origin_ref = True
+                                            if result != 'unsafe_null':
+                                                result = 'valid'
+
+            # Check if/switch on .origin (even without comparison)
+            if node.type in ('if_statement', 'switch_statement'):
+                cond = node.child_by_field_name('condition')
+                if cond and self._subtree_has_origin(cond, source_bytes):
+                    found_origin_ref = True
+                    if result == 'none':
+                        result = 'valid'
+
+            stack.extend(node.children)
+
+        return result
+
+    def _is_origin_access(self, node, source_bytes):
+        """Check if node is a .origin member access (e.g. event.origin)."""
+        if node.type != 'member_expression':
+            return False
+        prop = node.child_by_field_name('property')
+        if not prop:
+            return False
+        prop_name = self.get_node_text(prop, source_bytes)
+        if prop_name != 'origin':
+            return False
+        # Make sure it's NOT .source.origin
+        obj = node.child_by_field_name('object')
+        if obj and obj.type == 'member_expression':
+            obj_prop = obj.child_by_field_name('property')
+            if obj_prop and self.get_node_text(obj_prop, source_bytes) == 'source':
+                return False  # This is .source.origin — handled separately
+        return True
+
+    def _subtree_has_origin(self, node, source_bytes):
+        """Check if any node in the subtree is a .origin access."""
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if self._is_origin_access(n, source_bytes):
+                return True
+            stack.extend(n.children)
+        return False
+
+    def _find_function_by_name(self, root, name, source_bytes):
+        """Find a function declaration or variable-assigned function by name."""
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            # function foo() { ... }
+            if node.type == 'function_declaration':
+                fn_name = node.child_by_field_name('name')
+                if fn_name and self.get_node_text(fn_name, source_bytes) == name:
+                    return node
+            # const foo = function() { ... }  or  const foo = (...) => { ... }
+            if node.type == 'variable_declarator':
+                decl_name = node.child_by_field_name('name')
+                value = node.child_by_field_name('value')
+                if (decl_name and self.get_node_text(decl_name, source_bytes) == name
+                        and value and value.type in ('function_expression',
+                                                      'arrow_function')):
+                    return value
+            stack.extend(node.children)
+        return None
 
 
 # Singleton AST analyzer (created on first use)
@@ -831,7 +983,7 @@ def _extract_interesting_strings(script_content, script_hash, url, script_url):
 
 
 def _check_postmessage_handlers(analyzer, tree, source_bytes, script_hash, url, script_url):
-    """Check for postMessage handlers with missing origin validation. Emits findings."""
+    """Check for postMessage handlers with missing or unsafe origin validation."""
     handlers = analyzer.find_postmessage_handlers(tree, source_bytes)
     for handler in handlers:
         finding_key = f"postmsg:{script_hash}:{handler['line']}"
@@ -839,17 +991,24 @@ def _check_postmessage_handlers(analyzer, tree, source_bytes, script_hash, url, 
             continue
         SEEN_FINDINGS.add(finding_key)
 
-        if not handler['has_origin_check']:
-            severity = 7
-            issue = 'no_origin_check'
-            if handler['sinks']:
-                severity = 9
-                issue = 'no_origin_check_with_sink'
-        elif handler['sinks']:
+        origin_check = handler['origin_check']
+        has_sinks = bool(handler['sinks'])
+
+        # Classify the issue
+        if origin_check == 'none':
+            severity = 9 if has_sinks else 7
+            issue = 'no_origin_check_with_sink' if has_sinks else 'no_origin_check'
+        elif origin_check == 'unsafe_null':
+            severity = 9 if has_sinks else 7
+            issue = 'unsafe_null_origin_check'
+        elif origin_check == 'unsafe_source_origin':
+            severity = 9 if has_sinks else 7
+            issue = 'unsafe_source_origin_check'
+        elif origin_check == 'valid' and has_sinks:
             severity = 6
             issue = 'data_to_sink'
         else:
-            continue  # Origin check present, no sinks — not interesting
+            continue  # Valid origin check, no sinks — not interesting
 
         finding = {
             'finding_type': 'postmessage_issue',
@@ -857,12 +1016,13 @@ def _check_postmessage_handlers(analyzer, tree, source_bytes, script_hash, url, 
             'script_url': script_url or 'inline',
             'script_hash': script_hash,
             'issue': issue,
+            'origin_check': origin_check,
             'handler_line': handler['line'],
             'severity': severity,
             'confidence': 'medium',
             'analysis_method': 'ast',
         }
-        if handler['sinks']:
+        if has_sinks:
             finding['sink_categories'] = list({s['category'] for s in handler['sinks']})
         log_message("FINDING", finding)
 
