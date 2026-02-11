@@ -146,6 +146,38 @@ var handler = location.hash.slice(1);
 document.getElementById("t20").setAttribute("onclick", handler);
 </script>
 
+<!-- T21: queryParams as source (Angular-style URL parameters) -->
+<script>
+var route = { snapshot: { queryParams: { q: "test" } } };
+var q = route.snapshot.queryParams.q;
+document.getElementById("t21").innerHTML = q;
+</script>
+
+<!-- T22: this.X property taint within same scope -->
+<script>
+class Widget22 {
+    init() {
+        this.userInput = location.hash.slice(1);
+        document.getElementById("t22").innerHTML = this.userInput;
+    }
+}
+new Widget22().init();
+</script>
+
+<!-- T23: this.X property taint through function call -->
+<script>
+class Widget23 {
+    process() {
+        this.data = document.referrer;
+        this.render(this.data);
+    }
+    render(html) {
+        eval(html);
+    }
+}
+new Widget23().process();
+</script>
+
 <!-- ================================================================
      CROSS-FILE TAINT — globals-writer.js sets window.X from source,
      globals-reader.js reads window.X into sink
@@ -173,6 +205,7 @@ document.getElementById("t20").setAttribute("onclick", handler);
 <div id="t08"></div><div id="t09"></div><div id="t10"></div>
 <img id="t12img"><div id="t13"></div><div id="t14"></div>
 <div id="t17"></div><div id="t20"></div>
+<div id="t21"></div><div id="t22"></div>
 <div id="output"></div>
 </body>
 </html>

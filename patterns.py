@@ -13,13 +13,22 @@ SOURCES = {
     "document.URLUnencoded": r"""\bdocument\.URLUnencoded\b""",
     "document.referrer":    r"""\bdocument\.referrer\b""",
     "window.name":          r"""\b(?:window|top|self|parent|frames)\.name\b""",
-    "postMessage data":     r"""\b(?:event|e|evt|msg)\.data\b""",
+    "postMessage data":     r"""\bevent\.data\b""",
     "URLSearchParams":      r"""\bURLSearchParams\b""",
     "getItem":              r"""\b(?:localStorage|sessionStorage)\.getItem\b""",
     "storage_bracket":      r"""\b(?:localStorage|sessionStorage)\s*\[""",
     "storage_property":     r"""\b(?:localStorage|sessionStorage)\.(?!getItem\b|setItem\b|removeItem\b|clear\b|key\b|length\b)\w+""",
     "cookie_read":          r"""\bdocument\.cookie\b(?!\s*=)""",
     "input.value":          r"""\b(?:target|currentTarget|srcElement)\.value\b""",
+    "queryParams":          r"""\.queryParams\b""",
+    "queryParamMap":        r"""\.queryParamMap\b""",
+}
+
+# Context-dependent sources: only matched inside message event handler scopes.
+# Short parameter names like `e` are reused everywhere in minified code;
+# matching `e.data` globally produces false taint in jQuery, Angular, etc.
+CONTEXT_SOURCES = {
+    "postMessage data": r"""\b(?:e|evt|msg)\.data\b""",
 }
 
 SINKS = {

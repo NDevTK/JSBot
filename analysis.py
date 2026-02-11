@@ -1,4 +1,5 @@
 """AST parsing, cross-file taint analysis, script safety checks."""
+import bisect
 import re
 import asyncio
 import httpx
@@ -6,7 +7,7 @@ import threading
 from hashlib import sha256
 from urllib.parse import urljoin, urlparse
 
-from patterns import SOURCES, SINKS, TAINT_SINKS, JS_PATH_FINDER, ENDPOINT_PATTERNS, INTERESTING_STRING_PATTERNS
+from patterns import SOURCES, CONTEXT_SOURCES, SINKS, TAINT_SINKS, JS_PATH_FINDER, ENDPOINT_PATTERNS, INTERESTING_STRING_PATTERNS
 from output import log_message, SEEN_FINDINGS, SCRIPT_METADATA
 from scoring import looks_minified, _is_known_library, check_known_cves
 from sourcemaps import try_fetch_sourcemap, get_original_source
@@ -378,14 +379,99 @@ class ASTAnalyzer:
                 return False
         return True
 
-    def _check_tainted(self, text, tainted_vars):
+    def _get_shallow_text(self, node, source_bytes):
+        """Get the text of a node, excluding nested function/scope bodies.
+
+        Prevents taint leaking from deeply-nested function bodies into the
+        containing expression.  `var x = { fn: function() { location.hash } }`
+        returns `var x = { fn:  }` — the function body is elided.
+
+        Uses pre-computed _scope_byte_ranges (set by find_taint_flows) for
+        O(log N) binary-search overlap detection instead of walking the subtree.
+        """
+        if node.type in self._SCOPE_TYPES:
+            return ''
+        # Fast path: single-line expressions almost never contain scopes
+        if node.start_point[0] == node.end_point[0]:
+            return source_bytes[node.start_byte:node.end_byte].decode(
+                'utf-8', errors='replace',
+            )
+        # Multi-line: find nested scopes to elide
+        all_ranges = getattr(self, '_scope_byte_ranges', None)
+        if all_ranges is not None:
+            # Binary search: scopes starting within [node.start_byte, node.end_byte)
+            lo = bisect.bisect_left(all_ranges, (node.start_byte,))
+            hi = bisect.bisect_left(all_ranges, (node.end_byte,))
+            overlapping = [
+                r for r in all_ranges[lo:hi]
+                if r[0] >= node.start_byte
+            ]
+            if not overlapping:
+                return source_bytes[node.start_byte:node.end_byte].decode(
+                    'utf-8', errors='replace',
+                )
+            parts = []
+            pos = node.start_byte
+            for sb, eb in overlapping:
+                if sb > pos:
+                    parts.append(
+                        source_bytes[pos:sb].decode('utf-8', errors='replace')
+                    )
+                pos = max(pos, eb)
+            if node.end_byte > pos:
+                parts.append(
+                    source_bytes[pos:node.end_byte].decode(
+                        'utf-8', errors='replace',
+                    )
+                )
+            return ''.join(parts)
+
+        # Fallback: walk subtree (used when pre-computed ranges unavailable)
+        scope_ranges = []
+        stack = list(node.children)
+        while stack:
+            child = stack.pop()
+            if child.type in self._SCOPE_TYPES:
+                scope_ranges.append((child.start_byte, child.end_byte))
+            else:
+                stack.extend(child.children)
+        if not scope_ranges:
+            return source_bytes[node.start_byte:node.end_byte].decode(
+                'utf-8', errors='replace',
+            )
+        scope_ranges.sort()
+        parts = []
+        pos = node.start_byte
+        for sb, eb in scope_ranges:
+            if sb > pos:
+                parts.append(
+                    source_bytes[pos:sb].decode('utf-8', errors='replace')
+                )
+            pos = eb
+        if node.end_byte > pos:
+            parts.append(
+                source_bytes[pos:node.end_byte].decode(
+                    'utf-8', errors='replace',
+                )
+            )
+        return ''.join(parts)
+
+    def _check_tainted(self, text, tainted_vars, is_message_handler=False):
         """Check if text contains a source or references a tainted variable.
 
         Returns the source name if tainted, None otherwise.
+
+        is_message_handler: when True, also match CONTEXT_SOURCES (e.data,
+        evt.data, msg.data) — these are only valid inside message event
+        handler scopes to avoid false taint from minified parameter names.
         """
         for source_name, source_pattern in SOURCES.items():
             if re.search(source_pattern, text):
                 return source_name
+        if is_message_handler:
+            for source_name, source_pattern in CONTEXT_SOURCES.items():
+                if re.search(source_pattern, text):
+                    return source_name
         for var_name, source_name in tainted_vars.items():
             if re.search(r'\b' + re.escape(var_name) + r'\b', text):
                 return source_name
@@ -396,6 +482,68 @@ class ASTAnalyzer:
         'generator_function_declaration', 'generator_function',
         'method_definition',
     })
+
+    def _precompute_scope_ranges(self, root_node):
+        """Pre-compute sorted byte ranges of all scope-type nodes in the tree.
+
+        Returns a sorted list of (start_byte, end_byte) tuples.
+        Used by _get_shallow_text for O(log N) scope overlap detection.
+        """
+        ranges = []
+        stack = [root_node]
+        while stack:
+            node = stack.pop()
+            if node.type in self._SCOPE_TYPES:
+                ranges.append((node.start_byte, node.end_byte))
+            stack.extend(node.children)
+        ranges.sort()
+        return ranges
+
+    def _build_function_map(self, root_node, source_bytes):
+        """Build a name -> function-node map for efficient callee lookup.
+
+        Covers function declarations, variable-assigned functions/arrows,
+        object property functions, and class methods.
+        First match per name wins (DFS order).
+        """
+        fn_map = {}
+        stack = [root_node]
+        while stack:
+            node = stack.pop()
+            if node.type == 'function_declaration':
+                fn_name = node.child_by_field_name('name')
+                if fn_name:
+                    name = self.get_node_text(fn_name, source_bytes)
+                    if name not in fn_map:
+                        fn_map[name] = node
+            elif node.type == 'variable_declarator':
+                decl_name = node.child_by_field_name('name')
+                value = node.child_by_field_name('value')
+                if (decl_name and value
+                        and value.type in ('function_expression',
+                                           'arrow_function')):
+                    name = self.get_node_text(decl_name, source_bytes)
+                    if name not in fn_map:
+                        fn_map[name] = value
+            elif node.type == 'pair':
+                key = node.child_by_field_name('key')
+                value = node.child_by_field_name('value')
+                if (key and value
+                        and value.type in ('function_expression',
+                                           'arrow_function')):
+                    name = self.get_node_text(
+                        key, source_bytes,
+                    ).strip('\'"')
+                    if name not in fn_map:
+                        fn_map[name] = value
+            elif node.type == 'method_definition':
+                method_name = node.child_by_field_name('name')
+                if method_name:
+                    name = self.get_node_text(method_name, source_bytes)
+                    if name not in fn_map:
+                        fn_map[name] = node
+            stack.extend(node.children)
+        return fn_map
 
     def _analyze_return_taint(self, fn_node, source_bytes):
         """Check if a function returns tainted data. Returns source name or None.
@@ -413,26 +561,45 @@ class ASTAnalyzer:
             if n.type == 'variable_declarator':
                 name_node = n.child_by_field_name('name')
                 value_node = n.child_by_field_name('value')
-                if name_node and value_node and name_node.type == 'identifier':
+                if name_node and name_node.type == 'identifier':
                     var_name = self.get_node_text(name_node, source_bytes)
-                    value_text = self.get_node_text(value_node, source_bytes)
-                    source = self._check_tainted(value_text, tainted)
-                    if source:
-                        tainted[var_name] = source
-                    elif var_name in tainted:
-                        del tainted[var_name]
+                    if value_node is None:
+                        if var_name in tainted:
+                            del tainted[var_name]
+                    elif value_node.type in self._SCOPE_TYPES:
+                        if var_name in tainted:
+                            del tainted[var_name]
+                    else:
+                        value_text = self._get_shallow_text(value_node, source_bytes)
+                        source = self._check_tainted(value_text, tainted)
+                        if source:
+                            tainted[var_name] = source
+                        elif var_name in tainted:
+                            del tainted[var_name]
 
             elif n.type == 'assignment_expression':
                 left = n.child_by_field_name('left')
                 right = n.child_by_field_name('right')
-                if left and right and left.type == 'identifier':
-                    var_name = self.get_node_text(left, source_bytes)
-                    value_text = self.get_node_text(right, source_bytes)
-                    source = self._check_tainted(value_text, tainted)
-                    if source:
-                        tainted[var_name] = source
-                    elif var_name in tainted:
-                        del tainted[var_name]
+                var_name = None
+                if left and right:
+                    if left.type == 'identifier':
+                        var_name = self.get_node_text(left, source_bytes)
+                    elif left.type == 'member_expression':
+                        chain = self._get_member_chain(left, source_bytes)
+                        if (chain and chain.startswith('this.')
+                                and chain.count('.') == 1):
+                            var_name = chain
+                if var_name:
+                    if right.type in self._SCOPE_TYPES:
+                        if var_name in tainted:
+                            del tainted[var_name]
+                    else:
+                        value_text = self._get_shallow_text(right, source_bytes)
+                        source = self._check_tainted(value_text, tainted)
+                        if source:
+                            tainted[var_name] = source
+                        elif var_name in tainted:
+                            del tainted[var_name]
 
             elif n.type == 'return_statement':
                 for child in n.children:
@@ -452,34 +619,61 @@ class ASTAnalyzer:
             return None
         fn_name = self.get_node_text(fn, source_bytes)
 
-        # Walk up to the tree root
-        root = scope_root
-        while root.parent:
-            root = root.parent
-        fn_node = self._find_function_by_name(root, fn_name, source_bytes)
+        # Look up callee: pre-computed map (O(1)) or tree walk (O(N))
+        fn_map = getattr(self, '_fn_map', None)
+        if fn_map is not None:
+            fn_node = fn_map.get(fn_name)
+        else:
+            root = scope_root
+            while root.parent:
+                root = root.parent
+            fn_node = self._find_function_by_name(root, fn_name, source_bytes)
         if not fn_node:
             return None
+
+        # Cache return-taint results: same function → same answer
+        cache = getattr(self, '_return_taint_cache', None)
+        if cache is not None:
+            cache_key = (fn_node.start_byte, fn_node.end_byte)
+            if cache_key in cache:
+                return cache[cache_key]
+            result = self._analyze_return_taint(fn_node, source_bytes)
+            cache[cache_key] = result
+            return result
+
         return self._analyze_return_taint(fn_node, source_bytes)
 
     def _collect_taint_per_scope(self, node, source_bytes, parent_tainted,
-                                 arg_taint=None):
+                                 arg_taint=None, msg_handler_ranges=None):
         """Walk a scope, track taint with proper function boundaries.
 
-        Returns list of (tainted_vars_dict, start_line, end_line) for this scope
-        and all nested scopes. Each scope inherits from parent but local
-        declarations shadow inherited vars.
+        Returns list of (initial_tainted, taint_history, start_line, end_line)
+        for this scope and all nested scopes.  initial_tainted is the inherited
+        state at scope entry; taint_history is a source-ordered list of
+        (line, var_name, source_or_None) events that modify it.
+
+        To find the effective taint at any line, use _taint_at_line().
 
         Two-phase: first build this scope's complete taint map (skipping child
         functions), then recurse into child functions with the finished map.
 
         arg_taint: set of var names pre-tainted as function arguments — these
         survive formal_parameters stripping at the top-level function only.
+        msg_handler_ranges: set of (start_byte, end_byte) for message handler
+        scopes — enables CONTEXT_SOURCES (e.data) matching.
         """
         scopes = []
+        initial = dict(parent_tainted)
         tainted = dict(parent_tainted)
+        taint_history = []
         start_line = node.start_point[0]
         end_line = node.end_point[0]
         child_functions = []  # deferred — recurse after this scope is complete
+
+        is_msg_handler = bool(
+            msg_handler_ranges
+            and (node.start_byte, node.end_byte) in msg_handler_ranges
+        )
 
         # Phase 1: walk this scope, collect taint, defer child functions
         stack = [node]
@@ -493,44 +687,97 @@ class ASTAnalyzer:
             if n.type == 'variable_declarator':
                 name_node = n.child_by_field_name('name')
                 value_node = n.child_by_field_name('value')
-                if name_node and value_node and name_node.type == 'identifier':
+                if name_node and name_node.type == 'identifier':
                     var_name = self.get_node_text(name_node, source_bytes)
                     # Don't let local re-declarations overwrite arg-tainted params
                     if arg_taint and var_name in arg_taint:
                         pass
+                    # Uninitialized declaration (var x;) clears inherited taint
+                    elif value_node is None:
+                        if var_name in tainted:
+                            del tainted[var_name]
+                            taint_history.append((
+                                n.start_point[0], var_name, None,
+                            ))
+                    # Skip function values — their bodies are child scopes,
+                    # not data flowing into the variable.
+                    elif value_node.type in self._SCOPE_TYPES:
+                        if var_name in tainted:
+                            del tainted[var_name]
+                            taint_history.append((
+                                value_node.start_point[0], var_name, None,
+                            ))
                     else:
-                        value_text = self.get_node_text(value_node, source_bytes)
-                        source = self._check_tainted(value_text, tainted)
+                        value_text = self._get_shallow_text(
+                            value_node, source_bytes,
+                        )
+                        source = self._check_tainted(
+                            value_text, tainted, is_msg_handler,
+                        )
                         if not source and value_node.type == 'call_expression':
                             source = self._check_call_return_taint(
                                 value_node, node, source_bytes,
                             )
                         if source:
                             tainted[var_name] = source
+                            taint_history.append((
+                                value_node.start_point[0], var_name, source,
+                            ))
                         elif var_name in tainted:
                             del tainted[var_name]
+                            taint_history.append((
+                                value_node.start_point[0], var_name, None,
+                            ))
 
             elif n.type == 'assignment_expression':
                 left = n.child_by_field_name('left')
                 right = n.child_by_field_name('right')
-                if left and right and left.type == 'identifier':
-                    var_name = self.get_node_text(left, source_bytes)
-                    # Don't let assignments overwrite arg-tainted params
-                    if arg_taint and var_name in arg_taint:
-                        pass
+                # Determine the trackable variable name:
+                # - Simple identifiers: x = ...
+                # - this.X properties: this.foo = ... (within same scope)
+                var_name = None
+                is_arg = False
+                if left and right:
+                    if left.type == 'identifier':
+                        var_name = self.get_node_text(left, source_bytes)
+                        is_arg = bool(arg_taint and var_name in arg_taint)
+                    elif left.type == 'member_expression':
+                        chain = self._get_member_chain(left, source_bytes)
+                        if (chain and chain.startswith('this.')
+                                and chain.count('.') == 1):
+                            var_name = chain
+                if var_name and not is_arg:
+                    # Skip function values — their bodies are child scopes
+                    if right.type in self._SCOPE_TYPES:
+                        if var_name in tainted:
+                            del tainted[var_name]
+                            taint_history.append((
+                                right.start_point[0], var_name, None,
+                            ))
                     else:
-                        value_text = self.get_node_text(right, source_bytes)
-                        source = self._check_tainted(value_text, tainted)
+                        value_text = self._get_shallow_text(
+                            right, source_bytes,
+                        )
+                        source = self._check_tainted(
+                            value_text, tainted, is_msg_handler,
+                        )
                         if not source and right.type == 'call_expression':
                             source = self._check_call_return_taint(
                                 right, node, source_bytes,
                             )
                         if source:
                             tainted[var_name] = source
+                            taint_history.append((
+                                right.start_point[0], var_name, source,
+                            ))
                         elif var_name in tainted:
                             del tainted[var_name]
+                            taint_history.append((
+                                right.start_point[0], var_name, None,
+                            ))
 
             elif n.type == 'formal_parameters':
+                param_line = n.start_point[0]
                 for child in n.children:
                     if child.type == 'identifier':
                         param_name = self.get_node_text(child, source_bytes)
@@ -538,17 +785,121 @@ class ASTAnalyzer:
                             continue  # keep argument-tainted params
                         if param_name in tainted:
                             del tainted[param_name]
+                            taint_history.append((param_line, param_name, None))
                 continue
 
             stack.extend(reversed(n.children))
 
-        scopes.append((tainted, start_line, end_line))
+        scopes.append((initial, taint_history, start_line, end_line))
 
-        # Phase 2: recurse into child functions with completed taint map
+        # Phase 2: recurse into child functions with taint state at
+        # their definition point (not the final state — a variable
+        # tainted after a function is defined shouldn't leak into it).
         for child_fn in child_functions:
-            scopes.extend(self._collect_taint_per_scope(child_fn, source_bytes, tainted))
+            parent_at_child = self._taint_at_line(
+                initial, taint_history, child_fn.start_point[0],
+            )
+            scopes.extend(self._collect_taint_per_scope(
+                child_fn, source_bytes, parent_at_child,
+                msg_handler_ranges=msg_handler_ranges,
+            ))
 
         return scopes
+
+    def _taint_at_line(self, initial, history, target_line):
+        """Compute effective taint state at target_line by replaying history.
+
+        Starts from the inherited initial state and applies events up to
+        (and including) the target line.
+        """
+        state = dict(initial)
+        for line, var_name, source in history:
+            if line > target_line:
+                break
+            if source is not None:
+                state[var_name] = source
+            elif var_name in state:
+                del state[var_name]
+        return state
+
+    @staticmethod
+    def _line_in_handler_range(tree, line_idx, msg_handler_ranges):
+        """Check if a line falls inside any message handler function range."""
+        if not msg_handler_ranges:
+            return False
+        # Walk tree to find function nodes covering this line that are handlers
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if (node.start_point[0] <= line_idx <= node.end_point[0]
+                    and (node.start_byte, node.end_byte)
+                    in msg_handler_ranges):
+                return True
+            if node.start_point[0] <= line_idx <= node.end_point[0]:
+                stack.extend(node.children)
+        return False
+
+    def _find_message_handler_ranges(self, tree, source_bytes):
+        """Identify function nodes that are message event handler callbacks.
+
+        Returns a set of (start_byte, end_byte) tuples for handler functions,
+        used by _collect_taint_per_scope to enable CONTEXT_SOURCES matching.
+        """
+        handler_ranges = set()
+        _HANDLER_TYPES = frozenset({
+            'arrow_function', 'function_expression', 'function',
+        })
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+
+            # addEventListener('message', handler)
+            if node.type == 'call_expression':
+                fn = node.child_by_field_name('function')
+                if fn:
+                    fn_name = None
+                    if fn.type == 'member_expression':
+                        prop = fn.child_by_field_name('property')
+                        if prop:
+                            fn_name = self.get_node_text(prop, source_bytes)
+                    elif fn.type == 'identifier':
+                        fn_name = self.get_node_text(fn, source_bytes)
+                    if fn_name == 'addEventListener':
+                        args = node.child_by_field_name('arguments')
+                        if args:
+                            arg_nodes = [c for c in args.children
+                                         if c.type not in ('(', ')', ',')]
+                            if len(arg_nodes) >= 2:
+                                evt = self.get_node_text(
+                                    arg_nodes[0], source_bytes,
+                                ).strip('\'"` ')
+                                if evt == 'message':
+                                    handler = arg_nodes[1]
+                                    if handler.type in _HANDLER_TYPES:
+                                        handler_ranges.add((
+                                            handler.start_byte,
+                                            handler.end_byte,
+                                        ))
+
+            # window.onmessage = handler
+            if node.type == 'assignment_expression':
+                left = node.child_by_field_name('left')
+                if left and left.type == 'member_expression':
+                    prop = left.child_by_field_name('property')
+                    obj = left.child_by_field_name('object')
+                    if (prop and obj
+                            and self.get_node_text(prop, source_bytes)
+                            == 'onmessage'
+                            and self.get_node_text(obj, source_bytes)
+                            in ('window', 'self', 'globalThis', 'this')):
+                        right = node.child_by_field_name('right')
+                        if right and right.type in _HANDLER_TYPES:
+                            handler_ranges.add((
+                                right.start_byte, right.end_byte,
+                            ))
+
+            stack.extend(node.children)
+        return handler_ranges
 
     def find_taint_flows(self, tree, source_bytes):
         """Find intra-file dataflows from user-controlled sources to dangerous sinks.
@@ -559,12 +910,36 @@ class ASTAnalyzer:
 
         Taint tracking is scoped to function boundaries — variable `r` tainted
         in function A does not contaminate a different `r` in function B.
+        Taint state is line-aware — a variable reassigned clean before a sink
+        won't false-positive.
 
         Also checks taint-only sinks (setTimeout, window.open, .src/.href assignment,
         setAttribute) which are too broad for anomaly detection but valid for taint.
         """
-        # Build per-scope taint maps
-        scopes = self._collect_taint_per_scope(tree.root_node, source_bytes, {})
+        # Pre-compute data structures for efficient analysis of large files:
+        # - scope byte ranges: O(log N) nested-scope detection in _get_shallow_text
+        # - function name map: O(1) callee lookup in _check_call_return_taint
+        # - return taint cache: avoid re-analyzing the same function body
+        self._scope_byte_ranges = self._precompute_scope_ranges(tree.root_node)
+        self._fn_map = self._build_function_map(tree.root_node, source_bytes)
+        self._return_taint_cache = {}
+        try:
+            return self._find_taint_flows_inner(tree, source_bytes)
+        finally:
+            self._scope_byte_ranges = None
+            self._fn_map = None
+            self._return_taint_cache = None
+
+    def _find_taint_flows_inner(self, tree, source_bytes):
+        """Inner implementation of find_taint_flows (pre-computed data already set)."""
+        # Pre-compute message handler ranges for context-aware source matching
+        msg_handler_ranges = self._find_message_handler_ranges(tree, source_bytes)
+
+        # Build per-scope taint maps (line-aware: initial + history per scope)
+        scopes = self._collect_taint_per_scope(
+            tree.root_node, source_bytes, {},
+            msg_handler_ranges=msg_handler_ranges,
+        )
 
         # Collect all sinks: core SINKS + taint-only sinks (both AST-based)
         end_line = tree.root_node.end_point[0]
@@ -601,14 +976,21 @@ class ASTAnalyzer:
 
             # Find the innermost scope containing this sink line.
             # Children are appended after parents, so last match = deepest.
-            tainted_vars = {}
+            best_initial = {}
+            best_history = []
             best_span = float('inf')
-            for scope_tainted, scope_start, scope_end in scopes:
+            for scope_initial, scope_history, scope_start, scope_end in scopes:
                 if scope_start <= sink_line_idx <= scope_end:
                     span = scope_end - scope_start
                     if span <= best_span:
                         best_span = span
-                        tainted_vars = scope_tainted
+                        best_initial = scope_initial
+                        best_history = scope_history
+
+            # Line-aware: compute taint state at the sink line, not final state
+            tainted_vars = self._taint_at_line(
+                best_initial, best_history, sink_line_idx,
+            )
 
             # Mode 1: tainted variable in sink expression
             # Report all distinct sources — each source→sink path is a
@@ -637,6 +1019,11 @@ class ASTAnalyzer:
                     tree, source_bytes, sink_line_idx, sink['category'],
                 )
                 if value_text:
+                    # Check if sink is in a message handler (for CONTEXT_SOURCES)
+                    sink_in_handler = self._line_in_handler_range(
+                        tree, sink_line_idx, msg_handler_ranges,
+                    )
+                    # Check always-match sources
                     for source_name, source_pattern in SOURCES.items():
                         if re.search(source_pattern, value_text):
                             flows.append({
@@ -646,12 +1033,28 @@ class ASTAnalyzer:
                                 'sink_line': sink_line_num,
                                 'severity': sink['severity'],
                             })
+                            found = True
                             break
+                    # Check context-dependent sources if in handler
+                    if not found and sink_in_handler:
+                        for source_name, source_pattern in \
+                                CONTEXT_SOURCES.items():
+                            if re.search(source_pattern, value_text):
+                                flows.append({
+                                    'source': source_name,
+                                    'sink': sink['category'],
+                                    'tainted_var': 'direct',
+                                    'sink_line': sink_line_num,
+                                    'severity': sink['severity'],
+                                })
+                                break
 
         # Mode 3: taint through function arguments
         # When foo(taintedVar) is called, check if foo uses its parameter
         # in a sink (e.g. eval(x) where x came from top.name at call site).
-        arg_flows = self._find_argument_taint_flows(tree, source_bytes, scopes)
+        arg_flows = self._find_argument_taint_flows(
+            tree, source_bytes, scopes, msg_handler_ranges,
+        )
         seen_flow_keys = {
             (f['source'], f['sink'], f['sink_line']) for f in flows
         }
@@ -1014,10 +1417,17 @@ class ASTAnalyzer:
                         and value.type in ('function_expression',
                                            'arrow_function')):
                     return value
+            # class Foo { bar(x) { ... } }  (class method)
+            if node.type == 'method_definition':
+                method_name = node.child_by_field_name('name')
+                if (method_name
+                        and self.get_node_text(method_name, source_bytes) == name):
+                    return node
             stack.extend(node.children)
         return None
 
-    def _find_argument_taint_flows(self, tree, source_bytes, scopes):
+    def _find_argument_taint_flows(self, tree, source_bytes, scopes,
+                                    msg_handler_ranges=None):
         """Find taint flows through function arguments.
 
         When foo(taintedVar) is called and foo uses its parameter in a sink,
@@ -1029,6 +1439,21 @@ class ASTAnalyzer:
         lines = text.split('\n')
         root = tree.root_node
 
+        # Pre-compute merged tainted line intervals for quick rejection.
+        # Only call expressions within tainted scopes need full analysis.
+        tainted_intervals = sorted(
+            (ss, se) for si, sh, ss, se in scopes
+            if si or any(src is not None for _, _, src in sh)
+        )
+        merged = []
+        for ss, se in tainted_intervals:
+            if merged and merged[-1][1] >= ss - 1:
+                merged[-1][1] = max(merged[-1][1], se)
+            else:
+                merged.append([ss, se])
+        if not merged:
+            return flows
+
         stack = [root]
         while stack:
             node = stack.pop()
@@ -1039,6 +1464,13 @@ class ASTAnalyzer:
             fn = node.child_by_field_name('function')
             args = node.child_by_field_name('arguments')
             if not fn or not args:
+                stack.extend(node.children)
+                continue
+
+            # Quick rejection: skip calls outside tainted scopes
+            call_line = node.start_point[0]
+            idx = bisect.bisect_right(merged, [call_line, float('inf')]) - 1
+            if idx < 0 or merged[idx][1] < call_line:
                 stack.extend(node.children)
                 continue
 
@@ -1056,16 +1488,21 @@ class ASTAnalyzer:
                 stack.extend(node.children)
                 continue
 
-            # Get tainted vars at the call site
-            call_line = node.start_point[0]
-            call_tainted = {}
+            # Get tainted vars at the call site (line-aware)
+            best_initial = {}
+            best_history = []
             best_span = float('inf')
-            for scope_tainted, scope_start, scope_end in scopes:
+            for scope_initial, scope_history, scope_start, scope_end in scopes:
                 if scope_start <= call_line <= scope_end:
                     span = scope_end - scope_start
                     if span <= best_span:
                         best_span = span
-                        call_tainted = scope_tainted
+                        best_initial = scope_initial
+                        best_history = scope_history
+
+            call_tainted = self._taint_at_line(
+                best_initial, best_history, call_line,
+            )
 
             # Check which arguments are tainted
             arg_nodes = [c for c in args.children
@@ -1082,7 +1519,11 @@ class ASTAnalyzer:
                 continue
 
             # Find the callee function definition
-            callee = self._find_function_by_name(root, callee_name, source_bytes)
+            fn_map = getattr(self, '_fn_map', None)
+            if fn_map is not None:
+                callee = fn_map.get(callee_name)
+            else:
+                callee = self._find_function_by_name(root, callee_name, source_bytes)
             if not callee:
                 stack.extend(node.children)
                 continue
@@ -1111,6 +1552,7 @@ class ASTAnalyzer:
             callee_scopes = self._collect_taint_per_scope(
                 callee, source_bytes, pre_taint,
                 arg_taint=set(pre_taint.keys()),
+                msg_handler_ranges=msg_handler_ranges,
             )
 
             # Find sinks in callee
@@ -1127,7 +1569,7 @@ class ASTAnalyzer:
                 if (ts['category'], ts['line']) not in seen:
                     callee_sinks.append(ts)
 
-            # Check each callee sink for tainted params
+            # Check each callee sink for tainted params (line-aware)
             for sink in callee_sinks:
                 sink_line_idx = sink['line'] - 1
                 if not (0 <= sink_line_idx < len(lines)):
@@ -1138,15 +1580,21 @@ class ASTAnalyzer:
                 )
                 check_text = full_expr if full_expr else sink_text
 
-                # Find scope taint at this sink line
-                callee_tainted = {}
+                # Find innermost callee scope and compute taint at sink line
+                callee_best_init = {}
+                callee_best_hist = []
                 best = float('inf')
-                for st, ss, se in callee_scopes:
+                for si, sh, ss, se in callee_scopes:
                     if ss <= sink_line_idx <= se:
                         span = se - ss
                         if span <= best:
                             best = span
-                            callee_tainted = st
+                            callee_best_init = si
+                            callee_best_hist = sh
+
+                callee_tainted = self._taint_at_line(
+                    callee_best_init, callee_best_hist, sink_line_idx,
+                )
 
                 seen_sources = set()
                 for var_name, source_name in callee_tainted.items():
