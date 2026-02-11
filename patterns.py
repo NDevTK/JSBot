@@ -55,6 +55,14 @@ SINKS = {
         "pattern": r"""\b(?:v-html|dangerouslySetInnerHTML)\b""",
         "severity": 8,
     },
+    "Angular Security Bypass": {
+        "pattern": r"""\bbypassSecurityTrust(?:Html|ResourceUrl|Url|Style|Script)\s*\(""",
+        "severity": 9,
+    },
+    "Angular innerHTML Binding": {
+        "pattern": r"""\.(?:Y8G|ɵɵproperty)\s*\(\s*["'](?:innerHtml|innerHTML)["']""",
+        "severity": 8,
+    },
     "Cookie Write": {
         "pattern": r"""\bdocument\.cookie\s*=""",
         "severity": 5,
@@ -114,6 +122,8 @@ ENDPOINT_PATTERNS = [
     (r"""['"](/(?:api|graphql|rest|v[0-9]+|internal|admin|auth|oauth|webhook|socket\.io)/[^'"\s]{2,})['"]""", "api_path"),
     # WebSocket endpoints
     (r"""['"`](wss?://[^'"`\s\n]+)['"`]""", "websocket"),
+    # Server-side redirect endpoints with controllable target parameter
+    (r"""['"`]([^'"`\s]*(?:redirect|redir)[^'"`\s]*\?[^'"`\s]*(?:to|url|next|return|goto|dest|destination|redirect_uri)=[^'"`\s]*)['"`]""", "redirect_endpoint"),
 ]
 
 # --- Interesting String Patterns ---
@@ -123,7 +133,7 @@ INTERESTING_STRING_PATTERNS = [
     (r"""(?:['"`]|https?://)((?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})(?::\d+)?)""",
      "internal_ip", 6),
     # AWS S3 bucket URLs
-    (r"""['"`]((?:[a-z0-9][-a-z0-9]{2,62}\.)?s3[-.](?:us|eu|ap|sa|ca|me|af)[-a-z0-9]*\.amazonaws\.com/[^'"`\s]*)['"`]""",
+    (r"""['"`](https?://(?:[a-z0-9][-a-z0-9]{2,62}\.)?s3[-.](?:us|eu|ap|sa|ca|me|af)[-a-z0-9]*\.amazonaws\.com/[^'"`\s]*)['"`]""",
      "s3_url", 7),
     (r"""['"`]s3://([a-z0-9][-a-z0-9]{2,62}[^'"`\s]*)['"`]""", "s3_bucket", 7),
     # Firebase realtime DB

@@ -56,12 +56,16 @@ def _get_scan_domain(args, initial_urls):
     """Extract base domain for scan state storage."""
     if args.ct:
         return args.ct
+    # For URL input, use the raw input as the store key (matches daemon.py)
+    if args._input_type == 'url':
+        return args.input
     for url in initial_urls:
         parsed = urlparse(url)
         if parsed.hostname:
             parts = parsed.hostname.split('.')
             if len(parts) >= 2:
                 return '.'.join(parts[-2:])
+            return parsed.hostname
     return None
 
 

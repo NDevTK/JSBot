@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+import threading
 import time
 
 _DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'jsbot.db')
@@ -17,6 +18,7 @@ class FindingsStore:
 
     def __init__(self, domain):
         self.domain = domain
+        self._lock = threading.Lock()
         self._conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
         self._conn.execute('PRAGMA journal_mode=WAL')
         self._conn.execute('PRAGMA synchronous=NORMAL')
@@ -116,19 +118,20 @@ class FindingsStore:
 
         finding_key = self._build_finding_key(finding)
 
-        try:
-            self._conn.execute(
-                '''INSERT OR IGNORE INTO findings
-                   (domain, finding_type, severity, confidence, source_url,
-                    script_url, data_json, finding_key, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                (self.domain, finding_type, severity, confidence, source_url,
-                 script_url, json.dumps(finding), finding_key, time.time()),
-            )
-            self._conn.commit()
-            return self._conn.total_changes > 0
-        except sqlite3.Error:
-            return False
+        with self._lock:
+            try:
+                self._conn.execute(
+                    '''INSERT OR IGNORE INTO findings
+                       (domain, finding_type, severity, confidence, source_url,
+                        script_url, data_json, finding_key, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (self.domain, finding_type, severity, confidence, source_url,
+                     script_url, json.dumps(finding), finding_key, time.time()),
+                )
+                self._conn.commit()
+                return self._conn.total_changes > 0
+            except sqlite3.Error:
+                return False
 
     def _build_finding_key(self, finding):
         """Build a dedup key from finding fields."""
@@ -391,20 +394,21 @@ class FindingsStore:
     def add_log(self, level, message, max_entries=1000):
         """Store a log entry. Trims old entries beyond max_entries."""
         now = time.time()
-        self._conn.execute(
-            'INSERT INTO daemon_logs (domain, level, message, created_at) VALUES (?, ?, ?, ?)',
-            (self.domain, level, str(message)[:2000], now),
-        )
-        # Periodically trim — check every ~100 inserts (cheap heuristic)
-        if now % 100 < 1:
+        with self._lock:
             self._conn.execute(
-                '''DELETE FROM daemon_logs WHERE domain = ? AND id NOT IN (
-                    SELECT id FROM daemon_logs WHERE domain = ?
-                    ORDER BY created_at DESC LIMIT ?
-                )''',
-                (self.domain, self.domain, max_entries),
+                'INSERT INTO daemon_logs (domain, level, message, created_at) VALUES (?, ?, ?, ?)',
+                (self.domain, level, str(message)[:2000], now),
             )
-        self._conn.commit()
+            # Periodically trim — check every ~100 inserts (cheap heuristic)
+            if now % 100 < 1:
+                self._conn.execute(
+                    '''DELETE FROM daemon_logs WHERE domain = ? AND id NOT IN (
+                        SELECT id FROM daemon_logs WHERE domain = ?
+                        ORDER BY created_at DESC LIMIT ?
+                    )''',
+                    (self.domain, self.domain, max_entries),
+                )
+            self._conn.commit()
 
     def get_log_tail(self, limit=10):
         """Get the last N log entries."""

@@ -2,6 +2,7 @@
 import re
 import asyncio
 import httpx
+import threading
 from hashlib import sha256
 from urllib.parse import urljoin, urlparse
 
@@ -199,6 +200,10 @@ class ASTAnalyzer:
                                                     "line": node.start_point[0] + 1,
                                                     "severity": 8,
                                                 })
+                                # Fall back to property name for SINKS matching
+                                # Catches el.insertAdjacentHTML(), el.postMessage(), etc.
+                                # where the base object is a complex expression
+                                fn_text = prop_text
                     else:
                         fn_text = None
 
@@ -426,6 +431,8 @@ class ASTAnalyzer:
                     source = self._check_tainted(value_text, tainted)
                     if source:
                         tainted[var_name] = source
+                    elif var_name in tainted:
+                        del tainted[var_name]
 
             elif n.type == 'return_statement':
                 for child in n.children:
@@ -520,6 +527,8 @@ class ASTAnalyzer:
                             )
                         if source:
                             tainted[var_name] = source
+                        elif var_name in tainted:
+                            del tainted[var_name]
 
             elif n.type == 'formal_parameters':
                 for child in n.children:
@@ -808,17 +817,22 @@ class ASTAnalyzer:
                                         arg_nodes[1], node, tree, source_bytes
                                     ))
 
-            # window.onmessage = handler
+            # window.onmessage = handler (not WebSocket.onmessage)
             if node.type == 'assignment_expression':
                 left = node.child_by_field_name('left')
                 if left and left.type == 'member_expression':
-                    chain = self._get_member_chain(left, source_bytes)
-                    if chain and chain.endswith('.onmessage'):
-                        right = node.child_by_field_name('right')
-                        if right:
-                            results.append(self._analyze_msg_handler(
-                                right, node, tree, source_bytes
-                            ))
+                    prop = left.child_by_field_name('property')
+                    obj = left.child_by_field_name('object')
+                    if prop and self.get_node_text(prop, source_bytes) == 'onmessage':
+                        # Only flag if object is a window-like global or 'this'
+                        # at top level — skip ws.onmessage, socket.onmessage, etc.
+                        obj_text = self.get_node_text(obj, source_bytes)
+                        if obj_text in ('window', 'self', 'globalThis', 'this'):
+                            right = node.child_by_field_name('right')
+                            if right:
+                                results.append(self._analyze_msg_handler(
+                                    right, node, tree, source_bytes
+                                ))
 
             stack.extend(node.children)
         return results
@@ -1153,16 +1167,17 @@ class ASTAnalyzer:
         return flows
 
 
-# Singleton AST analyzer (created on first use)
-_ast_analyzer = None
+# Per-thread AST analyzer (Parser is not thread-safe)
+_thread_local = threading.local()
 
 
 def get_ast_analyzer():
-    """Get or create the singleton AST analyzer."""
-    global _ast_analyzer
-    if _ast_analyzer is None:
-        _ast_analyzer = ASTAnalyzer()
-    return _ast_analyzer
+    """Get or create a per-thread AST analyzer."""
+    analyzer = getattr(_thread_local, 'ast_analyzer', None)
+    if analyzer is None:
+        analyzer = ASTAnalyzer()
+        _thread_local.ast_analyzer = analyzer
+    return analyzer
 
 
 # --- Cross-File Analysis ---
