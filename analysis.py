@@ -570,6 +570,12 @@ class ASTAnalyzer:
                 continue
             sink_text = lines[sink_line_idx]
 
+            # For multi-line expressions, get the full AST expression text
+            full_expr = self._get_expression_text_at_line(
+                tree, source_bytes, sink_line_idx,
+            )
+            check_text = full_expr if full_expr else sink_text
+
             # Find the innermost scope containing this sink line.
             # Children are appended after parents, so last match = deepest.
             tainted_vars = {}
@@ -581,10 +587,10 @@ class ASTAnalyzer:
                         best_span = span
                         tainted_vars = scope_tainted
 
-            # Mode 1: tainted variable on sink line
+            # Mode 1: tainted variable in sink expression
             found = False
             for var_name, source_name in tainted_vars.items():
-                if re.search(r'\b' + re.escape(var_name) + r'\b', sink_text):
+                if re.search(r'\b' + re.escape(var_name) + r'\b', check_text):
                     flows.append({
                         'source': source_name,
                         'sink': sink['category'],
@@ -615,6 +621,28 @@ class ASTAnalyzer:
                             break
 
         return flows
+
+    def _get_expression_text_at_line(self, tree, source_bytes, line_idx):
+        """Get full text of the expression node starting at a given line.
+
+        For multi-line expressions like `el.src =\\n  tainted + value;`,
+        returns the complete text so tainted variable checks aren't limited
+        to the single sink line.
+        """
+        best = None
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node.start_point[0] == line_idx and node.type in (
+                'assignment_expression', 'call_expression', 'new_expression',
+            ):
+                if best is None or node.end_point[0] >= best.end_point[0]:
+                    best = node
+            if node.start_point[0] <= line_idx <= node.end_point[0]:
+                stack.extend(node.children)
+        if best and best.end_point[0] > line_idx:
+            return self.get_node_text(best, source_bytes)
+        return None
 
     def _extract_sink_value(self, tree, source_bytes, line_idx, sink_category):
         """Extract the data-flow value from the specific sink expression at a line.
