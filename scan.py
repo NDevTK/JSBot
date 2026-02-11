@@ -24,7 +24,7 @@ from scoring import score_url, url_path_key, path_segments, combined_url_score
 from patterns import JS_PATH_FINDER
 from analysis import (
     format_javascript, structural_hash, get_sha256, get_ast_analyzer,
-    check_script_safety,
+    check_script_safety, _extract_template_urls,
     SEEN_SCRIPTS, CHECKED_JS_URLS,
     CrossFileState,
 )
@@ -581,6 +581,34 @@ async def js_audit_worker(js_queue, client, args, executor,
                                 script_url=script_url,
                                 page_tracker=None,
                             ))
+                    except httpx.RequestError:
+                        pass
+
+                # Discover SPA template URLs (Angular/Vue/React route configs)
+                template_urls = _extract_template_urls(js_code, item.page_url)
+                for tmpl_url in template_urls:
+                    hashed_tmpl = get_sha256(tmpl_url)
+                    if hashed_tmpl in CHECKED_JS_URLS:
+                        continue
+                    CHECKED_JS_URLS.add(hashed_tmpl)
+                    log_message("INFO", f"Discovered template URL: {tmpl_url}")
+                    try:
+                        tmpl_resp = await client.get(tmpl_url, timeout=fetch_timeout)
+                        if tmpl_resp.status_code < 400:
+                            # Extract inline scripts from HTML template
+                            for m in re.finditer(
+                                r'<script[^>]*>(.*?)</script>',
+                                tmpl_resp.text,
+                                re.DOTALL | re.IGNORECASE,
+                            ):
+                                inline_js = m.group(1).strip()
+                                if inline_js:
+                                    await js_queue.put(JsWorkItem(
+                                        js_code=inline_js,
+                                        page_url=item.page_url,
+                                        script_url=tmpl_url,
+                                        page_tracker=None,
+                                    ))
                     except httpx.RequestError:
                         pass
 

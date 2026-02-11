@@ -12,7 +12,7 @@ SOURCES = {
     "document.baseURI":     r"""\bdocument\.baseURI\b""",
     "document.URLUnencoded": r"""\bdocument\.URLUnencoded\b""",
     "document.referrer":    r"""\bdocument\.referrer\b""",
-    "window.name":          r"""\bwindow\.name\b""",
+    "window.name":          r"""\b(?:window|top|self|parent|frames)\.name\b""",
     "postMessage data":     r"""\b(?:event|e|evt|msg)\.data\b""",
     "URLSearchParams":      r"""\bURLSearchParams\b""",
     "getItem":              r"""\b(?:localStorage|sessionStorage)\.getItem\b""",

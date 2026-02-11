@@ -454,7 +454,8 @@ class ASTAnalyzer:
             return None
         return self._analyze_return_taint(fn_node, source_bytes)
 
-    def _collect_taint_per_scope(self, node, source_bytes, parent_tainted):
+    def _collect_taint_per_scope(self, node, source_bytes, parent_tainted,
+                                 arg_taint=None):
         """Walk a scope, track taint with proper function boundaries.
 
         Returns list of (tainted_vars_dict, start_line, end_line) for this scope
@@ -463,6 +464,9 @@ class ASTAnalyzer:
 
         Two-phase: first build this scope's complete taint map (skipping child
         functions), then recurse into child functions with the finished map.
+
+        arg_taint: set of var names pre-tainted as function arguments — these
+        survive formal_parameters stripping at the top-level function only.
         """
         scopes = []
         tainted = dict(parent_tainted)
@@ -484,35 +488,45 @@ class ASTAnalyzer:
                 value_node = n.child_by_field_name('value')
                 if name_node and value_node and name_node.type == 'identifier':
                     var_name = self.get_node_text(name_node, source_bytes)
-                    value_text = self.get_node_text(value_node, source_bytes)
-                    source = self._check_tainted(value_text, tainted)
-                    if not source and value_node.type == 'call_expression':
-                        source = self._check_call_return_taint(
-                            value_node, node, source_bytes,
-                        )
-                    if source:
-                        tainted[var_name] = source
-                    elif var_name in tainted:
-                        del tainted[var_name]
+                    # Don't let local re-declarations overwrite arg-tainted params
+                    if arg_taint and var_name in arg_taint:
+                        pass
+                    else:
+                        value_text = self.get_node_text(value_node, source_bytes)
+                        source = self._check_tainted(value_text, tainted)
+                        if not source and value_node.type == 'call_expression':
+                            source = self._check_call_return_taint(
+                                value_node, node, source_bytes,
+                            )
+                        if source:
+                            tainted[var_name] = source
+                        elif var_name in tainted:
+                            del tainted[var_name]
 
             elif n.type == 'assignment_expression':
                 left = n.child_by_field_name('left')
                 right = n.child_by_field_name('right')
                 if left and right and left.type == 'identifier':
                     var_name = self.get_node_text(left, source_bytes)
-                    value_text = self.get_node_text(right, source_bytes)
-                    source = self._check_tainted(value_text, tainted)
-                    if not source and right.type == 'call_expression':
-                        source = self._check_call_return_taint(
-                            right, node, source_bytes,
-                        )
-                    if source:
-                        tainted[var_name] = source
+                    # Don't let assignments overwrite arg-tainted params
+                    if arg_taint and var_name in arg_taint:
+                        pass
+                    else:
+                        value_text = self.get_node_text(right, source_bytes)
+                        source = self._check_tainted(value_text, tainted)
+                        if not source and right.type == 'call_expression':
+                            source = self._check_call_return_taint(
+                                right, node, source_bytes,
+                            )
+                        if source:
+                            tainted[var_name] = source
 
             elif n.type == 'formal_parameters':
                 for child in n.children:
                     if child.type == 'identifier':
                         param_name = self.get_node_text(child, source_bytes)
+                        if arg_taint and param_name in arg_taint:
+                            continue  # keep argument-tainted params
                         if param_name in tainted:
                             del tainted[param_name]
                 continue
@@ -588,8 +602,13 @@ class ASTAnalyzer:
                         tainted_vars = scope_tainted
 
             # Mode 1: tainted variable in sink expression
+            # Report all distinct sources — each source→sink path is a
+            # separate vulnerability (e.g. cookie XSS vs referrer XSS).
             found = False
+            seen_sources = set()
             for var_name, source_name in tainted_vars.items():
+                if source_name in seen_sources:
+                    continue
                 if re.search(r'\b' + re.escape(var_name) + r'\b', check_text):
                     flows.append({
                         'source': source_name,
@@ -598,8 +617,8 @@ class ASTAnalyzer:
                         'sink_line': sink_line_num,
                         'severity': sink['severity'],
                     })
+                    seen_sources.add(source_name)
                     found = True
-                    break
 
             # Mode 2: source pattern directly in sink value (no intermediate variable)
             # Uses AST to extract only the data portion (RHS of assignment, call args)
@@ -619,6 +638,19 @@ class ASTAnalyzer:
                                 'severity': sink['severity'],
                             })
                             break
+
+        # Mode 3: taint through function arguments
+        # When foo(taintedVar) is called, check if foo uses its parameter
+        # in a sink (e.g. eval(x) where x came from top.name at call site).
+        arg_flows = self._find_argument_taint_flows(tree, source_bytes, scopes)
+        seen_flow_keys = {
+            (f['source'], f['sink'], f['sink_line']) for f in flows
+        }
+        for af in arg_flows:
+            key = (af['source'], af['sink'], af['sink_line'])
+            if key not in seen_flow_keys:
+                seen_flow_keys.add(key)
+                flows.append(af)
 
         return flows
 
@@ -941,7 +973,8 @@ class ASTAnalyzer:
         return False
 
     def _find_function_by_name(self, root, name, source_bytes):
-        """Find a function declaration or variable-assigned function by name."""
+        """Find a function declaration, variable-assigned function, or object
+        property function by name."""
         stack = [root]
         while stack:
             node = stack.pop()
@@ -958,8 +991,166 @@ class ASTAnalyzer:
                         and value and value.type in ('function_expression',
                                                       'arrow_function')):
                     return value
+            # { foo: function(x) { ... } }  (object property)
+            if node.type == 'pair':
+                key = node.child_by_field_name('key')
+                value = node.child_by_field_name('value')
+                if (key and value
+                        and self.get_node_text(key, source_bytes).strip('\'"') == name
+                        and value.type in ('function_expression',
+                                           'arrow_function')):
+                    return value
             stack.extend(node.children)
         return None
+
+    def _find_argument_taint_flows(self, tree, source_bytes, scopes):
+        """Find taint flows through function arguments.
+
+        When foo(taintedVar) is called and foo uses its parameter in a sink,
+        reports the source→sink flow. Handles both simple calls (foo(x)) and
+        member calls (obj.foo(x)) by resolving the callee by property name.
+        """
+        flows = []
+        text = source_bytes.decode('utf-8', errors='replace')
+        lines = text.split('\n')
+        root = tree.root_node
+
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.type != 'call_expression':
+                stack.extend(node.children)
+                continue
+
+            fn = node.child_by_field_name('function')
+            args = node.child_by_field_name('arguments')
+            if not fn or not args:
+                stack.extend(node.children)
+                continue
+
+            # Resolve callee name (simple identifier or member property)
+            if fn.type == 'identifier':
+                callee_name = self.get_node_text(fn, source_bytes)
+            elif fn.type == 'member_expression':
+                prop = fn.child_by_field_name('property')
+                callee_name = self.get_node_text(prop, source_bytes) if prop else None
+            else:
+                stack.extend(node.children)
+                continue
+
+            if not callee_name:
+                stack.extend(node.children)
+                continue
+
+            # Get tainted vars at the call site
+            call_line = node.start_point[0]
+            call_tainted = {}
+            best_span = float('inf')
+            for scope_tainted, scope_start, scope_end in scopes:
+                if scope_start <= call_line <= scope_end:
+                    span = scope_end - scope_start
+                    if span <= best_span:
+                        best_span = span
+                        call_tainted = scope_tainted
+
+            # Check which arguments are tainted
+            arg_nodes = [c for c in args.children
+                         if c.type not in ('(', ')', ',')]
+            tainted_params = {}
+            for i, arg in enumerate(arg_nodes):
+                arg_text = self.get_node_text(arg, source_bytes)
+                source = self._check_tainted(arg_text, call_tainted)
+                if source:
+                    tainted_params[i] = source
+
+            if not tainted_params:
+                stack.extend(node.children)
+                continue
+
+            # Find the callee function definition
+            callee = self._find_function_by_name(root, callee_name, source_bytes)
+            if not callee:
+                stack.extend(node.children)
+                continue
+
+            # Map tainted argument indices to parameter names
+            params_node = callee.child_by_field_name('parameters')
+            if not params_node:
+                stack.extend(node.children)
+                continue
+            param_names = [
+                self.get_node_text(c, source_bytes)
+                for c in params_node.children
+                if c.type in ('identifier', 'shorthand_property_identifier')
+            ]
+
+            pre_taint = {}
+            for idx, source in tainted_params.items():
+                if idx < len(param_names):
+                    pre_taint[param_names[idx]] = source
+
+            if not pre_taint:
+                stack.extend(node.children)
+                continue
+
+            # Build taint map for callee with pre-tainted params
+            callee_scopes = self._collect_taint_per_scope(
+                callee, source_bytes, pre_taint,
+                arg_taint=set(pre_taint.keys()),
+            )
+
+            # Find sinks in callee
+            callee_start = callee.start_point[0]
+            callee_end = callee.end_point[0]
+            callee_sinks = self.find_sinks_in_range(
+                tree, source_bytes, callee_start, callee_end,
+            )
+            callee_taint_sinks = self.find_taint_sinks_in_range(
+                tree, source_bytes, callee_start, callee_end,
+            )
+            seen = {(s['category'], s['line']) for s in callee_sinks}
+            for ts in callee_taint_sinks:
+                if (ts['category'], ts['line']) not in seen:
+                    callee_sinks.append(ts)
+
+            # Check each callee sink for tainted params
+            for sink in callee_sinks:
+                sink_line_idx = sink['line'] - 1
+                if not (0 <= sink_line_idx < len(lines)):
+                    continue
+                sink_text = lines[sink_line_idx]
+                full_expr = self._get_expression_text_at_line(
+                    tree, source_bytes, sink_line_idx,
+                )
+                check_text = full_expr if full_expr else sink_text
+
+                # Find scope taint at this sink line
+                callee_tainted = {}
+                best = float('inf')
+                for st, ss, se in callee_scopes:
+                    if ss <= sink_line_idx <= se:
+                        span = se - ss
+                        if span <= best:
+                            best = span
+                            callee_tainted = st
+
+                seen_sources = set()
+                for var_name, source_name in callee_tainted.items():
+                    if source_name in seen_sources:
+                        continue
+                    if re.search(r'\b' + re.escape(var_name) + r'\b',
+                                 check_text):
+                        flows.append({
+                            'source': source_name,
+                            'sink': sink['category'],
+                            'tainted_var': var_name,
+                            'sink_line': sink['line'],
+                            'severity': sink['severity'],
+                        })
+                        seen_sources.add(source_name)
+
+            stack.extend(node.children)
+        return flows
 
 
 # Singleton AST analyzer (created on first use)
@@ -1287,7 +1478,7 @@ def _check_taint_flows(analyzer, tree, source_bytes, script_hash, url, script_ur
     """Check for intra-file taint flows from user input to dangerous sinks. Emits findings."""
     flows = analyzer.find_taint_flows(tree, source_bytes)
     for flow in flows:
-        finding_key = f"taint:{script_hash}:{flow['sink']}:{flow['sink_line']}"
+        finding_key = f"taint:{script_hash}:{flow['source']}:{flow['sink']}:{flow['sink_line']}"
         if finding_key in SEEN_FINDINGS:
             continue
         SEEN_FINDINGS.add(finding_key)
@@ -1416,6 +1607,7 @@ async def process_javascript(js_code, url, client, script_url=None, cross_file_s
             log_message("ERROR", f"Failed to save script {raw_hash}: {e}")
 
     await find_and_process_js_paths(js_code, url, client)
+    await find_and_process_template_urls(js_code, url, client)
 
 
 async def find_and_process_js_paths(content, base_url, client):
@@ -1440,3 +1632,86 @@ async def find_and_process_js_paths(content, base_url, client):
         except httpx.RequestError as e:
             log_message("ERROR", f"Failed to fetch discovered script {script_url}: {e}")
     await asyncio.gather(*tasks)
+
+
+# --- Template URL patterns for SPA frameworks ---
+# Matches: templateUrl: '/path.html', templateUrl: "/path.html", templateUrl: `path.html`
+_TEMPLATE_URL_DIRECT = re.compile(
+    r"""templateUrl\s*:\s*['"`]([^'"`\n]+\.html?)['"`]""",
+    re.IGNORECASE,
+)
+# Matches helper calls: templateUrl: getPartialUrl('name'), templateUrl: helper("name")
+_TEMPLATE_URL_HELPER = re.compile(
+    r"""templateUrl\s*:\s*(\w+)\s*\(\s*['"`]([^'"`\n]+)['"`]\s*\)""",
+)
+# Matches simple string-returning functions:
+# function foo(x) { return "/prefix/" + x + ".html"; }
+_HELPER_FUNC = re.compile(
+    r"""function\s+(\w+)\s*\(\s*\w+\s*\)\s*\{[^}]*?return\s+['"`]([^'"`]*?)['"`]\s*\+\s*\w+\s*\+\s*['"`]([^'"`]*?)['"`]""",
+)
+
+
+def _extract_template_urls(content, base_url):
+    """Extract HTML template URLs from SPA framework route configurations.
+
+    Handles:
+    - Direct: templateUrl: '/views/page.html'
+    - Helper: templateUrl: getUrl('page') where getUrl builds a path
+    """
+    urls = set()
+
+    # Resolve helper functions: function name(x) { return prefix + x + suffix; }
+    helpers = {}
+    for m in _HELPER_FUNC.finditer(content):
+        func_name, prefix, suffix = m.group(1), m.group(2), m.group(3)
+        helpers[func_name] = (prefix, suffix)
+
+    # Direct templateUrl strings
+    for m in _TEMPLATE_URL_DIRECT.finditer(content):
+        path = m.group(1)
+        urls.add(urljoin(base_url, path))
+
+    # Helper-based templateUrl: resolve using detected helpers
+    for m in _TEMPLATE_URL_HELPER.finditer(content):
+        func_name, arg = m.group(1), m.group(2)
+        if func_name in helpers:
+            prefix, suffix = helpers[func_name]
+            path = prefix + arg + suffix
+            urls.add(urljoin(base_url, path))
+
+    return urls
+
+
+async def find_and_process_template_urls(content, base_url, client):
+    """Find SPA template URLs in JS and analyze their inline scripts."""
+    urls = _extract_template_urls(content, base_url)
+    if not urls:
+        return
+
+    tasks = []
+    for template_url in urls:
+        hashed = get_sha256(template_url)
+        if hashed in CHECKED_JS_URLS:
+            continue
+        CHECKED_JS_URLS.add(hashed)
+
+        log_message("INFO", f"Discovered template URL: {template_url}")
+        try:
+            resp = await client.get(template_url, timeout=10)
+            if resp.status_code >= 400:
+                continue
+            html = resp.text
+            # Extract inline scripts from the template
+            for m in re.finditer(
+                r'<script[^>]*>(.*?)</script>', html, re.DOTALL | re.IGNORECASE,
+            ):
+                js = m.group(1).strip()
+                if js:
+                    tasks.append(process_javascript(
+                        js, base_url, client, script_url=template_url,
+                    ))
+        except httpx.RequestError as e:
+            log_message("ERROR", f"Failed to fetch template {template_url}: {e}")
+
+    if tasks:
+        await asyncio.gather(*tasks)

@@ -149,6 +149,7 @@ _LIBRARY_VERSIONS = [
     (r'/\*!?\s*jQuery\s+v?([\d.]+)', "jQuery"),
     (r'jQuery\.fn\.jquery\s*=\s*[\'"]([^\'"]+)', "jQuery"),
     (r'angular[^.]*\.version\s*=\s*\{[^}]*full\s*:\s*[\'"]([^\'"]+)', "Angular.js"),
+    (r'AngularJS\s+v?([\d.]+)', "Angular.js"),
     (r'Vue\.version\s*=\s*[\'"]([^\'"]+)', "Vue.js"),
     (r'_\.VERSION\s*=\s*[\'"]([^\'"]+)', "Lodash"),
     (r'Bootstrap\s+v([\d.]+)', "Bootstrap"),
@@ -205,6 +206,8 @@ _KNOWN_VULNS = {
          "desc": "XSS via SVG animate elements", "severity": 8},
         {"below": "1.6.0", "cves": ["CVE-2019-10768"],
          "desc": "Prototype pollution in merge function", "severity": 8},
+        {"below": "1.2.0", "cves": ["CVE-2020-7676"],
+         "desc": "XSS via template sandbox escape", "severity": 9},
     ],
     "Lodash": [
         {"below": "4.17.21", "cves": ["CVE-2021-23337"],

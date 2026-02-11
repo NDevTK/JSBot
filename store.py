@@ -138,6 +138,7 @@ class FindingsStore:
         if ft == 'taint_flow':
             parts += [
                 finding.get('script_hash', ''),
+                finding.get('taint_source', ''),
                 finding.get('sink_category', ''),
                 str(finding.get('sink_line', '')),
             ]
