@@ -6,3 +6,4 @@ nul
 *.txt
 *.db
 *.pid
+*.db-*

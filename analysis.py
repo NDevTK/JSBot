@@ -218,6 +218,145 @@ class ASTAnalyzer:
             stack.extend(node.children)
         return results
 
+    _URL_SINK_PROPERTIES = frozenset({'src', 'href', 'action', 'formAction', 'data'})
+    _ATTR_URL_SINKS = frozenset({'href', 'src', 'action', 'formaction', 'data'})
+
+    def find_taint_sinks_in_range(self, tree, source_bytes, start_line, end_line):
+        """Find taint-only sinks via AST. Too broad for anomaly, valid for taint.
+
+        Detects: setTimeout/setInterval, window.open, .src/.href/.action/.data
+        assignment, setAttribute/setAttributeNS with URL or event handler attrs,
+        createContextualFragment, fetch, XHR .open.
+        """
+        results = []
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node.start_point[0] > end_line or node.end_point[0] < start_line:
+                continue
+
+            # Property assignment: el.src = x, el.href = x, el.data = x
+            if node.type == 'assignment_expression':
+                left = node.child_by_field_name('left')
+                if left and left.type == 'member_expression':
+                    prop = left.child_by_field_name('property')
+                    if prop:
+                        prop_name = self.get_node_text(prop, source_bytes)
+                        if prop_name in self._URL_SINK_PROPERTIES:
+                            # Skip location.href — already Open Redirect in core SINKS
+                            obj = left.child_by_field_name('object')
+                            if obj and prop_name == 'href':
+                                obj_text = self.get_node_text(obj, source_bytes)
+                                if obj_text == 'location' or obj_text.endswith('.location'):
+                                    stack.extend(node.children)
+                                    continue
+                            right = node.child_by_field_name('right')
+                            if right and not self._is_literal(right):
+                                results.append({
+                                    'category': 'Script/Link Source',
+                                    'match': f'.{prop_name} =',
+                                    'line': node.start_point[0] + 1,
+                                    'severity': 6,
+                                })
+
+            # Call expressions
+            if node.type == 'call_expression':
+                fn = node.child_by_field_name('function')
+                args_node = node.child_by_field_name('arguments')
+                if fn:
+                    if fn.type == 'identifier':
+                        fn_name = self.get_node_text(fn, source_bytes)
+                        if fn_name in ('setTimeout', 'setInterval'):
+                            results.append({
+                                'category': 'setTimeout/setInterval',
+                                'match': fn_name + '(',
+                                'line': node.start_point[0] + 1,
+                                'severity': 7,
+                            })
+                        elif fn_name == 'fetch':
+                            results.append({
+                                'category': 'Fetch/XHR',
+                                'match': 'fetch(',
+                                'line': node.start_point[0] + 1,
+                                'severity': 5,
+                            })
+
+                    elif fn.type == 'member_expression':
+                        mem_prop = fn.child_by_field_name('property')
+                        mem_obj = fn.child_by_field_name('object')
+                        if mem_prop and mem_obj:
+                            pname = self.get_node_text(mem_prop, source_bytes)
+
+                            if pname in ('setTimeout', 'setInterval'):
+                                results.append({
+                                    'category': 'setTimeout/setInterval',
+                                    'match': pname + '(',
+                                    'line': node.start_point[0] + 1,
+                                    'severity': 7,
+                                })
+                            elif pname == 'open':
+                                obj_text = self.get_node_text(mem_obj, source_bytes)
+                                if obj_text in ('window', 'self', 'globalThis'):
+                                    results.append({
+                                        'category': 'window.open',
+                                        'match': 'window.open(',
+                                        'line': node.start_point[0] + 1,
+                                        'severity': 6,
+                                    })
+                                else:
+                                    results.append({
+                                        'category': 'Fetch/XHR',
+                                        'match': '.open(',
+                                        'line': node.start_point[0] + 1,
+                                        'severity': 5,
+                                    })
+                            elif pname == 'fetch':
+                                results.append({
+                                    'category': 'Fetch/XHR',
+                                    'match': '.fetch(',
+                                    'line': node.start_point[0] + 1,
+                                    'severity': 5,
+                                })
+                            elif pname == 'createContextualFragment':
+                                results.append({
+                                    'category': 'createContextualFragment',
+                                    'match': '.createContextualFragment(',
+                                    'line': node.start_point[0] + 1,
+                                    'severity': 9,
+                                })
+                            elif pname in ('setAttribute', 'setAttributeNS'):
+                                if args_node:
+                                    arg_nodes = [c for c in args_node.children
+                                                 if c.type not in ('(', ')', ',')]
+                                    # setAttribute: 1st arg is attr name
+                                    # setAttributeNS: 2nd arg is attr name
+                                    attr_idx = 0 if pname == 'setAttribute' else 1
+                                    if len(arg_nodes) > attr_idx:
+                                        attr_node = arg_nodes[attr_idx]
+                                        if attr_node.type == 'string':
+                                            attr_val = self.get_node_text(
+                                                attr_node, source_bytes
+                                            ).strip('\'"` ')
+                                            # Strip namespace prefix (xlink:href → href)
+                                            bare = attr_val.split(':')[-1] if ':' in attr_val else attr_val
+                                            if bare.lower() in self._ATTR_URL_SINKS:
+                                                results.append({
+                                                    'category': 'Script/Link Source',
+                                                    'match': f'.{pname}("{attr_val}", ...)',
+                                                    'line': node.start_point[0] + 1,
+                                                    'severity': 6,
+                                                })
+                                            elif bare.lower().startswith('on'):
+                                                results.append({
+                                                    'category': 'setAttribute Event Handler',
+                                                    'match': f'.{pname}("{attr_val}", ...)',
+                                                    'line': node.start_point[0] + 1,
+                                                    'severity': 8,
+                                                })
+
+            stack.extend(node.children)
+        return results
+
     def _is_literal(self, node):
         """Check if a node is a literal value (string, number, boolean, null)."""
         return node.type in ('string', 'number', 'true', 'false', 'null', 'undefined')
@@ -253,6 +392,68 @@ class ASTAnalyzer:
         'method_definition',
     })
 
+    def _analyze_return_taint(self, fn_node, source_bytes):
+        """Check if a function returns tainted data. Returns source name or None.
+
+        Builds an internal taint map for the function body, then checks if any
+        return statement yields a tainted expression.
+        """
+        tainted = {}
+        stack = [fn_node]
+        while stack:
+            n = stack.pop()
+            if n != fn_node and n.type in self._SCOPE_TYPES:
+                continue  # skip nested functions
+
+            if n.type == 'variable_declarator':
+                name_node = n.child_by_field_name('name')
+                value_node = n.child_by_field_name('value')
+                if name_node and value_node and name_node.type == 'identifier':
+                    var_name = self.get_node_text(name_node, source_bytes)
+                    value_text = self.get_node_text(value_node, source_bytes)
+                    source = self._check_tainted(value_text, tainted)
+                    if source:
+                        tainted[var_name] = source
+                    elif var_name in tainted:
+                        del tainted[var_name]
+
+            elif n.type == 'assignment_expression':
+                left = n.child_by_field_name('left')
+                right = n.child_by_field_name('right')
+                if left and right and left.type == 'identifier':
+                    var_name = self.get_node_text(left, source_bytes)
+                    value_text = self.get_node_text(right, source_bytes)
+                    source = self._check_tainted(value_text, tainted)
+                    if source:
+                        tainted[var_name] = source
+
+            elif n.type == 'return_statement':
+                for child in n.children:
+                    if child.type not in ('return', ';'):
+                        return_text = self.get_node_text(child, source_bytes)
+                        source = self._check_tainted(return_text, tainted)
+                        if source:
+                            return source
+
+            stack.extend(reversed(n.children))
+        return None
+
+    def _check_call_return_taint(self, call_node, scope_root, source_bytes):
+        """Check if a function call returns tainted data by analyzing the callee."""
+        fn = call_node.child_by_field_name('function')
+        if not fn or fn.type != 'identifier':
+            return None
+        fn_name = self.get_node_text(fn, source_bytes)
+
+        # Walk up to the tree root
+        root = scope_root
+        while root.parent:
+            root = root.parent
+        fn_node = self._find_function_by_name(root, fn_name, source_bytes)
+        if not fn_node:
+            return None
+        return self._analyze_return_taint(fn_node, source_bytes)
+
     def _collect_taint_per_scope(self, node, source_bytes, parent_tainted):
         """Walk a scope, track taint with proper function boundaries.
 
@@ -285,6 +486,10 @@ class ASTAnalyzer:
                     var_name = self.get_node_text(name_node, source_bytes)
                     value_text = self.get_node_text(value_node, source_bytes)
                     source = self._check_tainted(value_text, tainted)
+                    if not source and value_node.type == 'call_expression':
+                        source = self._check_call_return_taint(
+                            value_node, node, source_bytes,
+                        )
                     if source:
                         tainted[var_name] = source
                     elif var_name in tainted:
@@ -297,6 +502,10 @@ class ASTAnalyzer:
                     var_name = self.get_node_text(left, source_bytes)
                     value_text = self.get_node_text(right, source_bytes)
                     source = self._check_tainted(value_text, tainted)
+                    if not source and right.type == 'call_expression':
+                        source = self._check_call_return_taint(
+                            right, node, source_bytes,
+                        )
                     if source:
                         tainted[var_name] = source
 
@@ -328,34 +537,29 @@ class ASTAnalyzer:
         Taint tracking is scoped to function boundaries — variable `r` tainted
         in function A does not contaminate a different `r` in function B.
 
-        Also checks TAINT_SINKS (setTimeout, window.open, .src/.href assignment)
-        which are too broad for anomaly detection but valid for taint analysis.
+        Also checks taint-only sinks (setTimeout, window.open, .src/.href assignment,
+        setAttribute) which are too broad for anomaly detection but valid for taint.
         """
         # Build per-scope taint maps
         scopes = self._collect_taint_per_scope(tree.root_node, source_bytes, {})
 
-        # Collect all sinks: core SINKS (AST-based) + TAINT_SINKS (line regex)
-        sinks = self.find_sinks_in_range(
-            tree, source_bytes, 0, tree.root_node.end_point[0],
-        )
-        text = source_bytes.decode('utf-8', errors='replace')
-        lines = text.split('\n')
+        # Collect all sinks: core SINKS + taint-only sinks (both AST-based)
+        end_line = tree.root_node.end_point[0]
+        sinks = self.find_sinks_in_range(tree, source_bytes, 0, end_line)
 
-        # Add TAINT_SINKS via line-level regex (too broad for anomaly, valid for taint)
+        # Add taint-only sinks via AST (too broad for anomaly, valid for taint)
+        taint_only = self.find_taint_sinks_in_range(tree, source_bytes, 0, end_line)
         seen_sink_lines = {(s['category'], s['line']) for s in sinks}
-        for category, info in TAINT_SINKS.items():
-            for m in re.finditer(info['pattern'], text):
-                line_num = text[:m.start()].count('\n') + 1
-                if (category, line_num) not in seen_sink_lines:
-                    seen_sink_lines.add((category, line_num))
-                    sinks.append({
-                        'category': category,
-                        'line': line_num,
-                        'severity': info['severity'],
-                    })
+        for ts in taint_only:
+            if (ts['category'], ts['line']) not in seen_sink_lines:
+                seen_sink_lines.add((ts['category'], ts['line']))
+                sinks.append(ts)
 
         if not sinks:
             return []
+
+        text = source_bytes.decode('utf-8', errors='replace')
+        lines = text.split('\n')
 
         # Check each sink line for tainted variables or direct source patterns
         flows = []

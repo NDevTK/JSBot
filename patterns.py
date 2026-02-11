@@ -6,14 +6,18 @@ SOURCES = {
     "location.search":      r"""\blocation\.search\b""",
     "location.href_read":   r"""\blocation\.href\b(?!\s*=)""",
     "location.pathname":    r"""\blocation\.pathname\b""",
+    "location_whole":       r"""\b(?:window|document|self|globalThis)\.location\b(?!\.)""",
     "document.URL":         r"""\bdocument\.URL\b""",
     "document.documentURI": r"""\bdocument\.documentURI\b""",
+    "document.baseURI":     r"""\bdocument\.baseURI\b""",
+    "document.URLUnencoded": r"""\bdocument\.URLUnencoded\b""",
     "document.referrer":    r"""\bdocument\.referrer\b""",
     "window.name":          r"""\bwindow\.name\b""",
     "postMessage data":     r"""\b(?:event|e|evt|msg)\.data\b""",
     "URLSearchParams":      r"""\bURLSearchParams\b""",
     "getItem":              r"""\b(?:localStorage|sessionStorage)\.getItem\b""",
     "storage_bracket":      r"""\b(?:localStorage|sessionStorage)\s*\[""",
+    "storage_property":     r"""\b(?:localStorage|sessionStorage)\.(?!getItem\b|setItem\b|removeItem\b|clear\b|key\b|length\b)\w+""",
     "cookie_read":          r"""\bdocument\.cookie\b(?!\s*=)""",
     "input.value":          r"""\b(?:target|currentTarget|srcElement)\.value\b""",
 }
@@ -82,7 +86,7 @@ TAINT_SINKS = {
         "severity": 6,
     },
     "Script/Link Source": {
-        "pattern": r"""\.(?:src|href|action|formAction)\s*=""",
+        "pattern": r"""(?:\.(?:src|href|action|formAction|data)\s*=|\.setAttribute(?:NS)?\s*\()""",
         "severity": 6,
     },
     "Fetch/XHR": {
