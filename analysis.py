@@ -13,8 +13,6 @@ from scoring import looks_minified, _is_known_library, check_known_cves
 from sourcemaps import try_fetch_sourcemap, get_original_source
 from anomaly import ScriptRecord
 
-import jsbeautifier
-
 # --- Global State (managed by scan.py) ---
 SEEN_SCRIPTS = set()
 CHECKED_JS_URLS = set()
@@ -27,11 +25,6 @@ _RE_ESCAPED = re.compile(r'\\.')
 def get_sha256(data):
     """Computes SHA256 hash of the given data."""
     return sha256(data.encode('utf-8')).hexdigest()
-
-
-def format_javascript(js_code):
-    """Beautifies JavaScript code."""
-    return jsbeautifier.beautify(js_code)
 
 
 # --- Internal signal scoring (not exposed as separate findings) ---
@@ -52,12 +45,13 @@ _WEAK_ORIGIN_CHECK_RE = re.compile(
 )
 
 
-def _score_postmessage(script_content):
+def _score_postmessage(script_content, is_minified=False):
     """Score based on postMessage handlers with missing or weak origin checks."""
+    window_size = 1500 if is_minified else 5000
     best = 0
     for m in _POSTMESSAGE_HANDLER_RE.finditer(script_content):
         window_start = m.start()
-        window_end = min(len(script_content), m.start() + 5000)
+        window_end = min(len(script_content), m.start() + window_size)
         handler_window = script_content[window_start:window_end]
 
         has_strong_check = bool(_STRONG_ORIGIN_CHECK_RE.search(handler_window))
@@ -145,15 +139,19 @@ def _score_interesting_strings(script_content):
     return best
 
 
-_TAINT_PROXIMITY_CHARS = 5000  # ~150 lines of beautified code
+_TAINT_PROXIMITY_CHARS = 5000       # ~150 lines of non-minified code
+_TAINT_PROXIMITY_CHARS_MIN = 1500   # equivalent range in minified code
 
 
-def _score_taint_flow(script_content):
+def _score_taint_flow(script_content, is_minified=False):
     """Score based on source+sink co-occurrence with proximity analysis.
 
     Proximity-confirmed (source and sink within ~150 lines): higher score.
     File-level only (both present but far apart): lower score.
+    Window scales based on minification — minified code is ~3x denser.
     """
+    proximity = _TAINT_PROXIMITY_CHARS_MIN if is_minified else _TAINT_PROXIMITY_CHARS
+
     source_positions = []
     for source_pattern in SOURCES.values():
         for m in re.finditer(source_pattern, script_content):
@@ -176,7 +174,7 @@ def _score_taint_flow(script_content):
     for sink_pos, sink_sev in sink_hits:
         best_any = max(best_any, sink_sev)
         for src_pos in source_positions:
-            if abs(sink_pos - src_pos) <= _TAINT_PROXIMITY_CHARS:
+            if abs(sink_pos - src_pos) <= proximity:
                 best_proximate = max(best_proximate, sink_sev)
                 break
 
@@ -205,9 +203,9 @@ def _score_library_cves(script_content):
 # --- Main Script Analysis Pipeline ---
 
 def check_script_safety(script_content, script_hash, url, script_url=None,
-                        struct_hash=None, anomaly_detector=None):
+                        struct_hash=None, anomaly_detector=None, is_minified=False):
     """Analyze script and emit a single combined finding if interesting enough."""
-    minified = looks_minified(script_content)
+    minified = is_minified
     line_count = script_content.count('\n') + 1
     SCRIPT_METADATA[script_hash] = {
         "minified": minified,
@@ -257,7 +255,7 @@ def check_script_safety(script_content, script_hash, url, script_url=None,
 
     scores = []
 
-    pm_score = _score_postmessage(script_content)
+    pm_score = _score_postmessage(script_content, minified)
     if pm_score:
         scores.append(pm_score)
 
@@ -273,7 +271,7 @@ def check_script_safety(script_content, script_hash, url, script_url=None,
     if str_score:
         scores.append(str_score)
 
-    taint_score = _score_taint_flow(script_content)
+    taint_score = _score_taint_flow(script_content, minified)
     if taint_score:
         scores.append(taint_score)
 
@@ -312,7 +310,7 @@ async def process_javascript(js_code, url, client, script_url=None):
     if not js_code:
         return
 
-    js_code = format_javascript(js_code)
+    is_minified = looks_minified(js_code)
     raw_hash = get_sha256(js_code)
     structural = structural_hash(js_code)
 
@@ -321,7 +319,8 @@ async def process_javascript(js_code, url, client, script_url=None):
     SEEN_SCRIPTS.add(raw_hash)
     SEEN_SCRIPTS.add(structural)
 
-    check_script_safety(js_code, raw_hash, url, script_url, structural)
+    check_script_safety(js_code, raw_hash, url, script_url, structural,
+                        is_minified=is_minified)
 
     # Source map: try to fetch and re-analyze original source
     if ARGS and not getattr(ARGS, 'no_sourcemaps', False) and script_url and script_url != "inline":

@@ -1,6 +1,5 @@
 httpx[http2]
 beautifulsoup4
 lxml
-jsbeautifier
 requests
 psycopg2-binary

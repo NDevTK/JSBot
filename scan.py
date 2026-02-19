@@ -19,10 +19,10 @@ from bs4 import BeautifulSoup
 
 import output
 from output import log_message
-from scoring import score_url, url_path_key, path_segments, combined_url_score
+from scoring import score_url, url_path_key, path_segments, combined_url_score, looks_minified
 from patterns import JS_PATH_FINDER
 from analysis import (
-    format_javascript, structural_hash, get_sha256,
+    structural_hash, get_sha256,
     check_script_safety, _extract_template_urls,
     SEEN_SCRIPTS, CHECKED_JS_URLS,
 )
@@ -395,18 +395,30 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker, anom
                         if js.strip():
                             script_items.append((js, None))
 
+                # Fetch external scripts concurrently
+                script_urls_to_fetch = []
                 for script in page_parser.find_all('script', src=True):
                     script_url = urljoin(page_url, script['src'])
                     hashed_script_url = get_sha256(script_url)
                     if hashed_script_url in CHECKED_JS_URLS:
                         continue
                     CHECKED_JS_URLS.add(hashed_script_url)
+                    script_urls_to_fetch.append(script_url)
+
+                async def _fetch_script(surl):
                     try:
-                        resp = await client.get(script_url, timeout=timeout)
+                        resp = await client.get(surl, timeout=timeout)
                         if resp.status_code < 400:
-                            script_items.append((resp.text, str(resp.url)))
+                            return (resp.text, str(resp.url))
                     except httpx.RequestError as e:
-                        log_message("ERROR", f"Failed to fetch script {script_url}: {e}")
+                        log_message("ERROR", f"Failed to fetch script {surl}: {e}")
+                    return None
+
+                if script_urls_to_fetch:
+                    results = await asyncio.gather(
+                        *[_fetch_script(u) for u in script_urls_to_fetch]
+                    )
+                    script_items.extend(r for r in results if r is not None)
 
                 # Enqueue each script
                 for js_code, script_url in script_items:
@@ -466,6 +478,14 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker, anom
             url_queue.task_done()
 
 
+def _prepare_js(js_code):
+    """CPU-bound JS preparation: hash + minification check. Runs in thread pool."""
+    is_minified = looks_minified(js_code)
+    raw_hash = get_sha256(js_code)
+    struct_hash = structural_hash(js_code)
+    return js_code, raw_hash, struct_hash, is_minified
+
+
 async def js_audit_worker(js_queue, client, args, executor,
                           anomaly_detector, url_queue=None):
     """Pulls JS from js_queue, runs taint analysis + feature extraction."""
@@ -483,9 +503,10 @@ async def js_audit_worker(js_queue, client, args, executor,
             if not js_code or not js_code.strip():
                 continue
 
-            js_code = format_javascript(js_code)
-            raw_hash = get_sha256(js_code)
-            struct_hash = structural_hash(js_code)
+            # Hash + minification check in thread pool
+            js_code, raw_hash, struct_hash, is_minified = await loop.run_in_executor(
+                executor, _prepare_js, js_code,
+            )
 
             # Dedup (on event loop thread — safe)
             skip_analysis = False
@@ -500,7 +521,7 @@ async def js_audit_worker(js_queue, client, args, executor,
                 await loop.run_in_executor(
                     executor,
                     check_script_safety, js_code, raw_hash, item.page_url, item.script_url,
-                    struct_hash, anomaly_detector,
+                    struct_hash, anomaly_detector, is_minified,
                 )
 
                 # Source map (async fetch, sync re-analysis)
@@ -515,11 +536,12 @@ async def js_audit_worker(js_queue, client, args, executor,
                                     SEEN_SCRIPTS.add(original_hash)
                                     log_message("INFO", f"Re-analyzing source map for {item.script_url}")
                                     original_struct = structural_hash(original)
+                                    original_minified = looks_minified(original)
                                     await loop.run_in_executor(
                                         executor,
                                         check_script_safety, original, original_hash,
                                         item.page_url, item.script_url + " (source map)",
-                                        original_struct, anomaly_detector,
+                                        original_struct, anomaly_detector, original_minified,
                                     )
                     except Exception as e:
                         log_message("ERROR", f"Source map failed for {item.script_url}: {e}")
