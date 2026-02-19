@@ -1,6 +1,6 @@
 # JSBot
 
-Continuous JavaScript security scanner. Runs in the background, finds vulnerabilities, persists results. Review findings when you're ready.
+Target page finder. Scans JavaScript at scale, scores scripts by interestingness, shows you which pages to open in a browser. One entry per script — no duplicates, no noise.
 
 ```bash
 # Start scanning
@@ -22,7 +22,7 @@ python cli.py stop example.com
 pip install -r requirements.txt
 ```
 
-No external analysis tools — all security analysis runs inline via tree-sitter AST. Findings persist to SQLite — no external database required.
+All analysis runs inline via regex pattern matching — no external tools, no AST parsing. Findings persist to SQLite.
 
 ## Commands
 
@@ -48,21 +48,16 @@ python cli.py start example.com -b "session=abc123" -H "X-CSRF-Token: xyz"
 python cli.py start example.com --rescan
 ```
 
-The scanner runs in the background. Each cycle: discovers subdomains via CT logs, pulls historical URLs from Common Crawl, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps, and analyzes every script it finds. After a full pass, it sleeps for an hour and re-scans — detecting new scripts, modified code, and configuration changes.
+The scanner runs in the background. Each cycle: discovers subdomains via CT logs, pulls historical URLs from Common Crawl, discovers paths from robots.txt and sitemaps, spiders for deeper pages, fetches source maps, and scores every script it finds. After a full pass, it sleeps for an hour and re-scans.
 
 ### Reviewing Findings
 
 ```bash
-# All findings, newest first
+# All findings, highest score first
 python cli.py findings example.com
 
-# High severity only
-python cli.py findings --severity 8
-
-# By type
-python cli.py findings --type taint_flow
-python cli.py findings --type postmessage_issue
-python cli.py findings --type anomaly
+# High score only
+python cli.py findings --score 8
 
 # JSONL export (for jq, scripts, etc.)
 python cli.py findings --json
@@ -71,110 +66,45 @@ python cli.py findings --json
 python cli.py findings --limit 200
 ```
 
-## Analysis
+Output shows one line per script: score, script URL, and an example page URL where the script is loaded.
 
-### Taint Flow (Intra-File)
+## Philosophy
 
-Tree-sitter AST analysis tracks user-controlled data from sources to sinks within each script. Taint tracking is scoped to function boundaries — each function gets its own taint map, child functions inherit from parents, and local declarations/parameters shadow inherited taint. This prevents minified variable name collisions across functions from producing false positives.
+JSBot is a **target page finder**. It tells you which scripts are worth opening in a browser. It doesn't try to prove vulnerabilities — it scores interestingness.
 
-Two detection modes:
+- **One entry per script hash.** Multiple signals (source+sink co-occurrence, postMessage handlers, prototype pollution, endpoints, secrets, CVEs) are combined into a single interestingness score. The breakdown is internal.
+- **Regex-based.** All analysis uses compiled regex patterns. No AST parsing, no tree-sitter, no heavyweight dependencies.
+- **Fast iteration.** Scans complete quickly because analysis is lightweight. Re-scans detect changes via anomaly detection.
 
-```javascript
-// Direct: source flows straight into sink (AST extracts the value
-// portion of the sink expression, not the whole line)
-el.innerHTML = location.hash;
+## How Scoring Works
 
-// Via variable: source stored, then used in sink
-var input = new URLSearchParams(location.search).get("q");
-document.getElementById("results").innerHTML = input;
-```
+Each script is scored by the highest signal found:
 
-Direct mode uses AST to extract only the value flowing into the sink (RHS for assignments, arguments for calls). Self-assignments like `location.href = location.href` produce no finding — no new data flows.
+| Signal                | What it detects                                                | Score  |
+| --------------------- | -------------------------------------------------------------- | ------ |
+| postMessage handler   | `addEventListener('message')` without origin check, near sinks | 7-9    |
+| Prototype pollution   | Deep merge/extend calls (`_.merge`, `$.extend(true, ...)`)     | 7      |
+| Interesting endpoints | Internal, admin, auth, GraphQL, WebSocket URLs                 | 4-6    |
+| Sensitive strings     | Hardcoded secrets, internal IPs, cloud URLs, JWTs              | 5-9    |
+| Known CVEs            | Library with published vulnerabilities                         | By CVE |
 
-### Secret Detection
-
-Regex patterns detect hardcoded credentials and API keys in JavaScript source:
-
-- **AWS access keys** (severity 9) — `AKIA...` patterns
-- **GitHub tokens** (severity 9) — `ghp_`, `ghs_`, `gho_`, `ghr_` prefixed tokens
-- **Slack tokens** (severity 9) — `xoxb-`, `xoxp-`, `xoxa-`, `xoxs-` tokens
-- **Stripe secret keys** (severity 9) — `sk_live_...` patterns
-- **Google API keys** (severity 5) — `AIza...` patterns
-- **Private key blocks** (severity 9) — `-----BEGIN PRIVATE KEY-----` and variants
-- **Generic API keys** (severity 5) — `apiKey = "..."`, `secret_key = "..."` assignment patterns
-- **JWTs** (severity 8) — Hardcoded `eyJ...` tokens in string literals
-
-### Cross-File Taint
-
-Tracks `window.X = taintedValue` assignments across all scripts on the same page. If script A writes tainted data to a global and script B reads that global into a sink, JSBot emits a `cross_file_taint` finding. Also detects dangerous global functions — `window.renderHTML = (html) => { el.innerHTML = html }` — that any script can call.
+If a script has multiple signals, the highest score wins. The individual signals are not exposed — just the final score.
 
 ### Anomaly Detection
 
-JSBot tracks scripts across scans to detect changes and contextual anomalies. Profiles are persisted in the SQLite database (`anomaly_profiles` table) — the first scan builds a baseline, subsequent scans detect deviations.
+Anomaly findings are separate from script scoring. They track changes across scans:
 
-**Change signals** (require previous scan data):
-
-- **`new_script`** (severity 7) — script URL not seen in previous scan of this subdomain. Primary signal for compromise or supply chain injection. Cache-busted filenames (`app.abc123.js` → `app.def456.js`) are normalized so deploys don't trigger false positives.
-- **`modified_script`** (severity 8) — same script URL (or same URL after cache-bust normalization) but structural hash changed since last scan. Indicates tampered or updated code.
-- **`origin_anomaly`** (severity 8) — script served from a hostname not previously seen for this subdomain. Everything loads from `cdn.example.com` but one script loads from `sketchy-cdn.net`.
-
-**Vulnerability surface signals** (current scan only, no history needed):
-
-- **`has_sinks`** (severity 5) — script contains dangerous sink patterns (innerHTML, eval, document.write, etc.). Indicates attack surface worth reviewing.
-- **`source_and_sink`** (severity 6) — script reads user input (location.hash, postMessage, URLSearchParams, etc.) AND writes to dangerous sinks. The ingredients for a vulnerability are in the same file.
-- **`inline_with_sinks`** (severity 7) — inline `<script>` block containing sinks. High priority because inline scripts are often server-rendered with user data.
-
-**Overlooked code signals** (code that likely got less scrutiny):
-
-- **`not_minified`** (severity 5) — unminified custom code on a subdomain where 85%+ of scripts are minified. Skipped the build pipeline, likely got less review.
-- **`small_non_library`** (severity 5) — custom script under 100 lines on a library-heavy subdomain (>50% libraries). Small custom scripts among polished libraries often mean quick fixes, debug helpers, or glue code that got less review.
-
-Overlooked signals compound with vulnerability surface: overlooked + sinks → severity 6, overlooked + source-and-sink → severity 7.
-
-### postMessage Analysis
-
-Dedicated AST analysis for message event handlers. JSBot finds `addEventListener('message', ...)` and `window.onmessage = ...` patterns, then checks:
-
-- **Origin validation**: Does the handler check `event.origin` before acting?
-- **Sink flow**: Does `event.data` reach a dangerous sink (innerHTML, eval, etc.)?
-
-| Issue                       | Severity | Meaning                                                                                  |
-| --------------------------- | -------- | ---------------------------------------------------------------------------------------- |
-| `no_origin_check_with_sink` | 9        | No origin check + data flows to sink. Likely exploitable.                                |
-| `no_origin_check`           | 7        | No origin check, but no obvious sink. Still worth reviewing.                             |
-| `data_to_sink`              | 6        | Origin is checked, but data still reaches a sink. Check if the validation is sufficient. |
-
-### Endpoint Extraction
-
-Extracts API endpoints, internal paths, and WebSocket URLs from JavaScript source. Captured patterns: `fetch()`, `axios.*()`, `XMLHttpRequest.open()`, string literals matching `/api/`, `/graphql/`, `/internal/`, `/admin/`, and `wss://` WebSocket URLs.
-
-### Interesting String Extraction
-
-Extracts sensitive recon data embedded in JavaScript:
-
-- **Internal IPs** (severity 6) — RFC1918 addresses
-- **Cloud URLs** (severity 6-7) — AWS S3, Firebase, Supabase, GCS, Azure
-- **JWT tokens** (severity 8) — Hardcoded JWTs
-- **Debug flags** (severity 5) — `debugMode = true`, `isAdmin = true`
-- **Security TODOs** (severity 5) — Comments containing security keywords
-
-### Known CVE Detection
-
-Two-layer library vulnerability detection:
-
-1. **Specific fingerprints** — high-confidence regex patterns for jQuery, Angular.js, Vue.js, Lodash, Bootstrap, and Moment.js with a hardcoded CVE database (works offline).
-2. **Generic detection + OSV.dev** — catches smaller libraries, queries the OSV.dev vulnerability database. Results are cached per library+version.
+- **`new_script`** (score 7) — script URL not seen in previous scan
+- **`modified_script`** (score 8) — same URL but structural hash changed
+- **`origin_anomaly`** (score 8) — script served from unexpected hostname
+- **`source_and_sink`** (score 6) — reads user input AND writes to dangerous sinks
+- **`inline_with_sinks`** (score 7) — inline script block containing sinks
+- **`not_minified`** / **`small_non_library`** (score 5) — code that likely got less scrutiny
 
 ### Response Headers
 
-Checks HTTP response headers for exploitable misconfigurations:
-
-- **CORS wildcard + credentials** (severity 9) — `Access-Control-Allow-Origin: *` with `Access-Control-Allow-Credentials: true`.
-
-CSP analysis uses **anomaly detection** — tracks CSP state per subdomain across scans and detects changes:
-
-- **`csp_removed`** (severity 7) — CSP header was present in the previous scan but is now missing.
-- **`csp_weakened`** (severity 7) — CSP gained `unsafe-inline` or `unsafe-eval` since the previous scan.
+- **CORS wildcard + credentials** (score 9) — exploitable misconfiguration
+- **CSP removed/weakened** (score 7) — CSP header disappeared or gained unsafe-inline/unsafe-eval
 
 ## Discovery
 
@@ -210,17 +140,3 @@ All state lives in a single `jsbot.db` (SQLite, WAL mode) in the project root:
 | `daemon_logs`      | Recent log entries from scanner processes            |
 
 All tables are domain-scoped. No filesystem state — everything in one file.
-
-## Finding Types
-
-| Type                        | Method                 | Description                                                       |
-| --------------------------- | ---------------------- | ----------------------------------------------------------------- |
-| `taint_flow`                | AST                    | User input flows to dangerous sink via variable tracking          |
-| `cross_file_taint`          | AST                    | Tainted global written by one script, read into sink by another   |
-| `dangerous_global_function` | AST                    | Function on window/globalThis containing sinks                    |
-| `anomaly`                   | change detection + AST | Script change, origin anomaly, or vulnerability surface           |
-| `postmessage_issue`         | AST                    | Message handler with missing origin check or data flowing to sink |
-| `endpoint`                  | regex                  | API endpoint, WebSocket URL, or internal path                     |
-| `interesting_string`        | regex                  | Internal IP, cloud URL, JWT, secret, debug flag, or security TODO |
-| `known_cve`                 | version detection      | Library with known CVE                                            |
-| `header_issue`              | header analysis        | CORS misconfiguration or CSP weakening                            |

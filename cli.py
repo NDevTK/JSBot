@@ -25,7 +25,7 @@ from daemon import (
 
 # --- Formatting Helpers ---
 
-_SEVERITY_COLORS = {
+_SCORE_COLORS = {
     9: '\033[91m',  # bright red
     8: '\033[91m',  # red
     7: '\033[93m',  # yellow
@@ -37,9 +37,9 @@ _BOLD = '\033[1m'
 _DIM = '\033[2m'
 
 
-def _sev_label(severity):
-    color = _SEVERITY_COLORS.get(severity, _DIM)
-    return f'{color}{severity}{_RESET}'
+def _score_label(score):
+    color = _SCORE_COLORS.get(score, _DIM)
+    return f'{color}[{score}]{_RESET}'
 
 
 def _time_ago(timestamp):
@@ -178,7 +178,7 @@ def cmd_findings(args):
 
         try:
             findings = store.get_findings(
-                severity_min=args.severity or 0,
+                severity_min=args.score or 0,
                 finding_type=args.type,
                 limit=args.limit,
             )
@@ -186,7 +186,7 @@ def cmd_findings(args):
             if not findings:
                 if args.domain:
                     print(f'No findings for {domain}' +
-                          (f' matching filters' if args.severity or args.type else ''))
+                          (f' matching filters' if args.score or args.type else ''))
                 continue
 
             if args.json:
@@ -201,69 +201,18 @@ def cmd_findings(args):
 
             for f in findings:
                 data = json.loads(f['data_json'])
-                sev = data.get('severity', 0)
-                ftype = data.get('finding_type', 'unknown')
+                score = data.get('severity', 0)
                 source = data.get('source_url', '')
                 script = data.get('script_url', '')
 
-                print(f'\n  {_sev_label(sev)}  {_BOLD}{ftype}{_RESET}')
+                print(f'\n  {_score_label(score)}  {script or source or "inline"}')
 
-                if ftype == 'taint_flow':
-                    print(f'     {data.get("taint_source", "?")} -> {data.get("sink_category", "?")}')
-                    if data.get('tainted_var') and data['tainted_var'] != 'direct':
-                        print(f'     via variable: {data["tainted_var"]}')
-                    print(f'     line {data.get("sink_line", "?")}')
-                elif ftype == 'cross_file_taint':
-                    print(f'     {data.get("taint_source", "?")} -> {data.get("global_name", "?")} -> {data.get("sink_category", "?")}')
-                    print(f'     writer: {data.get("writer_script", "?")}:{data.get("writer_line", "?")}')
-                    print(f'     reader: {data.get("reader_script", "?")}:{data.get("sink_line", "?")}')
-                elif ftype == 'postmessage_issue':
-                    print(f'     {data.get("issue", "?")}')
-                    if data.get('sink_categories'):
-                        print(f'     sinks: {", ".join(data["sink_categories"])}')
-                elif ftype == 'anomaly':
-                    signals = data.get('signals', [])
-                    print(f'     signals: {", ".join(signals)}')
-                    if data.get('sink_categories'):
-                        print(f'     sinks: {", ".join(data["sink_categories"])}')
-                elif ftype == 'known_cve':
-                    print(f'     {data.get("library", "?")} {data.get("version", "?")}')
-                    cves = data.get('cves', [])
-                    if cves:
-                        print(f'     CVEs: {", ".join(cves[:5])}')
-                elif ftype == 'header_issue':
-                    for issue in data.get('issues', []):
-                        print(f'     {issue.get("type", "?")}: {issue.get("detail", "")}')
-                elif ftype == 'endpoint':
-                    eps = data.get('endpoints', [])
-                    for ep in eps[:5]:
-                        print(f'     {ep.get("type", "?")}: {ep.get("url", "")}')
-                    if len(eps) > 5:
-                        print(f'     ... +{len(eps) - 5} more')
-                elif ftype == 'interesting_string':
-                    strings = data.get('strings', [])
-                    for s in strings[:5]:
-                        val = s.get('value', '')
-                        if len(val) > 80:
-                            val = val[:77] + '...'
-                        print(f'     {s.get("type", "?")}: {val}')
-                    if len(strings) > 5:
-                        print(f'     ... +{len(strings) - 5} more')
-                elif ftype == 'dangerous_global_function':
-                    print(f'     {data.get("global_name", "?")}')
-                    if data.get('sink_categories'):
-                        print(f'     sinks: {", ".join(data["sink_categories"])}')
-
-                if script and script != 'inline':
-                    label = script
-                    if len(label) > 80:
-                        label = '...' + label[-77:]
-                    print(f'     {_DIM}{label}{_RESET}')
-                elif source:
+                # Example page URL
+                if source and source != script:
                     label = source
                     if len(label) > 80:
                         label = '...' + label[-77:]
-                    print(f'     {_DIM}{label}{_RESET}')
+                    print(f'       {_DIM}{label}{_RESET}')
 
             total = store.get_total_count()
             shown = len(findings)
@@ -293,29 +242,50 @@ def cmd_domains(args):
     print(f'\n{_BOLD}Scanned Domains{_RESET}\n')
     for domain in domains:
         try:
-            info = get_domain_summary(domain)
-            total = info['total_findings']
-            status_marker = f' {_BOLD}* running{_RESET}' if domain in running else ''
+            store = FindingsStore(domain)
+            try:
+                info = get_domain_summary(domain)
+                total = info['total_findings']
+                status_marker = f' {_BOLD}* running{_RESET}' if domain in running else ''
 
-            # Break down by type
-            type_counts = {}
-            for row in info['by_type']:
-                ft = row['finding_type']
-                type_counts[ft] = type_counts.get(ft, 0) + row['count']
+                # Break down by type
+                type_counts = {}
+                for row in info['by_type']:
+                    ft = row['finding_type']
+                    type_counts[ft] = type_counts.get(ft, 0) + row['count']
 
-            types_str = ', '.join(f'{k}: {v}' for k, v in
-                                  sorted(type_counts.items(), key=lambda x: -x[1]))
+                types_str = ', '.join(f'{k}: {v}' for k, v in
+                                      sorted(type_counts.items(), key=lambda x: -x[1]))
 
-            print(f'  {_BOLD}{domain}{_RESET}{status_marker}')
-            print(f'    {total} findings ({types_str})')
+                # Load CT discovery state for subdomain/related counts
+                ct_state = store.load_ct_state()
+                subs = ct_state.get('scanned_subdomains', [])
+                related = ct_state.get('related_domains', [])
+                fetched = ct_state.get('fetched_months', [])
 
-            session = info.get('last_session')
-            if session:
-                if session.get('finished_at'):
-                    print(f'    last scan: {_time_ago(session["finished_at"])}')
-                elif session.get('started_at'):
-                    print(f'    scanning since: {_time_ago(session["started_at"])}')
-            print()
+                print(f'  {_BOLD}{domain}{_RESET}{status_marker}')
+                print(f'    {total} findings ({types_str})')
+
+                # Show subdomain discovery info
+                discovery_parts = []
+                if subs:
+                    discovery_parts.append(f'{len(subs)} subdomains')
+                if related:
+                    discovery_parts.append(f'{len(related)} related domains')
+                if fetched:
+                    discovery_parts.append(f'{len(fetched)} CT months fetched')
+                if discovery_parts:
+                    print(f'    {", ".join(discovery_parts)}')
+
+                session = info.get('last_session')
+                if session:
+                    if session.get('finished_at'):
+                        print(f'    last scan: {_time_ago(session["finished_at"])}')
+                    elif session.get('started_at'):
+                        print(f'    scanning since: {_time_ago(session["started_at"])}')
+                print()
+            finally:
+                store.close()
         except Exception as e:
             print(f'  {domain}  (error: {e})')
 
@@ -421,7 +391,7 @@ def main():
     # findings
     p_findings = subparsers.add_parser('findings', help='Review findings')
     p_findings.add_argument('domain', nargs='?', help='Domain (omit for all)')
-    p_findings.add_argument('--severity', type=int, help='Minimum severity (1-9)')
+    p_findings.add_argument('--score', type=int, help='Minimum score (1-10)')
     p_findings.add_argument('--type', help='Finding type filter')
     p_findings.add_argument('--limit', type=int, default=50, help='Max findings to show')
     p_findings.add_argument('--json', action='store_true', help='Output as JSONL')

@@ -1,6 +1,6 @@
-"""Taint source/sink patterns for AST analysis, URL/JS path discovery."""
+"""Taint source/sink patterns for regex-based analysis, URL/JS path discovery."""
 
-# --- Taint Analysis: Sources & Sinks (used by ASTAnalyzer) ---
+# --- Taint Analysis: Sources & Sinks (used by regex source/sink detection) ---
 SOURCES = {
     "location.hash":        r"""\blocation\.hash\b""",
     "location.search":      r"""\blocation\.search\b""",
@@ -89,9 +89,9 @@ SINKS = {
     },
 }
 
-# Taint-only sinks: used by find_taint_flows but NOT anomaly has_sinks detection.
+# Taint-only sinks: used by source+sink co-occurrence but NOT anomaly has_sinks detection.
 # These patterns are too broad for anomaly (setTimeout fires on 90% of scripts)
-# or need argument context that AST sink detection doesn't provide.
+# but useful for flagging when they co-occur with a user-controlled source.
 TAINT_SINKS = {
     "createContextualFragment": {
         "pattern": r"""\bcreateContextualFragment\s*\(""",

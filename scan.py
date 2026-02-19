@@ -11,7 +11,6 @@ import os
 import re
 import sys
 from collections import namedtuple
-from dataclasses import dataclass, field
 from random import shuffle
 from urllib.parse import urljoin, urlparse
 
@@ -23,10 +22,9 @@ from output import log_message
 from scoring import score_url, url_path_key, path_segments, combined_url_score
 from patterns import JS_PATH_FINDER
 from analysis import (
-    format_javascript, structural_hash, get_sha256, get_ast_analyzer,
+    format_javascript, structural_hash, get_sha256,
     check_script_safety, _extract_template_urls,
     SEEN_SCRIPTS, CHECKED_JS_URLS,
-    CrossFileState,
 )
 from sourcemaps import try_fetch_sourcemap, get_original_source
 from discovery import (
@@ -128,21 +126,8 @@ def _save_anomaly_profiles(store, anomaly_detector):
 _POISON = object()
 
 JsWorkItem = namedtuple('JsWorkItem', [
-    'js_code', 'page_url', 'script_url', 'page_tracker',
+    'js_code', 'page_url', 'script_url',
 ])
-
-
-@dataclass
-class PageTracker:
-    """Coordinates cross-file analysis — counts scripts remaining for one page."""
-    page_url: str
-    cross_file: CrossFileState
-    total: int
-    remaining: int = field(init=False)
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
-
-    def __post_init__(self):
-        self.remaining = self.total
 
 
 _FINDING_BOOST = 3  # each finding = N "free" crawl credits for host selection
@@ -395,7 +380,6 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker, anom
                     js_code=response.text,
                     page_url=page_url,
                     script_url=page_url,
-                    page_tracker=None,
                 ))
 
             # HTML content
@@ -424,23 +408,12 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker, anom
                     except httpx.RequestError as e:
                         log_message("ERROR", f"Failed to fetch script {script_url}: {e}")
 
-                # Build PageTracker for cross-file analysis
-                tracker = None
-                if script_items:
-                    cross_file = CrossFileState()
-                    tracker = PageTracker(
-                        page_url=page_url,
-                        cross_file=cross_file,
-                        total=len(script_items),
-                    )
-
                 # Enqueue each script
                 for js_code, script_url in script_items:
                     await js_queue.put(JsWorkItem(
                         js_code=js_code,
                         page_url=page_url,
                         script_url=script_url,
-                        page_tracker=tracker,
                     ))
 
                 # Discover JS paths referenced in HTML
@@ -462,7 +435,6 @@ async def page_crawl_worker(url_queue, js_queue, client, args, url_tracker, anom
                                 js_code=js_resp.text,
                                 page_url=page_url,
                                 script_url=js_url,
-                                page_tracker=None,
                             ))
                     except httpx.RequestError:
                         pass
@@ -509,8 +481,6 @@ async def js_audit_worker(js_queue, client, args, executor,
         try:
             js_code = item.js_code
             if not js_code or not js_code.strip():
-                # Still need to decrement PageTracker for empty scripts
-                await _decrement_page_tracker(item.page_tracker, executor, loop, url_queue)
                 continue
 
             js_code = format_javascript(js_code)
@@ -583,7 +553,6 @@ async def js_audit_worker(js_queue, client, args, executor,
                                 js_code=resp.text,
                                 page_url=item.page_url,
                                 script_url=script_url,
-                                page_tracker=None,
                             ))
                     except httpx.RequestError:
                         pass
@@ -611,44 +580,15 @@ async def js_audit_worker(js_queue, client, args, executor,
                                         js_code=inline_js,
                                         page_url=item.page_url,
                                         script_url=tmpl_url,
-                                        page_tracker=None,
                                     ))
                     except httpx.RequestError:
                         pass
 
-            # Cross-file tracking (always, even for deduped scripts)
-            if item.page_tracker is not None:
-                pt = item.page_tracker
-                pt.cross_file.add_script(js_code, item.script_url or "inline", raw_hash)
-                await _decrement_page_tracker(pt, executor, loop, url_queue)
 
         except Exception as e:
             log_message("ERROR", f"JS audit error: {e}")
         finally:
             js_queue.task_done()
-
-
-async def _decrement_page_tracker(page_tracker, executor, loop, url_queue=None):
-    """Decrement a PageTracker and run cross-file analysis when all scripts are done."""
-    if page_tracker is None:
-        return
-    async with page_tracker.lock:
-        page_tracker.remaining -= 1
-        if page_tracker.remaining <= 0 and page_tracker.cross_file.scripts:
-            analyzer = get_ast_analyzer()
-            try:
-                await loop.run_in_executor(
-                    executor,
-                    page_tracker.cross_file.collect_globals, analyzer,
-                )
-                count = page_tracker.cross_file.emit_cross_file_findings(page_tracker.page_url)
-                if count and url_queue is not None:
-                    host = urlparse(page_tracker.page_url).hostname
-                    if host:
-                        for _ in range(count):
-                            url_queue.record_finding(host)
-            except Exception as e:
-                log_message("ERROR", f"Cross-file analysis failed for {page_tracker.page_url}: {e}")
 
 
 # --- Producer Coroutines ---

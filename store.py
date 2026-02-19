@@ -138,46 +138,15 @@ class FindingsStore:
         ft = finding.get('finding_type', '')
         parts = [ft]
 
-        if ft == 'taint_flow':
-            parts += [
-                finding.get('script_hash', ''),
-                finding.get('taint_source', ''),
-                finding.get('sink_category', ''),
-                str(finding.get('sink_line', '')),
-            ]
-        elif ft == 'cross_file_taint':
-            parts += [
-                finding.get('global_name', ''),
-                finding.get('sink_category', ''),
-                finding.get('script_hash', ''),
-            ]
-        elif ft == 'postmessage_issue':
-            parts += [
-                finding.get('script_hash', ''),
-                str(finding.get('handler_line', '')),
-            ]
+        if ft == 'interesting_script':
+            parts.append(finding.get('script_hash', ''))
         elif ft == 'anomaly':
             parts += [
                 finding.get('script_url', ''),
                 finding.get('structural_hash', ''),
             ]
-        elif ft == 'known_cve':
-            parts += [
-                finding.get('library', ''),
-                finding.get('version', ''),
-                str(finding.get('cves', [''])[0] if finding.get('cves') else ''),
-            ]
-        elif ft == 'endpoint':
-            parts.append(finding.get('script_hash', ''))
-        elif ft == 'interesting_string':
-            parts.append(finding.get('script_hash', ''))
         elif ft == 'header_issue':
             parts.append(finding.get('subdomain', ''))
-        elif ft == 'dangerous_global_function':
-            parts += [
-                finding.get('global_name', ''),
-                finding.get('defined_in', ''),
-            ]
         else:
             parts.append(json.dumps(finding, sort_keys=True)[:200])
 

@@ -2,14 +2,14 @@
 
 ## What this is
 
-JSBot is a continuous JavaScript security scanner. It runs in the background, finds client-side vulnerabilities (DOM XSS, open redirects, eval injection, postMessage issues) by tracking data flow from user-controlled sources to dangerous sinks using tree-sitter AST analysis. Findings persist to a SQLite database. Review them with CLI commands when you're ready.
+JSBot is a continuous JavaScript security scanner. It runs in the background, scores scripts by interestingness for manual review, and persists results. One finding per script hash — no duplicates, no noise. Review findings when you're ready.
 
 ## Architecture
 
 ```
 cli.py           Unified CLI — start/stop/status/findings/domains/clear
 scan.py          Pipeline orchestrator — crawling, queuing, URL scoring, continuous loop
-analysis.py      Core security analysis — taint flow, postMessage, cross-file taint, endpoints
+analysis.py      Core analysis — scores scripts by combined interestingness signals
 patterns.py      Source/sink/secret pattern definitions (SOURCES, SINKS, TAINT_SINKS)
 anomaly.py       Per-subdomain change detection across scans
 scoring.py       URL novelty scoring, library detection, CVE lookup (hardcoded + OSV.dev)
@@ -26,49 +26,48 @@ output.py        Finding persistence (→ store only, no stdout)
 python cli.py start <domain>          # Start background scan — runs continuously
 python cli.py stop [domain]           # Stop scanner (no domain = stop all)
 python cli.py status                  # Running scans + finding counts
-python cli.py findings [domain]       # Review findings (--severity, --type, --json)
+python cli.py findings [domain]       # Review findings (--score, --type, --json)
 python cli.py domains                 # List all scanned domains
 python cli.py clear <domain>          # Delete all state for a domain
 ```
 
 Run as `python cli.py <command>`.
 
-## Core principle: AST over regex
+## Core principle: target page finder
 
-This is a high-signal security tool. Every detection must be grounded in actual code structure, not pattern guessing.
+JSBot is a target finder. It identifies scripts worth opening in a browser and looking at manually. It does not try to prove vulnerabilities — it scores interestingness.
 
-**Use tree-sitter AST** for understanding code behavior — variable assignments, function boundaries, call expressions, argument values. The AST tells you what the code actually does.
+**One finding per script hash.** Every script gets at most one entry. Multiple signals (source+sink co-occurrence, postMessage handlers, prototype pollution, endpoints, interesting strings, CVEs) are combined into a single interestingness score. The individual signals are internal — not exposed.
 
-**Avoid line-level regex** for security analysis. Regex can't scope variables to functions, can't distinguish LHS from RHS in assignments, can't tell if a source is flowing into a sink or just happens to be on the same line. Every time regex was used for detection, it produced false positives that had to be fixed with AST.
+**Output is a ranked list.** Each finding shows: score, script URL, example page URL. That's it.
 
-**No hardcoded exclusion rules.** Don't skip analysis based on filenames, library names, or URL patterns. If the analysis produces false positives on jQuery or Angular, the analysis logic is wrong — fix the logic so it's correct for ALL code, not just non-library code.
+**Regex-based analysis.** All checks use compiled regex patterns. No AST parsing, no tree-sitter, no heavyweight dependencies.
+
+**No hardcoded exclusion rules.** Don't skip analysis based on filenames, library names, or URL patterns. The scoring system handles prioritization.
+
+## Finding types
+
+Only three finding types in the output:
+
+| Type                 | Source      | What it means                                                               |
+| -------------------- | ----------- | --------------------------------------------------------------------------- |
+| `interesting_script` | analysis.py | Script scored high enough on combined signals to be worth reviewing         |
+| `anomaly`            | anomaly.py  | Script changed, came from unexpected origin, or has unusual characteristics |
+| `header_issue`       | scan.py     | Missing security headers on the page                                        |
+
+## Interestingness signals (internal, not shown)
+
+These contribute to the `interesting_script` score but are not exposed as separate findings:
+
+- postMessage handlers without origin checks
+- Prototype pollution sinks (deep merge/extend)
+- Interesting API endpoints
+- Sensitive strings (secrets, internal IPs, cloud URLs)
+- Known library CVEs
 
 ## State storage
 
 All state lives in a single `jsbot.db` (SQLite, WAL mode) in the project root. All tables are domain-scoped. Tables: findings, scan_sessions, scan_state (path segments + script hashes), anomaly_profiles (per-subdomain baselines), ct_state (fetched months), ct_cache (per-month subdomain results), daemons (running PIDs), daemon_logs (recent log entries). No filesystem state files. The store initializes automatically when a scan starts. Deduplication happens at the store level by finding key.
-
-## Taint tracking design
-
-Taint flows through `_collect_taint_per_scope` in analysis.py:
-
-1. Each function (`function_declaration`, `function_expression`, `arrow_function`, `method_definition`) gets its own scope
-2. Child scopes inherit parent tainted variables
-3. Local `var`/`let`/`const` declarations and function parameters shadow parent taint
-4. Two-phase: build the scope's taint map first (skipping child functions), then recurse into children with the completed map
-5. Processing is source-order (reversed children on stack) so taint chains work (`a = source; b = a; sink(b)`)
-
-Direct mode (source directly in sink expression, no intermediate variable) uses `_extract_sink_value`:
-
-- Finds the specific AST node matching the sink at that line
-- Extracts only the value portion (RHS for assignments, arguments for calls)
-- Self-assignment (LHS == RHS) returns no value — structural no-op detection
-
-## Pattern definitions (patterns.py)
-
-- **SOURCES** — user-controlled input origins (location.hash, document.cookie, event.data, etc.)
-- **SINKS** — dangerous operations detected via AST call/assignment analysis (eval, innerHTML, document.write, etc.). Used by both taint analysis and anomaly detection.
-- **TAINT_SINKS** — patterns too broad for anomaly detection but valid when tainted data reaches them (setTimeout, window.open, .src/.href assignment, fetch). Only checked during taint analysis, not anomaly scoring.
-- **INTERESTING_STRING_PATTERNS** — recon extraction (internal IPs, cloud URLs, JWTs, debug flags)
 
 ## Background scanning
 
@@ -94,9 +93,7 @@ python cli.py findings public-firing-range.appspot.com
 ## What not to do
 
 - Don't add `if library: skip` guards. Fix the analysis to be correct.
-- Don't use regex to determine if code is safe or unsafe. Use AST structure.
+- Don't expose individual signal types as separate findings. Combine into one score per script.
 - Don't hardcode URL or filename exclusions. The scoring system handles prioritization.
-- Don't add severity based on guesses about what a pattern "usually means." Severity should reflect actual exploitability based on the source-to-sink flow.
-- Don't create per-API-name special cases. Write general rules that handle all APIs correctly through structural analysis.
 - Don't make the database optional. It is always on.
 - Don't add foreground or one-shot modes. The scanner runs in the background only.

@@ -4,5 +4,3 @@ lxml
 jsbeautifier
 requests
 psycopg2-binary
-tree-sitter
-tree-sitter-javascript
