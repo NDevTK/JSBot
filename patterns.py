@@ -87,6 +87,10 @@ SINKS = {
         "pattern": r"""\.postMessage\s*\(""",
         "severity": 4,
     },
+    "postMessage Wildcard": {
+        "pattern": r"""\.postMessage\s*\([^)]+,\s*['"`]\*['"`]\s*\)""",
+        "severity": 7,
+    },
 }
 
 # Taint-only sinks: used by source+sink co-occurrence but NOT anomaly has_sinks detection.

@@ -7,7 +7,7 @@ from urllib.parse import urljoin, urlparse
 
 from patterns import (SOURCES, SINKS, TAINT_SINKS, JS_PATH_FINDER,
                       ENDPOINT_PATTERNS, INTERESTING_STRING_PATTERNS,
-                      PROTOTYPE_POLLUTION_SINKS)
+                      PROTOTYPE_POLLUTION_SINKS, PROTOTYPE_POLLUTION_SOURCES)
 from output import log_message, SEEN_FINDINGS, SCRIPT_METADATA
 from scoring import looks_minified, _is_known_library, check_known_cves
 from sourcemaps import try_fetch_sourcemap, get_original_source
@@ -42,21 +42,26 @@ _POSTMESSAGE_HANDLER_RE = re.compile(
     r"""|onmessage\s*=""",
     re.IGNORECASE,
 )
-_ORIGIN_CHECK_RE = re.compile(
-    r"""\.origin\s*(?:===?|!==?|\.(?:includes|startsWith|match|indexOf|endsWith))\s*""",
+_STRONG_ORIGIN_CHECK_RE = re.compile(
+    r"""\.origin\s*(?:===?|!==?)""",
+    re.IGNORECASE,
+)
+_WEAK_ORIGIN_CHECK_RE = re.compile(
+    r"""\.origin\s*\.(?:includes|startsWith|match|indexOf|endsWith)\s*\(""",
     re.IGNORECASE,
 )
 
 
 def _score_postmessage(script_content):
-    """Score based on postMessage handlers with missing origin checks or sinks."""
+    """Score based on postMessage handlers with missing or weak origin checks."""
     best = 0
     for m in _POSTMESSAGE_HANDLER_RE.finditer(script_content):
         window_start = m.start()
-        window_end = min(len(script_content), m.start() + 2000)
+        window_end = min(len(script_content), m.start() + 5000)
         handler_window = script_content[window_start:window_end]
 
-        has_origin_check = bool(_ORIGIN_CHECK_RE.search(handler_window))
+        has_strong_check = bool(_STRONG_ORIGIN_CHECK_RE.search(handler_window))
+        has_weak_check = bool(_WEAK_ORIGIN_CHECK_RE.search(handler_window))
 
         has_sinks = False
         for sink_info in SINKS.values():
@@ -69,23 +74,36 @@ def _score_postmessage(script_content):
                     has_sinks = True
                     break
 
-        if has_origin_check and not has_sinks:
+        if has_strong_check and not has_sinks:
             continue
 
-        if not has_origin_check:
+        if not has_strong_check and not has_weak_check:
+            # No origin check at all
             best = max(best, 9 if has_sinks else 7)
+        elif has_weak_check and not has_strong_check:
+            # Bypassable check (includes/startsWith/indexOf/endsWith)
+            best = max(best, 8 if has_sinks else 6)
         else:
+            # Strong check but sinks present
             best = max(best, 6)
 
     return best
 
 
 def _score_prototype_pollution(script_content):
-    """Score based on deep merge/extend calls."""
+    """Score based on deep merge/extend calls, boosted when PP sources co-occur."""
+    has_sink = False
     for pattern in PROTOTYPE_POLLUTION_SINKS:
         if re.search(pattern, script_content):
-            return 7
-    return 0
+            has_sink = True
+            break
+    if not has_sink:
+        return 0
+
+    for pattern in PROTOTYPE_POLLUTION_SOURCES:
+        if re.search(pattern, script_content):
+            return 8  # source + sink = confirmed PP chain
+    return 7  # sink only
 
 
 def _score_endpoints(script_content):
@@ -97,7 +115,11 @@ def _score_endpoints(script_content):
             if len(endpoint) < 5 or endpoint.startswith(('data:', 'blob:')):
                 continue
             ep_lower = endpoint.lower()
-            if any(kw in ep_lower for kw in ('admin', 'internal', 'debug', 'private')):
+            if category == 'redirect_endpoint':
+                best = max(best, 7)
+            elif category == 'jsonp_endpoint':
+                best = max(best, 6)
+            elif any(kw in ep_lower for kw in ('admin', 'internal', 'debug', 'private')):
                 best = max(best, 6)
             elif any(kw in ep_lower for kw in ('graphql', 'webhook', 'oauth', 'auth')):
                 best = max(best, 5)
@@ -121,6 +143,55 @@ def _score_interesting_strings(script_content):
         if re.search(pattern, script_content, re.IGNORECASE):
             best = max(best, severity)
     return best
+
+
+_TAINT_PROXIMITY_CHARS = 5000  # ~150 lines of beautified code
+
+
+def _score_taint_flow(script_content):
+    """Score based on source+sink co-occurrence with proximity analysis.
+
+    Proximity-confirmed (source and sink within ~150 lines): higher score.
+    File-level only (both present but far apart): lower score.
+    """
+    source_positions = []
+    for source_pattern in SOURCES.values():
+        for m in re.finditer(source_pattern, script_content):
+            source_positions.append(m.start())
+    if not source_positions:
+        return 0
+
+    sink_hits = []
+    for sink_info in SINKS.values():
+        for m in re.finditer(sink_info["pattern"], script_content):
+            sink_hits.append((m.start(), sink_info["severity"]))
+    for sink_info in TAINT_SINKS.values():
+        for m in re.finditer(sink_info["pattern"], script_content):
+            sink_hits.append((m.start(), sink_info["severity"]))
+    if not sink_hits:
+        return 0
+
+    best_proximate = 0
+    best_any = 0
+    for sink_pos, sink_sev in sink_hits:
+        best_any = max(best_any, sink_sev)
+        for src_pos in source_positions:
+            if abs(sink_pos - src_pos) <= _TAINT_PROXIMITY_CHARS:
+                best_proximate = max(best_proximate, sink_sev)
+                break
+
+    # Proximity-confirmed: source and sink in same function/block
+    if best_proximate >= 8:
+        return 8
+    if best_proximate >= 6:
+        return 7
+
+    # File-level co-occurrence only (weaker signal)
+    if best_any >= 8:
+        return 6
+    if best_any >= 6:
+        return 5
+    return 0
 
 
 def _score_library_cves(script_content):
@@ -202,6 +273,10 @@ def check_script_safety(script_content, script_hash, url, script_url=None,
     if str_score:
         scores.append(str_score)
 
+    taint_score = _score_taint_flow(script_content)
+    if taint_score:
+        scores.append(taint_score)
+
     cve_score = _score_library_cves(script_content)
     if cve_score:
         scores.append(cve_score)
@@ -209,7 +284,9 @@ def check_script_safety(script_content, script_hash, url, script_url=None,
     if not scores:
         return
 
-    severity = max(scores)
+    scores.sort(reverse=True)
+    severity = scores[0] + sum(s * 0.1 for s in scores[1:])
+    severity = min(10, round(severity))
 
     log_message("FINDING", {
         'finding_type': 'interesting_script',

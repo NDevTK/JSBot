@@ -78,17 +78,18 @@ JSBot is a **target page finder**. It tells you which scripts are worth opening 
 
 ## How Scoring Works
 
-Each script is scored by the highest signal found:
+Each script is scored across multiple signal types:
 
-| Signal                | What it detects                                                | Score  |
-| --------------------- | -------------------------------------------------------------- | ------ |
-| postMessage handler   | `addEventListener('message')` without origin check, near sinks | 7-9    |
-| Prototype pollution   | Deep merge/extend calls (`_.merge`, `$.extend(true, ...)`)     | 7      |
-| Interesting endpoints | Internal, admin, auth, GraphQL, WebSocket URLs                 | 4-6    |
-| Sensitive strings     | Hardcoded secrets, internal IPs, cloud URLs, JWTs              | 5-9    |
-| Known CVEs            | Library with published vulnerabilities                         | By CVE |
+| Signal                | What it detects                                                          | Score  |
+| --------------------- | ------------------------------------------------------------------------ | ------ |
+| postMessage handler   | `addEventListener('message')` without or with weak origin check + sinks  | 6-9    |
+| Prototype pollution   | Deep merge/extend calls, boosted when PP sources co-occur                | 7-8    |
+| Taint flow            | User-controlled sources near dangerous sinks (proximity-weighted)        | 5-8    |
+| Interesting endpoints | Redirect/JSONP/admin/auth/GraphQL/WebSocket URLs                         | 4-7    |
+| Sensitive strings     | Hardcoded secrets, internal IPs, cloud URLs, JWTs                        | 5-9    |
+| Known CVEs            | Library with published vulnerabilities                                   | By CVE |
 
-If a script has multiple signals, the highest score wins. The individual signals are not exposed — just the final score.
+The highest signal sets the base score. Each additional signal adds 10% of its own value, capped at 10. A script with multiple independent attack surfaces ranks higher than one with a single signal at the same severity. The individual signals are not exposed — just the final score.
 
 ### Anomaly Detection
 

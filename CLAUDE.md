@@ -61,9 +61,12 @@ These contribute to the `interesting_script` score but are not exposed as separa
 
 - postMessage handlers without origin checks
 - Prototype pollution sinks (deep merge/extend)
+- Taint flow (user-controlled sources co-occurring with dangerous sinks)
 - Interesting API endpoints
 - Sensitive strings (secrets, internal IPs, cloud URLs)
 - Known library CVEs
+
+**Scoring formula:** highest signal is the base score, each additional signal adds 10% of its value, capped at 10. Multiple attack surfaces rank higher than a single signal at the same severity.
 
 ## State storage
 
