@@ -119,10 +119,10 @@ def combined_url_score(url, seen_keys, seen_segments):
 _LIBRARY_SIGNATURES = [
     (r'/\*!?\s*jQuery\s+v', "jQuery"),
     (r'React\.createElement|react\.production', "React"),
-    (r'angular\.module|ng\.core', "Angular"),
-    (r'Vue\.config|vue\.runtime', "Vue"),
+    (r'angular\.module|ng\.core|AngularJS', "Angular"),
+    (r'Vue\.config|vue\.runtime|\.Vue\s*=', "Vue"),
     (r'[Ll]odash|_\.VERSION', "Lodash"),
-    (r'moment\.js|moment\.version', "Moment.js"),
+    (r'moment\.js|moment\.version|\.moment\s*=', "Moment.js"),
     (r'bootstrap\.js|Bootstrap\s+v', "Bootstrap"),
     (r'google-analytics|GoogleAnalyticsObject|gtag\(', "Google Analytics"),
     (r'fbevents\.js|fbq\(', "Facebook Pixel"),
@@ -131,9 +131,9 @@ _LIBRARY_SIGNATURES = [
 
 def _is_known_library(content):
     """Check if script is a known third-party library by signature."""
-    first_5k = content[:5000]
+    first_10k = content[:10000]
     for pattern, _ in _LIBRARY_SIGNATURES:
-        if re.search(pattern, first_5k, re.IGNORECASE):
+        if re.search(pattern, first_10k, re.IGNORECASE):
             return True
     return False
 
@@ -150,8 +150,8 @@ def looks_minified(content):
 # --- Library Version Detection + Known CVE Database ---
 
 _LIBRARY_VERSIONS = [
-    (r'/\*!?\s*jQuery\s+v?([\d.]+)', "jQuery"),
-    (r'/\*!?\s*jQuery\s+[^\n]*?v([\d.]+)', "jQuery"),
+    (r'/\*!?\s*jQuery\s+v?@?([\d.]+)', "jQuery"),
+    (r'/\*!?\s*jQuery\s+[^\n]*?v?@?([\d.]+)', "jQuery"),
     (r'jQuery\.fn\.jquery\s*=\s*[\'"]([^\'"]+)', "jQuery"),
     (r'\bjquery\s*:\s*["\'](\d+\.\d+[\d.]*)["\']', "jQuery"),
     (r'angular[^.]*\.version\s*=\s*\{[^}]*full\s*:\s*[\'"]([^\'"]+)', "Angular.js"),
@@ -163,9 +163,9 @@ _LIBRARY_VERSIONS = [
 ]
 
 # Generic header pattern for broader library detection
-# Catches /*! LibName v1.2.3 — the minification-preserved comment format
+# Catches /*! LibName v1.2.3, /*!\n * LibName v1.2.3, and /*\n LibName v1.2.3
 _GENERIC_LIB_PATTERN = re.compile(
-    r'/\*!\s*([A-Za-z][\w.-]{1,50}?)(?:\.js)?\s+(?:[-|]+\s+)?v?(\d+\.\d+(?:\.\d+)?)',
+    r'/\*!?[\s*]*([A-Za-z][\w.-]{1,50}?)(?:\.js)?\s+(?:[-|]+\s+)?v?@?(\d+\.\d+(?:\.\d+)?)',
     re.IGNORECASE,
 )
 
@@ -264,7 +264,41 @@ def _parse_version(version_str):
 # Used only when a library is identified by signature but no version was found.
 _MINIFIED_VERSION_FALLBACKS = {
     "lodash": re.compile(r'\.VERSION\s*=\s*["\'](\d+\.\d+\.\d+)["\']'),
+    "vue": re.compile(r'\.version\s*=\s*["\'](\d+\.\d+\.\d+)["\']'),
+    "moment": re.compile(r'\.version\s*=\s*["\'](\d+\.\d+\.\d+)["\']'),
 }
+
+# Indirect version assignment: .VERSION=varName (minifiers extract the string to a variable)
+# Variable name length: 1-3 in minified code, up to 20 in non-minified (e.g., VERSION)
+_INDIRECT_VERSION_RE = re.compile(
+    r'\.(?:VERSION|version)\s*=\s*([a-zA-Z_$]\w{0,19})\s*[,;)\n]'
+)
+
+
+def _resolve_indirect_version(content):
+    """Resolve indirect version: .VERSION=var where var='X.Y.Z' elsewhere."""
+    for m in _INDIRECT_VERSION_RE.finditer(content):
+        var_name = m.group(1)
+        # Find where this variable is assigned a semver string
+        val_re = re.compile(
+            rf'(?:^|[,;\s]){re.escape(var_name)}\s*=\s*["\'](\d+\.\d+\.\d+)["\']'
+        )
+        val_m = val_re.search(content)
+        if val_m:
+            return val_m.group(1)
+    return None
+
+
+def _normalize_lib_key(name):
+    """Normalize library name for deduplication.
+
+    Angular.js, AngularJS, angular → all become 'angular'.
+    """
+    key = re.sub(r'[.\-]js$', '', name.lower()).strip('.-')
+    # Strip trailing 'js' when base is >= 3 chars (angularjs→angular, not js→empty)
+    if key.endswith('js') and len(key) > 4:
+        key = key[:-2]
+    return key
 
 
 def _detect_libraries(content):
@@ -277,33 +311,39 @@ def _detect_libraries(content):
     for pattern, name in _LIBRARY_VERSIONS:
         m = re.search(pattern, first_10k, re.IGNORECASE)
         if m:
-            name_lower = name.lower()
-            if name_lower not in seen_names:
-                seen_names.add(name_lower)
+            name_key = _normalize_lib_key(name)
+            if name_key not in seen_names:
+                seen_names.add(name_key)
                 results.append((name, m.group(1)))
 
     # Generic header pattern for smaller/unknown libraries
     for m in _GENERIC_LIB_PATTERN.finditer(first_10k):
         name = m.group(1)
         version = m.group(2)
-        name_lower = re.sub(r'\.js$', '', name.lower()).strip('.-')
-        if name_lower not in seen_names and len(name_lower) >= 2:
-            seen_names.add(name_lower)
+        name_key = _normalize_lib_key(name)
+        if name_key not in seen_names and len(name_key) >= 2:
+            seen_names.add(name_key)
             results.append((name, version))
 
     # Fallback: library identified by signature but version not found in first 10K
     # (handles minified code where variable names are mangled)
-    first_5k = content[:5000]
     for sig_pattern, sig_name in _LIBRARY_SIGNATURES:
-        if re.search(sig_pattern, first_5k, re.IGNORECASE):
-            name_lower = sig_name.lower()
-            if name_lower not in seen_names:
-                fallback = _MINIFIED_VERSION_FALLBACKS.get(name_lower)
+        if re.search(sig_pattern, first_10k, re.IGNORECASE):
+            name_key = _normalize_lib_key(sig_name)
+            if name_key not in seen_names:
+                fallback = _MINIFIED_VERSION_FALLBACKS.get(name_key)
                 if fallback:
                     m = fallback.search(content)
                     if m:
-                        seen_names.add(name_lower)
+                        seen_names.add(name_key)
                         results.append((sig_name, m.group(1)))
+                        continue
+                # Indirect assignment: .VERSION=var where var="X.Y.Z"
+                # (some minifiers extract the version string to a shared variable)
+                version = _resolve_indirect_version(content)
+                if version:
+                    seen_names.add(name_key)
+                    results.append((sig_name, version))
 
     return results
 

@@ -236,8 +236,11 @@ INTERESTING_STRING_PATTERNS = [
 # Functions known to perform deep merge/extend with attacker-controlled input.
 # If these are called with user-controlled data, prototype pollution is possible.
 PROTOTYPE_POLLUTION_SINKS = [
-    # lodash/underscore deep merge/set
-    r"""\b(?:_|lodash)\.(?:merge|defaultsDeep|set|setWith|mergeWith)\s*\(""",
+    # lodash/underscore — lodash-specific method names (safe to match with _ prefix)
+    r"""\b(?:_|lodash)\.(?:defaultsDeep|setWith|mergeWith)\s*\(""",
+    # lodash merge/set — require explicit "lodash" name because _.merge() and _.set()
+    # are too common in minified code (e.g. jQuery uses _ for its internal data cache)
+    r"""\blodash\.(?:merge|set)\s*\(""",
     # jQuery deep extend: $.extend(true, target, source)
     r"""\$\.extend\s*\(\s*true\b""",
     # angular.merge (CVE-2019-10768)

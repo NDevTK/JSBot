@@ -25,7 +25,7 @@ from patterns import (
 )
 from scoring import (
     score_url, PATH_KEYWORDS, PARAM_KEYWORDS, SUBDOMAIN_KEYWORDS,
-    looks_minified, check_known_cves,
+    looks_minified, check_known_cves, _detect_libraries, _is_known_library,
 )
 from analysis import (
     _score_postmessage, _score_prototype_pollution, _score_endpoints,
@@ -36,13 +36,30 @@ from analysis import (
 # --- Helpers ---
 
 def _fetch_js(target):
-    """Load JS from a file path or URL."""
+    """Load JS from a file path or URL.
+
+    For URLs returning HTML, extracts and concatenates <script> blocks
+    to match what the scanner actually analyzes.
+    """
     if target.startswith(('http://', 'https://')):
         resp = httpx.get(target, follow_redirects=True, timeout=15)
         if resp.status_code >= 400:
             print(f"HTTP {resp.status_code} for {target}", file=sys.stderr)
-            return resp.text  # still return content for review
-        return resp.text
+        content = resp.text
+        # If response is HTML, extract inline scripts (matches scanner behavior)
+        ct = resp.headers.get('content-type', '')
+        if 'html' in ct or (content.lstrip()[:15].lower().startswith(('<!doctype', '<html'))):
+            scripts = re.findall(
+                r'<script[^>]*>(.*?)</script>', content,
+                re.DOTALL | re.IGNORECASE,
+            )
+            scripts = [s.strip() for s in scripts if s.strip()]
+            if scripts:
+                print(f"(HTML page — extracted {len(scripts)} inline script blocks)")
+                return '\n'.join(scripts)
+            print("(HTML page — no inline scripts found)")
+            return content
+        return content
     with open(target, 'r', encoding='utf-8', errors='replace') as f:
         return f.read()
 
@@ -113,12 +130,34 @@ def cmd_patterns(args):
         if not matches:
             continue
         matches.sort()
+        # Cap noisy sections: TAINT_SINKS can have 100+ matches in large files.
+        # Show up to 3 per pattern type, then summarize the rest.
+        is_taint = 'taint' in section_name.lower()
+        cap = 20 if not is_taint else None
         print(f"=== {section_name} ({len(matches)} matches) ===")
-        for pos, name, sev_str, m in matches:
-            line = _line_number(content, pos)
-            ctx = _context(content, m.start(), m.end())
-            print(f"  L{line:>5}  {name}{sev_str}")
-            print(f"         {ctx}")
+        if is_taint and len(matches) > 20:
+            # Group by pattern name, show top 2 per type
+            by_type = {}
+            for pos, name, sev_str, m in matches:
+                by_type.setdefault(name, []).append((pos, name, sev_str, m))
+            for pname, pmatches in by_type.items():
+                shown = pmatches[:2]
+                for pos, name, sev_str, m in shown:
+                    line = _line_number(content, pos)
+                    ctx = _context(content, m.start(), m.end())
+                    print(f"  L{line:>5}  {name}{sev_str}")
+                    print(f"         {ctx}")
+                if len(pmatches) > 2:
+                    print(f"         ... +{len(pmatches)-2} more {pname} matches")
+        else:
+            shown = matches[:cap] if cap else matches
+            for pos, name, sev_str, m in shown:
+                line = _line_number(content, pos)
+                ctx = _context(content, m.start(), m.end())
+                print(f"  L{line:>5}  {name}{sev_str}")
+                print(f"         {ctx}")
+            if cap and len(matches) > cap:
+                print(f"  ... +{len(matches)-cap} more matches")
         print()
         total_matches += len(matches)
 
@@ -128,6 +167,150 @@ def cmd_patterns(args):
         print(f"Total: {total_matches} matches")
 
 
+def _snippet(content, pos, chars=50):
+    """Extract a short code snippet around a position."""
+    start = max(0, pos - chars)
+    end = min(len(content), pos + chars)
+    snip = content[start:end].replace('\n', ' ').replace('\r', '')
+    # Trim to nearest word boundary
+    if start > 0:
+        snip = '...' + snip
+    if end < len(content):
+        snip = snip + '...'
+    return snip
+
+
+def _score_detail_taint(content, is_min):
+    """Show which source-sink pairs triggered taint flow."""
+    proximity = 1500 if is_min else 5000
+    file_len = len(content)
+    if file_len > 10000:
+        proximity = max(150, proximity * 10000 // file_len)
+
+    sources = []
+    for name, pat in SOURCES.items():
+        for m in re.finditer(pat, content):
+            sources.append((m.start(), name))
+    sinks = []
+    for name, info in SINKS.items():
+        for m in re.finditer(info["pattern"], content):
+            sinks.append((m.start(), info["severity"], name))
+    for name, info in TAINT_SINKS.items():
+        for m in re.finditer(info["pattern"], content):
+            sinks.append((m.start(), info["severity"], name))
+
+    if not sources or not sinks:
+        return
+
+    print(f"    Proximity window: {proximity} chars (file: {file_len})")
+    print(f"    Sources: {len(sources)}, Sinks: {len(sinks)}")
+
+    # Show proximate pairs with code snippets
+    proximate = []
+    for sink_pos, sev, sname in sinks:
+        for src_pos, src_name in sources:
+            dist = abs(sink_pos - src_pos)
+            if dist <= proximity:
+                proximate.append((dist, src_name, sname, sev,
+                                  _line_number(content, src_pos),
+                                  _line_number(content, sink_pos),
+                                  src_pos, sink_pos))
+                break
+
+    if proximate:
+        # Sort by severity descending so reviewer sees what drives the score
+        proximate.sort(key=lambda x: (-x[3], x[0]))
+        print(f"    Proximate pairs ({len(proximate)}, top by severity):")
+        for dist, src, sink, sev, src_line, sink_line, src_pos, sink_pos in proximate[:5]:
+            print(f"      {src} (L{src_line}) -> {sink} sev {sev} (L{sink_line}), {dist} chars apart")
+            # Show code snippet around the source-sink pair
+            pair_start = min(src_pos, sink_pos)
+            pair_end = max(src_pos, sink_pos)
+            snip = _snippet(content, pair_start, chars=min(40, dist // 2 + 20))
+            print(f"        {snip}")
+    else:
+        best_sev = max(s for _, s, _ in sinks)
+        label = "file-level" if file_len <= 50000 else "too far apart in large file"
+        print(f"    No proximate pairs ({label}, best sink sev {best_sev})")
+
+
+def _score_detail_postmessage(content, is_min):
+    """Show postMessage handler details."""
+    from analysis import (_POSTMESSAGE_HANDLER_RE, _STRONG_ORIGIN_CHECK_RE,
+                          _WEAK_ORIGIN_CHECK_RE)
+    window_size = 1500 if is_min else 5000
+    handler_matches = list(_POSTMESSAGE_HANDLER_RE.finditer(content))
+    handler_positions = [m.start() for m in handler_matches]
+    for i, m in enumerate(handler_matches):
+        line = _line_number(content, m.start())
+        # Backward: midpoint (avoids previous handler's code)
+        # Forward: next handler position (captures full inline function)
+        back_limit = (m.start() + handler_positions[i - 1]) // 2 if i > 0 else 0
+        fwd_limit = handler_positions[i + 1] if i < len(handler_positions) - 1 else len(content)
+        window_start = max(back_limit, m.start() - window_size)
+        window_end = min(fwd_limit, m.start() + window_size)
+        window = content[window_start:window_end]
+        strong = bool(_STRONG_ORIGIN_CHECK_RE.search(window))
+        weak = bool(_WEAK_ORIGIN_CHECK_RE.search(window))
+        sink_names = []
+        for sname, info in SINKS.items():
+            if re.search(info["pattern"], window):
+                sink_names.append(sname)
+        for sname, info in TAINT_SINKS.items():
+            if re.search(info["pattern"], window):
+                sink_names.append(sname)
+        origin = "strong" if strong else ("weak" if weak else "none")
+        sinks_str = ', '.join(sink_names[:3]) if sink_names else "none"
+        print(f"    L{line}: handler, origin check: {origin}, sinks: {sinks_str}")
+        print(f"      {_snippet(content, m.start(), chars=60)}")
+
+
+def _score_detail_pp(content):
+    """Show prototype pollution details."""
+    from patterns import PROTOTYPE_POLLUTION_SINKS, PROTOTYPE_POLLUTION_SOURCES
+    sink_matches = []
+    for pattern in PROTOTYPE_POLLUTION_SINKS:
+        for m in re.finditer(pattern, content):
+            line = _line_number(content, m.start())
+            sink_matches.append((line, _snippet(content, m.start(), chars=50)))
+    src_matches = []
+    for pattern in PROTOTYPE_POLLUTION_SOURCES:
+        for m in re.finditer(pattern, content):
+            line = _line_number(content, m.start())
+            src_matches.append((line, _snippet(content, m.start(), chars=50)))
+    for line, snip in sink_matches[:3]:
+        print(f"    L{line}: PP sink: {snip}")
+    if src_matches:
+        for line, snip in src_matches[:2]:
+            print(f"    L{line}: PP source: {snip}")
+    else:
+        print(f"    No PP source patterns (sink-only)")
+
+
+def _score_detail_strings(content):
+    """Show which sensitive string patterns triggered."""
+    for pattern, stype, sev in INTERESTING_STRING_PATTERNS:
+        m = re.search(pattern, content, re.IGNORECASE)
+        if m:
+            val = m.group(1)[:60] if m.lastindex else m.group(0)[:60]
+            line = _line_number(content, m.start())
+            print(f"    L{line}: {stype} (sev {sev}): {val}")
+
+
+def _score_detail_endpoints(content):
+    """Show which endpoints were found."""
+    seen = set()
+    for pattern, cat in ENDPOINT_PATTERNS:
+        for m in re.finditer(pattern, content, re.IGNORECASE):
+            ep = m.group(1).strip()[:80]
+            if ep not in seen and len(ep) >= 5:
+                seen.add(ep)
+                line = _line_number(content, m.start())
+                print(f"    L{line}: [{cat}] {ep}")
+    if not seen:
+        return
+
+
 def cmd_score(args):
     """Show full scoring breakdown for a script."""
     content = _fetch_js(args.target)
@@ -135,10 +318,20 @@ def cmd_score(args):
     print(f"File: {args.target}")
     print(f"Size: {len(content)} chars, {content.count(chr(10)) + 1} lines")
     print(f"Minified: {is_min}")
+
+    # Library identification
+    libs = _detect_libraries(content)
+    is_lib = _is_known_library(content)
+    if libs:
+        lib_strs = [f"{name} {ver}" for name, ver in libs]
+        print(f"Library: {', '.join(lib_strs)}")
+    elif is_lib:
+        print(f"Library: yes (signature match, version unknown)")
     print()
 
     # Run each scorer and show results
     scores = []
+    details = {}
     scorers = [
         ("postMessage handler", _score_postmessage, (content, is_min)),
         ("Prototype pollution", _score_prototype_pollution, (content,)),
@@ -157,8 +350,25 @@ def cmd_score(args):
         print(f" {indicator} {name:<25} {s:>5}")
         if s > 0:
             scores.append(s)
+            details[name] = True
 
     print()
+
+    # Show details for each active signal
+    if details:
+        print("Signal details:")
+        if "Taint flow" in details:
+            _score_detail_taint(content, is_min)
+        if "postMessage handler" in details:
+            _score_detail_postmessage(content, is_min)
+        if "Prototype pollution" in details:
+            _score_detail_pp(content)
+        if "Sensitive strings" in details:
+            _score_detail_strings(content)
+        if "Interesting endpoints" in details:
+            _score_detail_endpoints(content)
+        print()
+
     if not scores:
         print("Final score: 0 (no signals fired)")
         return

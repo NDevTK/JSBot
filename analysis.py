@@ -32,7 +32,11 @@ def get_sha256(data):
 
 _POSTMESSAGE_HANDLER_RE = re.compile(
     r"""addEventListener\s*\(\s*['"]message['"]"""
-    r"""|onmessage\s*=""",
+    # window.onmessage= or self.onmessage= (explicit window-level handler)
+    r"""|(?:window|self)\s*\.\s*onmessage\s*="""
+    # bare onmessage= (not preceded by dot or word char — excludes ws.onmessage,
+    # socket.onmessage, port1.onmessage, worker.onmessage, etc.)
+    r"""|(?<![.\w])onmessage\s*=""",
     re.IGNORECASE,
 )
 _STRONG_ORIGIN_CHECK_RE = re.compile(
@@ -48,10 +52,21 @@ _WEAK_ORIGIN_CHECK_RE = re.compile(
 def _score_postmessage(script_content, is_minified=False):
     """Score based on postMessage handlers with missing or weak origin checks."""
     window_size = 1500 if is_minified else 5000
+    # Collect all handler positions first to prevent window overlap
+    handler_matches = list(_POSTMESSAGE_HANDLER_RE.finditer(script_content))
+    if not handler_matches:
+        return 0
+    handler_positions = [m.start() for m in handler_matches]
+
     best = 0
-    for m in _POSTMESSAGE_HANDLER_RE.finditer(script_content):
-        window_start = m.start()
-        window_end = min(len(script_content), m.start() + window_size)
+    for i, m in enumerate(handler_matches):
+        # Clip windows to prevent origin checks from one handler bleeding into another.
+        # Backward: midpoint (tight, avoids previous handler's function body)
+        # Forward: next handler position (generous, captures full inline function)
+        back_limit = (m.start() + handler_positions[i - 1]) // 2 if i > 0 else 0
+        fwd_limit = handler_positions[i + 1] if i < len(handler_positions) - 1 else len(script_content)
+        window_start = max(back_limit, m.start() - window_size)
+        window_end = min(fwd_limit, m.start() + window_size)
         handler_window = script_content[window_start:window_end]
 
         has_strong_check = bool(_STRONG_ORIGIN_CHECK_RE.search(handler_window))
@@ -149,8 +164,15 @@ def _score_taint_flow(script_content, is_minified=False):
     Proximity-confirmed (source and sink within ~150 lines): higher score.
     File-level only (both present but far apart): lower score.
     Window scales based on minification — minified code is ~3x denser.
+    Large files get tighter proximity windows — in a 90K library, 1500 chars
+    covers <2% of the file and coincidental co-occurrence is expected.
     """
     proximity = _TAINT_PROXIMITY_CHARS_MIN if is_minified else _TAINT_PROXIMITY_CHARS
+
+    # Scale proximity for large files — random co-occurrence increases with size
+    file_len = len(script_content)
+    if file_len > 10000:
+        proximity = max(150, proximity * 10000 // file_len)
 
     source_positions = []
     for source_pattern in SOURCES.values():
@@ -179,12 +201,18 @@ def _score_taint_flow(script_content, is_minified=False):
                 break
 
     # Proximity-confirmed: source and sink in same function/block
+    # Severity 6 sinks (Script/Link Source, window.open) near URL sources are usually
+    # safe propagation, not taint flows — only boost for severity 7+ sinks
     if best_proximate >= 8:
         return 8
-    if best_proximate >= 6:
+    if best_proximate >= 7:
         return 7
 
     # File-level co-occurrence only (weaker signal)
+    # Skip for large files — source+sink both present but not proximate
+    # is expected by chance when the file contains many sink patterns
+    if file_len > 50000:
+        return 0
     if best_any >= 8:
         return 6
     if best_any >= 6:
