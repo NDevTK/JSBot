@@ -98,7 +98,7 @@ class SubdomainProfile:
 class AnomalyDetector:
     """Change detection + context signals across scans.
 
-    First scan: builds baseline (context signals only).
+    First scan: builds baseline only (no findings emitted).
     Subsequent scans: detects new/modified scripts, origin anomalies, plus context signals.
     """
 
@@ -151,15 +151,14 @@ class AnomalyDetector:
             is detected as modified (not new) across deploys.
           - origin_anomaly: script served from unknown hostname (severity 8)
 
-        Context signals (current scan only, vulnerability surface):
-          - has_sinks: script contains dangerous sink patterns (severity 5)
-          - source_and_sink: script has both sources and sinks (severity 6)
+        Context signals (require previous profile — first scan builds baseline):
           - inline_with_sinks: inline script containing sinks (severity 7)
-
-        Overlooked code signals (less scrutiny = more bugs):
           - not_minified: unminified custom code on a heavily-minified subdomain (severity 5)
           - small_non_library: short custom script on library-heavy subdomain (severity 5)
-          Compound boost: overlooked + has_sinks → 6, overlooked + source_and_sink → 7.
+          Compound boost: overlooked + has_sinks → 6.
+
+        has_sinks is a modifier only — it boosts change/overlooked signals but does
+        not create findings on its own.
 
         Args:
             emitted_keys: set of script_hashes already emitted. New findings are
@@ -210,45 +209,44 @@ class AnomalyDetector:
                     signals.append('origin_anomaly')
                     max_severity = max(max_severity, 8)
 
-            # --- Context signals (vulnerability surface) ---
-            if rec.has_sinks:
-                signals.append('has_sinks')
-                max_severity = max(max_severity, 5)
-
-            if rec.has_sources and rec.has_sinks:
-                signals.append('source_and_sink')
-                max_severity = max(max_severity, 6)
-
-            if rec.has_sinks and (rec.script_url == 'inline' or not rec.script_origin):
-                signals.append('inline_with_sinks')
-                max_severity = max(max_severity, 7)
-
-            # --- Overlooked code signals (less scrutiny = more bugs) ---
-            sc = stats.get('script_count', 0)
-            if sc >= 5:
-                minified_rate = stats.get('minified_count', 0) / sc
-                library_rate = stats.get('library_count', 0) / sc
-
-                if (not rec.is_minified and not rec.is_known_library
-                        and minified_rate > 0.85):
-                    signals.append('not_minified')
-                    max_severity = max(max_severity, 5)
-
-                if (not rec.is_known_library and library_rate > 0.5
-                        and rec.line_count < 100):
-                    signals.append('small_non_library')
-                    max_severity = max(max_severity, 5)
-
-            # --- Compound: overlooked code with attack surface gets priority ---
-            if {'not_minified', 'small_non_library'} & set(signals):
-                if rec.has_sources and rec.has_sinks:
+            # --- Context signals (require previous profile — first scan is baseline) ---
+            if prev:
+                if rec.has_sinks and (rec.script_url == 'inline' or not rec.script_origin):
+                    signals.append('inline_with_sinks')
                     max_severity = max(max_severity, 7)
-                elif rec.has_sinks:
-                    max_severity = max(max_severity, 6)
+
+                # --- Overlooked code signals (less scrutiny = more bugs) ---
+                sc = stats.get('script_count', 0)
+                if sc >= 5:
+                    minified_rate = stats.get('minified_count', 0) / sc
+                    library_rate = stats.get('library_count', 0) / sc
+
+                    if (not rec.is_minified and not rec.is_known_library
+                            and minified_rate > 0.85):
+                        signals.append('not_minified')
+                        max_severity = max(max_severity, 5)
+
+                    if (not rec.is_known_library and library_rate > 0.5
+                            and rec.line_count < 100):
+                        signals.append('small_non_library')
+                        max_severity = max(max_severity, 5)
+
+                # --- Compound: overlooked code with attack surface gets priority ---
+                if {'not_minified', 'small_non_library'} & set(signals):
+                    if rec.has_sinks:
+                        max_severity = max(max_severity, 6)
+
+            # --- has_sinks as modifier: boost change signals when sinks present ---
+            if signals and rec.has_sinks:
+                if 'new_script' in signals:
+                    max_severity = max(max_severity, 8)
+                if 'modified_script' in signals:
+                    max_severity = max(max_severity, 9)
 
             if not signals:
                 continue
 
+            sc = stats.get('script_count', 0)
             emitted_keys.add(rec.script_hash)
             findings.append({
                 'finding_type': 'anomaly',
@@ -277,33 +275,37 @@ class AnomalyDetector:
         self._update_profiles(self._build_stats())
 
     def _update_profiles(self, current_stats):
-        """Replace profiles with current scan data."""
-        new_profiles = {}
+        """Merge current scan data into existing profiles.
+
+        Scripts seen this scan update their hash. Scripts from previous scans
+        that weren't seen this time (page temporarily down, crawl didn't reach
+        them) are retained so they don't trigger false new_script alerts next scan.
+        Origins accumulate across scans for the same reason.
+        Stats reflect the current scan only (used for overlooked-code heuristics).
+        """
         for rec in self._records:
             sub = rec.subdomain
-            if sub not in new_profiles:
-                new_profiles[sub] = SubdomainProfile(sub)
-            profile = new_profiles[sub]
+            if sub not in self.profiles:
+                self.profiles[sub] = SubdomainProfile(sub)
+            profile = self.profiles[sub]
             profile.known_scripts[rec.script_url] = rec.structural_hash
             norm = _normalize_versioned_url(rec.script_url)
             profile.known_scripts_normalized[norm] = rec.structural_hash
             if rec.script_origin:
                 profile.known_origins.add(rec.script_origin)
 
-        # Copy current stats
+        # Stats reflect current scan (used for minified_rate/library_rate heuristics)
         for sub, stats in current_stats.items():
-            if sub in new_profiles:
-                new_profiles[sub].script_count = stats['script_count']
-                new_profiles[sub].minified_count = stats['minified_count']
-                new_profiles[sub].library_count = stats['library_count']
+            if sub in self.profiles:
+                self.profiles[sub].script_count = stats['script_count']
+                self.profiles[sub].minified_count = stats['minified_count']
+                self.profiles[sub].library_count = stats['library_count']
 
-        # Copy current header states
+        # Header states reflect current scan
         for sub, state in self._current_headers.items():
-            if sub not in new_profiles:
-                new_profiles[sub] = SubdomainProfile(sub)
-            new_profiles[sub].header_state = state
-
-        self.profiles = new_profiles
+            if sub not in self.profiles:
+                self.profiles[sub] = SubdomainProfile(sub)
+            self.profiles[sub].header_state = state
 
     def to_dict(self):
         """Serialize for cross-scan persistence."""

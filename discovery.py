@@ -304,6 +304,29 @@ def fetch_commoncrawl_urls(domains, user_agent, per_host_limit=2000):
 
 # --- robots.txt & sitemap.xml Discovery ---
 
+def _parse_sitemap(xml_text):
+    """Parse a sitemap or sitemap index XML. Returns (page_urls, child_sitemap_urls)."""
+    pages = set()
+    children = set()
+    try:
+        root = ElementTree.fromstring(xml_text)
+        ns = ''
+        if root.tag.startswith('{'):
+            ns = root.tag.split('}')[0] + '}'
+        # Sitemap index: <sitemapindex> contains <sitemap><loc>...</loc></sitemap>
+        is_index = 'sitemapindex' in root.tag.lower()
+        for loc in root.iter(f'{ns}loc'):
+            if loc.text:
+                url = loc.text.strip()
+                if is_index:
+                    children.add(url)
+                else:
+                    pages.add(url)
+    except ElementTree.ParseError:
+        pass
+    return pages, children
+
+
 async def discover_paths(domain, client):
     """Discovers URLs from robots.txt and sitemap.xml for a domain."""
     import httpx
@@ -311,7 +334,8 @@ async def discover_paths(domain, client):
     base = f"https://{domain}"
     timeout = httpx.Timeout(10.0, connect=5.0)
 
-    # robots.txt
+    # robots.txt — extract Disallow/Allow paths and Sitemap: directives
+    sitemap_locations = set()
     try:
         resp = await client.get(f"{base}/robots.txt", timeout=timeout)
         if resp.status_code == 200:
@@ -323,6 +347,10 @@ async def discover_paths(domain, client):
                         clean_path = path.replace('*', '').rstrip('$')
                         if clean_path:
                             discovered.add(urljoin(base, clean_path))
+                elif line.lower().startswith('sitemap:'):
+                    sitemap_url = line.split(':', 1)[1].strip()
+                    if sitemap_url:
+                        sitemap_locations.add(sitemap_url)
             log_message("INFO", f"Found {len(discovered)} paths from robots.txt for {domain}")
     except (httpx.ConnectError, httpx.ConnectTimeout):
         # Domain is unreachable — don't bother with sitemap
@@ -330,24 +358,34 @@ async def discover_paths(domain, client):
     except Exception as e:
         log_message("ERROR", f"Failed to fetch robots.txt for {domain}: {e}")
 
-    # sitemap.xml
+    # Always try the default location too
+    sitemap_locations.add(f"{base}/sitemap.xml")
+
+    # Fetch sitemaps — follows sitemap indexes one level deep
+    fetched_sitemaps = set()
+    async def _fetch_sitemap(url):
+        if url in fetched_sitemaps:
+            return set(), set()
+        fetched_sitemaps.add(url)
+        try:
+            resp = await client.get(url, timeout=timeout)
+            if resp.status_code == 200:
+                return _parse_sitemap(resp.text)
+        except Exception as e:
+            log_message("ERROR", f"Failed to fetch sitemap {url}: {e}")
+        return set(), set()
+
     sitemap_urls = set()
-    try:
-        resp = await client.get(f"{base}/sitemap.xml", timeout=timeout)
-        if resp.status_code == 200:
-            try:
-                root = ElementTree.fromstring(resp.text)
-                ns = ''
-                if root.tag.startswith('{'):
-                    ns = root.tag.split('}')[0] + '}'
-                for loc in root.iter(f'{ns}loc'):
-                    if loc.text:
-                        sitemap_urls.add(loc.text.strip())
-                log_message("INFO", f"Found {len(sitemap_urls)} URLs from sitemap.xml for {domain}")
-            except ElementTree.ParseError:
-                log_message("ERROR", f"Failed to parse sitemap.xml for {domain}")
-    except Exception as e:
-        log_message("ERROR", f"Failed to fetch sitemap.xml for {domain}: {e}")
+    for sitemap_url in sitemap_locations:
+        pages, children = await _fetch_sitemap(sitemap_url)
+        sitemap_urls.update(pages)
+        # Follow child sitemaps (one level — no recursive indexes)
+        for child in children:
+            child_pages, _ = await _fetch_sitemap(child)
+            sitemap_urls.update(child_pages)
+
+    if sitemap_urls:
+        log_message("INFO", f"Found {len(sitemap_urls)} URLs from sitemaps for {domain}")
 
     discovered.update(sitemap_urls)
     return discovered
@@ -355,18 +393,30 @@ async def discover_paths(domain, client):
 
 # --- Spider ---
 
+def _is_same_domain(hostname, base_domain):
+    """Check if hostname belongs to base_domain (exact match or subdomain)."""
+    return hostname == base_domain or hostname.endswith('.' + base_domain)
+
+
 def spider_links(response_text, response_url, base_domain):
-    """Extracts same-domain <a href> links from an HTML page."""
+    """Extracts same-domain links from an HTML page (a href, iframe src, form action)."""
     discovered = set()
     try:
         parser = BeautifulSoup(response_text, 'lxml')
+        urls_to_check = []
         for a_tag in parser.find_all('a', href=True):
-            href = a_tag['href'].strip()
+            urls_to_check.append(a_tag['href'])
+        for iframe in parser.find_all('iframe', src=True):
+            urls_to_check.append(iframe['src'])
+        for form in parser.find_all('form', action=True):
+            urls_to_check.append(form['action'])
+        for href in urls_to_check:
+            href = href.strip()
             if not href or href.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
                 continue
             full_url = urljoin(str(response_url), href)
             parsed = urlparse(full_url)
-            if parsed.hostname and base_domain in parsed.hostname:
+            if parsed.hostname and _is_same_domain(parsed.hostname, base_domain):
                 discovered.add(full_url)
     except Exception:
         pass

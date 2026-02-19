@@ -93,14 +93,15 @@ The highest signal sets the base score. Each additional signal adds 10% of its o
 
 ### Anomaly Detection
 
-Anomaly findings are separate from script scoring. They track changes across scans:
+Anomaly findings are separate from script scoring. The first scan builds a baseline — no anomaly findings are emitted. Subsequent scans detect changes and flag overlooked code:
 
-- **`new_script`** (score 7) — script URL not seen in previous scan
-- **`modified_script`** (score 8) — same URL but structural hash changed
+- **`new_script`** (score 7-8) — script URL not seen in previous scan (boosted to 8 if script contains sinks)
+- **`modified_script`** (score 8-9) — same URL but structural hash changed (boosted to 9 if script contains sinks)
 - **`origin_anomaly`** (score 8) — script served from unexpected hostname
-- **`source_and_sink`** (score 6) — reads user input AND writes to dangerous sinks
 - **`inline_with_sinks`** (score 7) — inline script block containing sinks
-- **`not_minified`** / **`small_non_library`** (score 5) — code that likely got less scrutiny
+- **`not_minified`** / **`small_non_library`** (score 5-6) — code that likely got less scrutiny (boosted to 6 if sinks present)
+
+Profiles merge across scans — scripts from previous scans that weren't reached this time are retained, preventing false `new_script` alerts from intermittent availability.
 
 ### Response Headers
 
@@ -119,7 +120,7 @@ Historical URLs from the Common Crawl archive — pages that existed in the past
 
 ### robots.txt, sitemaps, spidering
 
-Standard path discovery: robots.txt disallowed paths, sitemap.xml entries, and recursive link following within the same domain.
+Standard path discovery: robots.txt disallowed paths, `Sitemap:` directives, sitemap index support (follows child sitemaps one level deep), and recursive link following within the same domain. Spider extracts links from `<a href>`, `<iframe src>`, and `<form action>`.
 
 ### URL Scoring
 
