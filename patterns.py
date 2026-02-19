@@ -27,13 +27,6 @@ SOURCES = {
     "clipboardData":        r"""\b(?:clipboardData|dataTransfer)\.getData\b""",
 }
 
-# Context-dependent sources: only matched inside message event handler scopes.
-# Short parameter names like `e` are reused everywhere in minified code;
-# matching `e.data` globally produces false taint in jQuery, Angular, etc.
-CONTEXT_SOURCES = {
-    "postMessage data": r"""\b(?:e|evt|msg)\.data\b""",
-}
-
 SINKS = {
     "DOM XSS": {
         "pattern": r"""\b(?:innerHTML|outerHTML)\s*=""",
@@ -118,7 +111,7 @@ TAINT_SINKS = {
         "severity": 6,
     },
     "Fetch/XHR": {
-        "pattern": r"""\b(?:fetch|\.open)\s*\(""",
+        "pattern": r"""\bfetch\s*\(""",
         "severity": 5,
     },
     "Dynamic Import": {
@@ -126,7 +119,7 @@ TAINT_SINKS = {
         "severity": 9,
     },
     "ServiceWorker Registration": {
-        "pattern": r"""\.register\s*\(""",
+        "pattern": r"""\bserviceWorker\.register\s*\(""",
         "severity": 9,
     },
     "Worker Constructor": {
@@ -157,10 +150,6 @@ TAINT_SINKS = {
         "pattern": r"""\bdocument\.domain\s*=""",
         "severity": 7,
     },
-    "jQuery Selector Injection": {
-        "pattern": r"""\b(?:\$|jQuery)\s*\(""",
-        "severity": 7,
-    },
 }
 
 # --- Discovery Patterns ---
@@ -186,6 +175,9 @@ ENDPOINT_PATTERNS = [
     (r"""['"`]([^'"`\s]*(?:redirect|redir)[^'"`\s]*\?[^'"`\s]*(?:to|url|next|return|goto|dest|destination|redirect_uri)=[^'"`\s]*)['"`]""", "redirect_endpoint"),
     # JSONP endpoints — callback parameter enables data exfil / XSS
     (r"""['"`]([^'"`\s\n]*\?[^'"`\s\n]*(?:callback|jsonp|cb|jsonpcallback)=[^'"`\s\n]*)['"`]""", "jsonp_endpoint"),
+    # jQuery AJAX: $.ajax({url: '/api/...'}) and $.get/$.post/$.getJSON('/api/...')
+    (r"""\$\s*\.\s*(?:get|post|getJSON|getScript)\s*\(\s*['"`]([^'"`\n]{5,})['"`]""", "fetch_call"),
+    (r"""\$\s*\.\s*ajax\s*\(\s*\{[^}]*?url\s*:\s*['"`]([^'"`\n]{5,})['"`]""", "fetch_call"),
 ]
 
 # --- Interesting String Patterns ---
@@ -258,9 +250,9 @@ PROTOTYPE_POLLUTION_SINKS = [
 
 # Prototype pollution source patterns — URL param parsers that create nested objects
 PROTOTYPE_POLLUTION_SOURCES = [
-    # qs.parse, deparam — create nested objects from bracket notation
+    # qs.parse, deparam — create nested objects from bracket notation (?a[__proto__][x]=y)
     r"""\b(?:qs|querystring)\.parse\s*\(""",
     r"""\$\.deparam\s*\(""",
-    # JSON.parse of user-controlled data (combined with merge = pollution)
-    r"""\bJSON\.parse\s*\(""",
+    # flatted/destr — recursively rebuilds objects from serialized form
+    r"""\b(?:flatted|destr)\.parse\s*\(""",
 ]
