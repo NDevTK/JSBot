@@ -34,11 +34,14 @@ def score_url(url):
     except Exception:
         return 0
 
-    # Path keyword scoring (+3 each) — substring match on segments
+    # Path keyword scoring (+3 each, capped at 9) — exact word match within segments
     segs = [s for s in parsed.path.lower().strip('/').split('/') if s]
+    path_bonus = 0
     for seg in segs:
-        if any(kw in seg for kw in PATH_KEYWORDS):
-            score += 3
+        seg_parts = re.split(r'[-_.]', seg)
+        if any(p in PATH_KEYWORDS for p in seg_parts):
+            path_bonus += 3
+    score += min(path_bonus, 9)
 
     # Parameter name scoring (+5 each)
     params = parse_qs(parsed.query)
@@ -57,8 +60,9 @@ def score_url(url):
         subdomain = '.'.join(parts[:-2]).lower()
         if subdomain and subdomain != 'www':
             score += 2  # Non-www subdomain bonus
-            for kw in SUBDOMAIN_KEYWORDS:
-                if kw in subdomain:
+            sub_parts = re.split(r'[-_.]', subdomain)
+            for part in sub_parts:
+                if part in SUBDOMAIN_KEYWORDS:
                     score += 4
                     break  # Only count once
 

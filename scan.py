@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 
 import output
 from output import log_message
-from scoring import score_url, url_path_key, path_segments, combined_url_score, looks_minified
+from scoring import url_path_key, path_segments, combined_url_score, looks_minified
 from patterns import JS_PATH_FINDER
 from analysis import (
     structural_hash, get_sha256,
@@ -616,15 +616,8 @@ async def js_audit_worker(js_queue, client, args, executor,
 # --- Producer Coroutines ---
 
 def _clean_urls(urls):
-    """Strip query params/fragments, keep highest-scored version of each URL."""
-    cleaned = {}
-    for url in urls:
-        clean = url.split('?')[0].split('#')[0]
-        existing_score = cleaned.get(clean, -1)
-        new_score = score_url(url)
-        if new_score > existing_score:
-            cleaned[clean] = new_score
-    return set(cleaned.keys())
+    """Deduplicate URLs by base path (strip query params/fragments)."""
+    return {url.split('?')[0].split('#')[0] for url in urls}
 
 
 async def _seed_urls(urls, url_queue, domain_queue):
