@@ -39,7 +39,9 @@ def _fetch_js(target):
     """Load JS from a file path or URL."""
     if target.startswith(('http://', 'https://')):
         resp = httpx.get(target, follow_redirects=True, timeout=15)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            print(f"HTTP {resp.status_code} for {target}", file=sys.stderr)
+            return resp.text  # still return content for review
         return resp.text
     with open(target, 'r', encoding='utf-8', errors='replace') as f:
         return f.read()
@@ -70,40 +72,42 @@ def cmd_patterns(args):
     print(f"Minified: {looks_minified(content)}")
     print()
 
+    # Flags must match the real scanner: sources/sinks are case-sensitive,
+    # endpoints and strings use IGNORECASE (see analysis.py _score_* functions)
     sections = [
-        ("SOURCES (user-controlled inputs)", [
+        ("SOURCES (user-controlled inputs)", 0, [
             (name, pattern, None) for name, pattern in SOURCES.items()
         ]),
-        ("SINKS (dangerous outputs)", [
+        ("SINKS (dangerous outputs)", 0, [
             (name, info["pattern"], info["severity"])
             for name, info in SINKS.items()
         ]),
-        ("TAINT_SINKS (taint-only sinks)", [
+        ("TAINT_SINKS (taint-only sinks)", 0, [
             (name, info["pattern"], info["severity"])
             for name, info in TAINT_SINKS.items()
         ]),
-        ("ENDPOINT_PATTERNS", [
+        ("ENDPOINT_PATTERNS", re.IGNORECASE, [
             (cat, pattern, None) for pattern, cat in ENDPOINT_PATTERNS
         ]),
-        ("INTERESTING_STRING_PATTERNS", [
+        ("INTERESTING_STRING_PATTERNS", re.IGNORECASE, [
             (stype, pattern, sev)
             for pattern, stype, sev in INTERESTING_STRING_PATTERNS
         ]),
-        ("PROTOTYPE_POLLUTION_SINKS", [
+        ("PROTOTYPE_POLLUTION_SINKS", 0, [
             (f"PP sink #{i+1}", p, None)
             for i, p in enumerate(PROTOTYPE_POLLUTION_SINKS)
         ]),
-        ("PROTOTYPE_POLLUTION_SOURCES", [
+        ("PROTOTYPE_POLLUTION_SOURCES", 0, [
             (f"PP source #{i+1}", p, None)
             for i, p in enumerate(PROTOTYPE_POLLUTION_SOURCES)
         ]),
     ]
 
     total_matches = 0
-    for section_name, patterns in sections:
+    for section_name, flags, patterns in sections:
         matches = []
         for name, pattern, severity in patterns:
-            for m in re.finditer(pattern, content, re.IGNORECASE):
+            for m in re.finditer(pattern, content, flags):
                 sev_str = f" (severity {severity})" if severity else ""
                 matches.append((m.start(), name, sev_str, m))
         if not matches:
@@ -246,11 +250,11 @@ def cmd_discovery(args):
 
             # --- robots.txt ---
             print(f"=== robots.txt ({base}/robots.txt) ===")
+            sitemap_directives = []
             try:
                 resp = await client.get(f"{base}/robots.txt", timeout=timeout)
                 if resp.status_code == 200:
                     paths = []
-                    sitemap_directives = []
                     for line in resp.text.splitlines():
                         line = line.strip()
                         if line.lower().startswith(('disallow:', 'allow:')):

@@ -121,7 +121,7 @@ _LIBRARY_SIGNATURES = [
     (r'React\.createElement|react\.production', "React"),
     (r'angular\.module|ng\.core', "Angular"),
     (r'Vue\.config|vue\.runtime', "Vue"),
-    (r'lodash\.js|_\.VERSION', "Lodash"),
+    (r'[Ll]odash|_\.VERSION', "Lodash"),
     (r'moment\.js|moment\.version', "Moment.js"),
     (r'bootstrap\.js|Bootstrap\s+v', "Bootstrap"),
     (r'google-analytics|GoogleAnalyticsObject|gtag\(', "Google Analytics"),
@@ -151,7 +151,9 @@ def looks_minified(content):
 
 _LIBRARY_VERSIONS = [
     (r'/\*!?\s*jQuery\s+v?([\d.]+)', "jQuery"),
+    (r'/\*!?\s*jQuery\s+[^\n]*?v([\d.]+)', "jQuery"),
     (r'jQuery\.fn\.jquery\s*=\s*[\'"]([^\'"]+)', "jQuery"),
+    (r'\bjquery\s*:\s*["\'](\d+\.\d+[\d.]*)["\']', "jQuery"),
     (r'angular[^.]*\.version\s*=\s*\{[^}]*full\s*:\s*[\'"]([^\'"]+)', "Angular.js"),
     (r'AngularJS\s+v?([\d.]+)', "Angular.js"),
     (r'Vue\.version\s*=\s*[\'"]([^\'"]+)', "Vue.js"),
@@ -194,46 +196,6 @@ def _normalize_npm_name(detected_name):
     """Map detected library name to npm package name."""
     clean = re.sub(r'\.js$', '', detected_name.lower()).strip('.-')
     return _NPM_NAME_MAP.get(clean, clean)
-
-
-_KNOWN_VULNS = {
-    "jQuery": [
-        {"below": "3.5.0", "cves": ["CVE-2020-11022", "CVE-2020-11023"],
-         "desc": "XSS via HTML containing <option> passed to DOM manipulation methods", "severity": 8},
-        {"below": "3.0.0", "cves": ["CVE-2015-9251"],
-         "desc": "XSS via cross-domain ajax when dataType is not specified", "severity": 7},
-        {"below": "1.12.0", "cves": ["CVE-2012-6708"],
-         "desc": "XSS via selector string misinterpreted as HTML", "severity": 9},
-    ],
-    "Angular.js": [
-        {"below": "1.6.9", "cves": ["CVE-2019-14863"],
-         "desc": "XSS via SVG animate elements", "severity": 8},
-        {"below": "1.6.0", "cves": ["CVE-2019-10768"],
-         "desc": "Prototype pollution in merge function", "severity": 8},
-        {"below": "1.2.0", "cves": ["CVE-2020-7676"],
-         "desc": "XSS via template sandbox escape", "severity": 9},
-    ],
-    "Lodash": [
-        {"below": "4.17.21", "cves": ["CVE-2021-23337"],
-         "desc": "Command injection via template function", "severity": 9},
-        {"below": "4.17.12", "cves": ["CVE-2019-10744"],
-         "desc": "Prototype pollution via defaultsDeep/merge", "severity": 8},
-    ],
-    "Vue.js": [
-        {"below": "2.5.0", "cves": ["CVE-2018-6341"],
-         "desc": "XSS via v-bind:href with javascript: protocol", "severity": 8},
-    ],
-    "Bootstrap": [
-        {"below": "3.4.0", "cves": ["CVE-2018-14040", "CVE-2018-14041", "CVE-2018-14042"],
-         "desc": "XSS via tooltip/popover data-template attributes", "severity": 7},
-    ],
-    "Moment.js": [
-        {"below": "2.29.4", "cves": ["CVE-2022-31129"],
-         "desc": "ReDoS in string parsing", "severity": 5},
-        {"below": "2.29.2", "cves": ["CVE-2022-24785"],
-         "desc": "Path traversal in moment.locale", "severity": 7},
-    ],
-}
 
 
 # --- OSV.dev Integration (real-time CVE lookup) ---
@@ -298,6 +260,13 @@ def _parse_version(version_str):
         return None
 
 
+# Fallback version patterns for minified code where variable names are mangled.
+# Used only when a library is identified by signature but no version was found.
+_MINIFIED_VERSION_FALLBACKS = {
+    "lodash": re.compile(r'\.VERSION\s*=\s*["\'](\d+\.\d+\.\d+)["\']'),
+}
+
+
 def _detect_libraries(content):
     """Detect all library name+version pairs from script content."""
     first_10k = content[:10000]
@@ -322,6 +291,20 @@ def _detect_libraries(content):
             seen_names.add(name_lower)
             results.append((name, version))
 
+    # Fallback: library identified by signature but version not found in first 10K
+    # (handles minified code where variable names are mangled)
+    first_5k = content[:5000]
+    for sig_pattern, sig_name in _LIBRARY_SIGNATURES:
+        if re.search(sig_pattern, first_5k, re.IGNORECASE):
+            name_lower = sig_name.lower()
+            if name_lower not in seen_names:
+                fallback = _MINIFIED_VERSION_FALLBACKS.get(name_lower)
+                if fallback:
+                    m = fallback.search(content)
+                    if m:
+                        seen_names.add(name_lower)
+                        results.append((sig_name, m.group(1)))
+
     return results
 
 
@@ -332,7 +315,7 @@ def detect_library_version(content):
 
 
 def check_known_cves(content):
-    """Check if script contains a library with known CVEs. Hardcoded DB + OSV.dev lookup."""
+    """Check if script contains a library with known CVEs via OSV.dev."""
     detections = _detect_libraries(content)
     if not detections:
         return []
@@ -341,24 +324,6 @@ def check_known_cves(content):
     seen_cves = set()
 
     for name, version in detections:
-        ver_tuple = _parse_version(version)
-
-        # Hardcoded database (fast, no network)
-        if name in _KNOWN_VULNS and ver_tuple:
-            for vuln in _KNOWN_VULNS[name]:
-                threshold = _parse_version(vuln['below'])
-                if threshold and ver_tuple < threshold:
-                    seen_cves.update(vuln['cves'])
-                    all_findings.append({
-                        'library': name,
-                        'version': version,
-                        'cves': vuln['cves'],
-                        'description': vuln['desc'],
-                        'severity': vuln['severity'],
-                        'fix_below': vuln['below'],
-                    })
-
-        # OSV.dev for additional/supplementary CVEs
         npm_name = _normalize_npm_name(name)
         osv_findings = _query_osv(npm_name, version)
         for of in osv_findings:
