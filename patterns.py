@@ -229,15 +229,15 @@ INTERESTING_STRING_PATTERNS = [
     (r"""(?:['"`\s;=(]|^)(xox[bpas]-[0-9a-zA-Z-]{10,})""", "slack_token", 9),
     # Stripe secret keys
     (r"""(?:['"`\s;=(]|^)(sk_live_[0-9a-zA-Z]{20,})""", "stripe_secret_key", 9),
-    # Stripe publishable keys (public but indicates live environment)
-    (r"""(?:['"`\s;=(]|^)(pk_live_[0-9a-zA-Z]{20,})""", "stripe_publishable_key", 5),
-    # Google API keys
-    (r"""(?:['"`\s;=(]|^)(AIza[0-9A-Za-z_-]{35})""", "google_api_key", 5),
+    # Stripe publishable keys (public by design — can only create tokens, not charges)
+    (r"""(?:['"`\s;=(]|^)(pk_live_[0-9a-zA-Z]{20,})""", "stripe_publishable_key", 2),
+    # Google API keys (public by design — restricted by referrer/IP, on every Maps/YouTube page)
+    (r"""(?:['"`\s;=(]|^)(AIza[0-9A-Za-z_-]{35})""", "google_api_key", 2),
     # Private key blocks
     (r"""(-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----)""", "private_key", 9),
-    # Generic API key/secret assignments
+    # Generic API key/secret assignments (noisy — matches config values and public keys)
     (r"""(?:api[_-]?key|apikey|api[_-]?secret|secret[_-]?key|access[_-]?token|auth[_-]?token)\s*[:=]\s*['"`]([A-Za-z0-9_/+=.-]{20,})['"`]""",
-     "api_key_generic", 5),
+     "api_key_generic", 3),
 ]
 
 # --- Prototype Pollution Sink Patterns ---

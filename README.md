@@ -86,7 +86,7 @@ Each script is scored across multiple signal types:
 | Prototype pollution   | Deep merge/extend calls, boosted when PP sources co-occur                | 7-8    |
 | Taint flow            | User-controlled sources near dangerous sinks (proximity-weighted)        | 5-8    |
 | Interesting endpoints | Redirect/JSONP/admin/auth/GraphQL/WebSocket URLs                         | 4-7    |
-| Sensitive strings     | Hardcoded secrets, internal IPs, cloud URLs, JWTs                        | 5-9    |
+| Sensitive strings     | Hardcoded secrets, internal IPs, cloud URLs, JWTs (public-by-design keys deprioritized) | 2-9    |
 | Known CVEs            | Library with published vulnerabilities                                   | By CVE |
 
 The highest signal sets the base score. Each additional signal adds 10% of its own value, capped at 10. A script with multiple independent attack surfaces ranks higher than one with a single signal at the same severity. The individual signals are not exposed — just the final score.
